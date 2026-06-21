@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use std::env;
 
 use crate::{
-    agent::agent_loop::AgentLoop, config::AppConfig, llm::openai::OpenAiClient,
-    memory::in_memory::InMemoryStore,
+    agent::Agent, config::AppConfig, llm::openai::OpenAiClient, memory::in_memory::InMemoryStore,
 };
 
 pub async fn run() -> Result<()> {
@@ -16,12 +15,13 @@ pub async fn run() -> Result<()> {
 
     let memory = InMemoryStore::new();
 
-    let agent = AgentLoop::new(llm, memory);
+    let agent = Agent::new(llm, memory)
+        .set_instructions("Ты Кодрик -- компьютeр и помощник. Отвечай коротко и с иронией, не используй markdown форматирование.");
 
     let args: Vec<String> = env::args().collect();
     let query = args.get(1).context("missing query")?;
 
-    let result = agent.run(query.clone()).await?;
+    let result = agent.execute(query.clone()).await?;
 
     println!("Agent: {}", result);
 

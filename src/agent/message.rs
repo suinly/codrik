@@ -1,6 +1,4 @@
-use serde::Serialize;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -20,11 +18,18 @@ impl Message {
             content: content.into(),
         }
     }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: content.into(),
+        }
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,
+    System,
 }

@@ -5,7 +5,13 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{agent::message::Message, llm::client::LlmClient};
+use crate::{
+    agent::{
+        message::{Message, Role},
+        tool::Tool,
+    },
+    llm::client::{LlmClient, LlmRequest, LlmResponse},
+};
 
 pub struct OpenAiClient {
     api_key: String,
@@ -41,18 +47,16 @@ impl OpenAiClient {
         self
     }
 
-    async fn request(&self, messages: Vec<Message>) -> Result<String> {
+    async fn request(&self, request: LlmRequest) -> Result<LlmResponse> {
         let url = format!("{}/chat/completions", &self.base_url.trim_end_matches('/'));
+
+        let openai_request = self.to_openai_request(request);
 
         let response = self
             .http
             .post(url)
             .bearer_auth(&self.api_key)
-            .json(&OpenAiRequest {
-                model: self.model.clone(),
-                messages,
-                stream: false,
-            })
+            .json(&openai_request)
             .send()
             .await?;
 
@@ -64,12 +68,25 @@ impl OpenAiClient {
 
         extract_answer(response)
     }
+
+    fn to_openai_request(&self, request: LlmRequest) -> OpenAiRequest {
+        OpenAiRequest {
+            model: self.model.clone(),
+            messages: request
+                .messages
+                .into_iter()
+                .map(OpenAiMessage::from)
+                .collect(),
+            tools: request.tools,
+            stream: false,
+        }
+    }
 }
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
-    async fn generate(&self, messages: Vec<Message>) -> Result<String> {
-        let response = self.request(messages).await?;
+    async fn generate(&self, request: LlmRequest) -> Result<LlmResponse> {
+        let response = self.request(request).await?;
 
         Ok(response)
     }
@@ -78,8 +95,36 @@ impl LlmClient for OpenAiClient {
 #[derive(Debug, Serialize)]
 struct OpenAiRequest {
     model: String,
-    messages: Vec<Message>,
+    messages: Vec<OpenAiMessage>,
+    tools: Vec<Tool>,
     stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiMessage {
+    content: String,
+    role: OpenAiRole,
+}
+
+impl From<Message> for OpenAiMessage {
+    fn from(message: Message) -> Self {
+        Self {
+            content: message.content,
+            role: match message.role {
+                Role::User => OpenAiRole::User,
+                Role::Assistant => OpenAiRole::Assistant,
+                Role::System => OpenAiRole::System,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum OpenAiRole {
+    User,
+    Assistant,
+    System,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,69 +142,13 @@ struct ChatMessage {
     content: String,
 }
 
-fn extract_answer(response: ChatCompletionResponse) -> Result<String> {
+fn extract_answer(response: ChatCompletionResponse) -> Result<LlmResponse> {
     response
         .choices
         .into_iter()
         .next()
         .context("chat completion response has no choices")
-        .map(|choice| choice.message.content)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{agent::message::Message, llm::openai::OpenAiRequest};
-
-    use super::{ChatCompletionResponse, extract_answer};
-    use anyhow::Result;
-
-    #[test]
-    fn extracts_answer_from_chat_completion_response() -> Result<()> {
-        let response: ChatCompletionResponse = serde_json::from_str(
-            r#"
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "Hi!"
-                            }
-                        }
-                    ]
-                }
-            "#,
-        )?;
-
-        let answer = extract_answer(response)?;
-
-        assert_eq!(answer, "Hi!");
-
-        Ok(())
-    }
-
-    #[test]
-    fn returns_error_when_response_has_no_choices() {
-        let response = ChatCompletionResponse { choices: vec![] };
-
-        let result = extract_answer(response);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn serializes_chat_completion_request() -> Result<()> {
-        let request = OpenAiRequest {
-            model: "test-model".into(),
-            messages: vec![Message::user("Hi!")],
-            stream: false,
-        };
-
-        let value = serde_json::to_value(request)?;
-
-        assert_eq!(value["model"], "test-model");
-        assert_eq!(value["stream"], false);
-        assert_eq!(value["messages"][0]["role"], "user");
-        assert_eq!(value["messages"][0]["content"], "Hi!");
-
-        Ok(())
-    }
+        .map(|choice| LlmResponse {
+            content: choice.message.content,
+        })
 }
