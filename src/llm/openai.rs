@@ -47,16 +47,14 @@ impl OpenAiClient {
         self
     }
 
-    async fn request(&self, request: LlmRequest) -> Result<LlmResponse> {
+    async fn make_request(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let url = format!("{}/chat/completions", &self.base_url.trim_end_matches('/'));
-
-        let openai_request = self.to_openai_request(request);
 
         let response = self
             .http
             .post(url)
             .bearer_auth(&self.api_key)
-            .json(&openai_request)
+            .json(&request)
             .send()
             .await?;
 
@@ -64,90 +62,80 @@ impl OpenAiClient {
             bail!("request failed!");
         }
 
-        let response = response.json::<ChatCompletionResponse>().await?;
-
-        extract_answer(response)
+        Ok(response.json::<ChatCompletionResponse>().await?)
     }
 
-    fn to_openai_request(&self, request: LlmRequest) -> OpenAiRequest {
-        OpenAiRequest {
+    fn to_chat_completion_request(&self, request: LlmRequest) -> ChatCompletionRequest {
+        ChatCompletionRequest {
             model: self.model.clone(),
             messages: request
                 .messages
                 .into_iter()
-                .map(OpenAiMessage::from)
+                .map(ChatCompletionMessage::from)
                 .collect(),
-            tools: request.tools.into_iter().map(OpenAiTool::from).collect(),
+            tools: request
+                .tools
+                .into_iter()
+                .map(ChatCompletionTool::from)
+                .collect(),
             stream: false,
         }
+    }
+
+    fn to_llm_response(&self, response: ChatCompletionResponse) -> Result<LlmResponse> {
+        response
+            .choices
+            .into_iter()
+            .next()
+            .context("chat completion response has no choices")
+            .map(|choice| LlmResponse {
+                content: choice.message.content,
+            })
     }
 }
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
     async fn generate(&self, request: LlmRequest) -> Result<LlmResponse> {
-        let response = self.request(request).await?;
+        let chat_completion_request = self.to_chat_completion_request(request);
+
+        let chat_completion_response = self.make_request(chat_completion_request).await?;
+
+        let response = self.to_llm_response(chat_completion_response)?;
 
         Ok(response)
     }
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAiRequest {
+struct ChatCompletionRequest {
     model: String,
-    messages: Vec<OpenAiMessage>,
-    tools: Vec<OpenAiTool>,
+    messages: Vec<ChatCompletionMessage>,
+    tools: Vec<ChatCompletionTool>,
     stream: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAiMessage {
-    content: String,
-    role: OpenAiRole,
-}
-
-impl From<Message> for OpenAiMessage {
-    fn from(message: Message) -> Self {
-        Self {
-            content: message.content,
-            role: match message.role {
-                Role::User => OpenAiRole::User,
-                Role::Assistant => OpenAiRole::Assistant,
-                Role::System => OpenAiRole::System,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum OpenAiRole {
-    User,
-    Assistant,
-    System,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiTool {
+struct ChatCompletionTool {
     #[serde(rename = "type")]
     kind: String,
-    function: OpenAiFunction,
+    function: FunctionDefinition,
 }
 
-impl From<Tool> for OpenAiTool {
+impl From<Tool> for ChatCompletionTool {
     fn from(tool: Tool) -> Self {
         Self {
             kind: "function".into(),
-            function: OpenAiFunction {
+            function: FunctionDefinition {
                 name: tool.name,
                 description: tool.description,
-                parameters: OpenAiParameters {
+                parameters: FunctionParameters {
                     kind: "object".into(),
                     properties: tool
                         .parameters
                         .properties
                         .into_iter()
-                        .map(|(name, parameter)| (name, OpenAiProperty::from(parameter)))
+                        .map(|(name, parameter)| (name, FunctionProperty::from(parameter)))
                         .collect(),
                     required: tool.parameters.required,
                 },
@@ -157,34 +145,34 @@ impl From<Tool> for OpenAiTool {
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAiFunction {
+struct FunctionDefinition {
     name: String,
     description: String,
-    parameters: OpenAiParameters,
+    parameters: FunctionParameters,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAiParameters {
+struct FunctionParameters {
     #[serde(rename = "type")]
     kind: String,
-    properties: BTreeMap<String, OpenAiProperty>,
+    properties: BTreeMap<String, FunctionProperty>,
     required: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAiProperty {
+struct FunctionProperty {
     #[serde(rename = "type")]
-    kind: OpenAiPropertyKind,
+    kind: FunctionPropertyKind,
     description: String,
 
     #[serde(rename = "enum", skip_serializing_if = "Vec::is_empty")]
     allowed_values: Vec<String>,
 }
 
-impl From<ToolParameter> for OpenAiProperty {
+impl From<ToolParameter> for FunctionProperty {
     fn from(parameter: ToolParameter) -> Self {
         Self {
-            kind: OpenAiPropertyKind::from(parameter.kind),
+            kind: FunctionPropertyKind::from(parameter.kind),
             description: parameter.description,
             allowed_values: parameter.allowed_values,
         }
@@ -193,44 +181,54 @@ impl From<ToolParameter> for OpenAiProperty {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum OpenAiPropertyKind {
+enum FunctionPropertyKind {
     String,
     Number,
     Boolean,
 }
 
-impl From<ToolParameterKind> for OpenAiPropertyKind {
+impl From<ToolParameterKind> for FunctionPropertyKind {
     fn from(kind: ToolParameterKind) -> Self {
         match kind {
-            ToolParameterKind::String => OpenAiPropertyKind::String,
-            ToolParameterKind::Number => OpenAiPropertyKind::Number,
-            ToolParameterKind::Boolean => OpenAiPropertyKind::Boolean,
+            ToolParameterKind::String => FunctionPropertyKind::String,
+            ToolParameterKind::Number => FunctionPropertyKind::Number,
+            ToolParameterKind::Boolean => FunctionPropertyKind::Boolean,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
+    choices: Vec<ChatCompletionChoice>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
+struct ChatCompletionChoice {
+    message: ChatCompletionMessage,
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatMessage {
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatCompletionMessage {
     content: String,
+    role: ChatCompoletionRole,
 }
 
-fn extract_answer(response: ChatCompletionResponse) -> Result<LlmResponse> {
-    response
-        .choices
-        .into_iter()
-        .next()
-        .context("chat completion response has no choices")
-        .map(|choice| LlmResponse {
-            content: choice.message.content,
-        })
+impl From<Message> for ChatCompletionMessage {
+    fn from(message: Message) -> Self {
+        Self {
+            content: message.content,
+            role: match message.role {
+                Role::User => ChatCompoletionRole::User,
+                Role::Assistant => ChatCompoletionRole::Assistant,
+                Role::System => ChatCompoletionRole::System,
+            },
+        }
+    }
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ChatCompoletionRole {
+    User,
+    Assistant,
+    System,
 }
