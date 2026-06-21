@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::BTreeMap, env};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agent::{
         message::{Message, Role},
-        tool::Tool,
+        tool::{Tool, ToolParameter, ToolParameterKind},
     },
     llm::client::{LlmClient, LlmRequest, LlmResponse},
 };
@@ -77,7 +77,7 @@ impl OpenAiClient {
                 .into_iter()
                 .map(OpenAiMessage::from)
                 .collect(),
-            tools: request.tools,
+            tools: request.tools.into_iter().map(OpenAiTool::from).collect(),
             stream: false,
         }
     }
@@ -96,7 +96,7 @@ impl LlmClient for OpenAiClient {
 struct OpenAiRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
-    tools: Vec<Tool>,
+    tools: Vec<OpenAiTool>,
     stream: bool,
 }
 
@@ -125,6 +125,88 @@ enum OpenAiRole {
     User,
     Assistant,
     System,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OpenAiFunction,
+}
+
+impl From<Tool> for OpenAiTool {
+    fn from(tool: Tool) -> Self {
+        Self {
+            kind: "function".into(),
+            function: OpenAiFunction {
+                name: tool.name,
+                description: tool.description,
+                parameters: OpenAiParameters {
+                    kind: "object".into(),
+                    properties: tool
+                        .parameters
+                        .properties
+                        .into_iter()
+                        .map(|(name, parameter)| (name, OpenAiProperty::from(parameter)))
+                        .collect(),
+                    required: tool.parameters.required,
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiFunction {
+    name: String,
+    description: String,
+    parameters: OpenAiParameters,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiParameters {
+    #[serde(rename = "type")]
+    kind: String,
+    properties: BTreeMap<String, OpenAiProperty>,
+    required: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiProperty {
+    #[serde(rename = "type")]
+    kind: OpenAiPropertyKind,
+    description: String,
+
+    #[serde(rename = "enum", skip_serializing_if = "Vec::is_empty")]
+    allowed_values: Vec<String>,
+}
+
+impl From<ToolParameter> for OpenAiProperty {
+    fn from(parameter: ToolParameter) -> Self {
+        Self {
+            kind: OpenAiPropertyKind::from(parameter.kind),
+            description: parameter.description,
+            allowed_values: parameter.allowed_values,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum OpenAiPropertyKind {
+    String,
+    Number,
+    Boolean,
+}
+
+impl From<ToolParameterKind> for OpenAiPropertyKind {
+    fn from(kind: ToolParameterKind) -> Self {
+        match kind {
+            ToolParameterKind::String => OpenAiPropertyKind::String,
+            ToolParameterKind::Number => OpenAiPropertyKind::Number,
+            ToolParameterKind::Boolean => OpenAiPropertyKind::Boolean,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

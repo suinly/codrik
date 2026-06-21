@@ -2,12 +2,14 @@ pub mod message;
 pub mod tool;
 
 use crate::agent::message::Message;
+use crate::agent::tool::Tool;
 use crate::llm::client::{LlmClient, LlmRequest};
 use crate::memory::store::MemoryStore;
 use anyhow::Result;
 
 pub struct Agent<L, M> {
     instructions: String,
+    tools: Vec<Tool>,
     llm: L,
     memory: M,
 }
@@ -20,6 +22,7 @@ where
     pub fn new(llm: L, memory: M) -> Self {
         Self {
             instructions: String::new(),
+            tools: Vec::new(),
             memory,
             llm,
         }
@@ -30,15 +33,21 @@ where
         self
     }
 
+    pub fn add_tool(mut self, tool: Tool) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
     pub async fn execute(&self, content: impl Into<String>) -> Result<String> {
         let instructions = Message::system(self.instructions.clone());
         self.memory.save(instructions).await?;
         self.memory.save(Message::user(content.into())).await?;
 
         let messages = self.memory.load_context().await?;
-        let tools = Vec::new();
-
-        let request = LlmRequest { messages, tools };
+        let request = LlmRequest {
+            messages,
+            tools: self.tools.clone(),
+        };
         let response = self.llm.generate(request).await?;
 
         let message = Message::assistant(response.content.clone());
