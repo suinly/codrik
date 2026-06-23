@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+use anyhow::Result;
+use async_trait::async_trait;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tool {
     pub name: String,
@@ -92,4 +95,20 @@ pub enum ToolParameterKind {
     String,
     Number,
     Boolean,
+}
+
+#[async_trait]
+pub trait ToolExecutor {
+    fn definitions(&self) -> Vec<Tool>;
+
+    async fn execute(&self, name: &str, arguments: &str) -> Result<String>;
+}
+
+#[async_trait]
+pub trait ToolHandler: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn definition(&self) -> Tool;
+
+    async fn execute(&self, arguments: &str) -> Result<String>;
 }

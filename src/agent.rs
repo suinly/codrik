@@ -2,27 +2,28 @@ pub mod message;
 pub mod tool;
 
 use crate::agent::message::Message;
-use crate::agent::tool::Tool;
+use crate::agent::tool::ToolExecutor;
 use crate::llm::client::{LlmClient, LlmRequest};
 use crate::memory::store::MemoryStore;
-use anyhow::Result;
+use anyhow::{Result, bail};
 
-pub struct Agent<L, M> {
+pub struct Agent<L, M, T> {
     instructions: String,
-    tools: Vec<Tool>,
+    tools: T,
     llm: L,
     memory: M,
 }
 
-impl<L, M> Agent<L, M>
+impl<L, M, T> Agent<L, M, T>
 where
     L: LlmClient,
     M: MemoryStore,
+    T: ToolExecutor,
 {
-    pub fn new(llm: L, memory: M) -> Self {
+    pub fn new(llm: L, memory: M, tools: T) -> Self {
         Self {
             instructions: String::new(),
-            tools: Vec::new(),
+            tools,
             memory,
             llm,
         }
@@ -30,11 +31,6 @@ where
 
     pub fn set_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = instructions.into();
-        self
-    }
-
-    pub fn add_tool(mut self, tool: Tool) -> Self {
-        self.tools.push(tool);
         self
     }
 
@@ -51,7 +47,7 @@ where
                 .llm
                 .generate(LlmRequest {
                     messages,
-                    tools: self.tools.clone(),
+                    tools: self.tools.definitions(),
                 })
                 .await?;
 
@@ -72,8 +68,14 @@ where
 
             for tool_call in response.tool_calls {
                 let result = self
-                    .execute_tool(&tool_call.name, &tool_call.arguments)
+                    .tools
+                    .execute(&tool_call.name, &tool_call.arguments)
                     .await?;
+
+                println!(
+                    "Tool: `{}` called with arguments `{}` returned: {}",
+                    &tool_call.name, &tool_call.arguments, &result
+                );
 
                 self.memory
                     .save(Message::tool_result(tool_call.id, result))
@@ -81,13 +83,6 @@ where
             }
         }
 
-        anyhow::bail!("tool call loop exceeeded max iterations (5)")
-    }
-
-    async fn execute_tool(&self, name: &str, _arguments: &str) -> Result<String> {
-        match name {
-            "hello_world" => Ok("Hello World".to_string()),
-            _ => anyhow::bail!("unknown tool: {name}"),
-        }
+        bail!("tool call loop exceeeded max iterations (5)")
     }
 }
