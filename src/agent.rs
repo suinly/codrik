@@ -39,20 +39,55 @@ where
     }
 
     pub async fn execute(&self, content: impl Into<String>) -> Result<String> {
-        let instructions = Message::system(self.instructions.clone());
-        self.memory.save(instructions).await?;
+        self.memory
+            .save(Message::system(self.instructions.clone()))
+            .await?;
         self.memory.save(Message::user(content.into())).await?;
 
-        let messages = self.memory.load_context().await?;
-        let request = LlmRequest {
-            messages,
-            tools: self.tools.clone(),
-        };
-        let response = self.llm.generate(request).await?;
+        for _ in 0..5 {
+            let messages = self.memory.load_context().await?;
 
-        let message = Message::assistant(response.content.clone());
-        self.memory.save(message).await?;
+            let response = self
+                .llm
+                .generate(LlmRequest {
+                    messages,
+                    tools: self.tools.clone(),
+                })
+                .await?;
 
-        Ok(response.content)
+            if response.tool_calls.is_empty() {
+                self.memory
+                    .save(Message::assistant(response.content.clone()))
+                    .await?;
+
+                return Ok(response.content);
+            }
+
+            self.memory
+                .save(Message::assistant_tool_calls(
+                    response.content,
+                    response.tool_calls.clone(),
+                ))
+                .await?;
+
+            for tool_call in response.tool_calls {
+                let result = self
+                    .execute_tool(&tool_call.name, &tool_call.arguments)
+                    .await?;
+
+                self.memory
+                    .save(Message::tool_result(tool_call.id, result))
+                    .await?;
+            }
+        }
+
+        anyhow::bail!("tool call loop exceeeded max iterations (5)")
+    }
+
+    async fn execute_tool(&self, name: &str, _arguments: &str) -> Result<String> {
+        match name {
+            "hello_world" => Ok("Hello World".to_string()),
+            _ => anyhow::bail!("unknown tool: {name}"),
+        }
     }
 }

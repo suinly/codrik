@@ -13,11 +13,7 @@ use anyhow::Result;
 pub type AppAgent = Agent<OpenAiClient, InMemoryStore>;
 
 pub fn build_agent(config: AppConfig) -> AppAgent {
-    let llm = OpenAiClient::new()
-        .set_api_key(config.api_key)
-        .set_base_url(config.base_url)
-        .set_model(config.model);
-
+    let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
     let memory = InMemoryStore::new();
 
     Agent::new(llm, memory)

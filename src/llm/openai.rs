@@ -1,234 +1,204 @@
-use std::{collections::BTreeMap, env};
-
-use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     agent::{
-        message::{Message, Role},
-        tool::{Tool, ToolParameter, ToolParameterKind},
+        message::Role,
+        tool::{Tool, ToolParameter, ToolParameterKind, ToolParameters},
     },
-    llm::client::{LlmClient, LlmRequest, LlmResponse},
+    llm::client::{LlmClient, LlmRequest, LlmResponse, LlmToolCall},
 };
+use anyhow::{Context, Result};
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage, ChatCompletionTool,
+        ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionResponse, FunctionCall, FunctionObject,
+    },
+};
+use serde_json::{Value, json};
 
 pub struct OpenAiClient {
-    api_key: String,
-    base_url: String,
     model: String,
-    http: Client,
+    client: Client<OpenAIConfig>,
 }
 
 impl OpenAiClient {
-    pub fn new() -> Self {
-        let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY is not set");
+    pub fn new(
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        let config = OpenAIConfig::new()
+            .with_api_key(api_key.into())
+            .with_api_base(base_url.into());
+
+        let client = Client::with_config(config);
 
         Self {
-            api_key,
-            base_url: "https://api.openai.com/v1".into(),
-            model: "gpt-5.5".into(),
-            http: Client::new(),
+            model: model.into(),
+            client,
         }
     }
 
-    pub fn set_api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.api_key = api_key.into();
-        self
-    }
+    fn to_openai_request(&self, llm_request: LlmRequest) -> Result<CreateChatCompletionRequest> {
+        let messages = llm_request
+            .messages
+            .into_iter()
+            .map(|message| -> Result<ChatCompletionRequestMessage> {
+                Ok(match message.role {
+                    Role::User => ChatCompletionRequestUserMessage::from(message.content).into(),
+                    Role::Assistant => ChatCompletionRequestAssistantMessage {
+                        content: if message.content.is_empty() && !message.tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(ChatCompletionRequestAssistantMessageContent::Text(
+                                message.content,
+                            ))
+                        },
+                        tool_calls: if message.tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                message
+                                    .tool_calls
+                                    .into_iter()
+                                    .map(Self::to_openai_tool_call)
+                                    .collect(),
+                            )
+                        },
+                        ..Default::default()
+                    }
+                    .into(),
+                    Role::System => {
+                        ChatCompletionRequestSystemMessage::from(message.content).into()
+                    }
+                    Role::Tool => {
+                        let tool_call_id = message
+                            .tool_call_id
+                            .context("tool message is missing tool_call_id")?;
 
-    pub fn set_model(mut self, model: impl Into<String>) -> Self {
-        self.model = model.into();
-        self
-    }
+                        ChatCompletionRequestToolMessage {
+                            content: message.content.into(),
+                            tool_call_id,
+                        }
+                        .into()
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-    pub fn set_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
-    }
+        let tools = llm_request
+            .tools
+            .into_iter()
+            .map(Self::to_openai_tool)
+            .collect::<Vec<_>>();
 
-    async fn make_request(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse> {
-        let url = format!("{}/chat/completions", &self.base_url.trim_end_matches('/'));
+        let mut request = CreateChatCompletionRequestArgs::default();
+        request.model(self.model.clone()).messages(messages);
 
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            bail!("request failed!");
+        if !tools.is_empty() {
+            request.tools(tools);
         }
 
-        Ok(response.json::<ChatCompletionResponse>().await?)
+        let request = request.build()?;
+
+        Ok(request)
     }
 
-    fn to_chat_completion_request(&self, request: LlmRequest) -> ChatCompletionRequest {
-        ChatCompletionRequest {
-            model: self.model.clone(),
-            messages: request
-                .messages
-                .into_iter()
-                .map(ChatCompletionMessage::from)
-                .collect(),
-            tools: request
-                .tools
-                .into_iter()
-                .map(ChatCompletionTool::from)
-                .collect(),
-            stream: false,
-        }
-    }
-
-    fn to_llm_response(&self, response: ChatCompletionResponse) -> Result<LlmResponse> {
-        response
+    fn to_llm_response(response: CreateChatCompletionResponse) -> Result<LlmResponse> {
+        let choice = response
             .choices
             .into_iter()
             .next()
-            .context("chat completion response has no choices")
-            .map(|choice| LlmResponse {
-                content: choice.message.content,
+            .context("chat completion response has no choices")?;
+
+        let content = choice.message.content.unwrap_or_default();
+
+        let tool_calls = choice
+            .message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tool_call| match tool_call {
+                ChatCompletionMessageToolCalls::Function(function_call) => Some(LlmToolCall {
+                    id: function_call.id,
+                    name: function_call.function.name,
+                    arguments: function_call.function.arguments,
+                }),
+                ChatCompletionMessageToolCalls::Custom(_) => None,
             })
+            .collect();
+
+        Ok(LlmResponse {
+            content,
+            tool_calls,
+        })
     }
-}
 
-#[async_trait]
-impl LlmClient for OpenAiClient {
-    async fn generate(&self, request: LlmRequest) -> Result<LlmResponse> {
-        let chat_completion_request = self.to_chat_completion_request(request);
-
-        let chat_completion_response = self.make_request(chat_completion_request).await?;
-
-        let response = self.to_llm_response(chat_completion_response)?;
-
-        Ok(response)
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatCompletionMessage>,
-    tools: Vec<ChatCompletionTool>,
-    stream: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionTool {
-    #[serde(rename = "type")]
-    kind: String,
-    function: FunctionDefinition,
-}
-
-impl From<Tool> for ChatCompletionTool {
-    fn from(tool: Tool) -> Self {
-        Self {
-            kind: "function".into(),
-            function: FunctionDefinition {
+    fn to_openai_tool(tool: Tool) -> ChatCompletionTools {
+        ChatCompletionTools::Function(ChatCompletionTool {
+            function: FunctionObject {
                 name: tool.name,
-                description: tool.description,
-                parameters: FunctionParameters {
-                    kind: "object".into(),
-                    properties: tool
-                        .parameters
-                        .properties
-                        .into_iter()
-                        .map(|(name, parameter)| (name, FunctionProperty::from(parameter)))
-                        .collect(),
-                    required: tool.parameters.required,
-                },
+                description: Some(tool.description),
+                parameters: Some(Self::to_openai_parameters(tool.parameters)),
+                strict: None,
             },
-        }
+        })
     }
-}
 
-#[derive(Debug, Serialize)]
-struct FunctionDefinition {
-    name: String,
-    description: String,
-    parameters: FunctionParameters,
-}
-
-#[derive(Debug, Serialize)]
-struct FunctionParameters {
-    #[serde(rename = "type")]
-    kind: String,
-    properties: BTreeMap<String, FunctionProperty>,
-    required: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct FunctionProperty {
-    #[serde(rename = "type")]
-    kind: FunctionPropertyKind,
-    description: String,
-
-    #[serde(rename = "enum", skip_serializing_if = "Vec::is_empty")]
-    allowed_values: Vec<String>,
-}
-
-impl From<ToolParameter> for FunctionProperty {
-    fn from(parameter: ToolParameter) -> Self {
-        Self {
-            kind: FunctionPropertyKind::from(parameter.kind),
-            description: parameter.description,
-            allowed_values: parameter.allowed_values,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum FunctionPropertyKind {
-    String,
-    Number,
-    Boolean,
-}
-
-impl From<ToolParameterKind> for FunctionPropertyKind {
-    fn from(kind: ToolParameterKind) -> Self {
-        match kind {
-            ToolParameterKind::String => FunctionPropertyKind::String,
-            ToolParameterKind::Number => FunctionPropertyKind::Number,
-            ToolParameterKind::Boolean => FunctionPropertyKind::Boolean,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatCompletionChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionChoice {
-    message: ChatCompletionMessage,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChatCompletionMessage {
-    content: String,
-    role: ChatCompoletionRole,
-}
-
-impl From<Message> for ChatCompletionMessage {
-    fn from(message: Message) -> Self {
-        Self {
-            content: message.content,
-            role: match message.role {
-                Role::User => ChatCompoletionRole::User,
-                Role::Assistant => ChatCompoletionRole::Assistant,
-                Role::System => ChatCompoletionRole::System,
+    fn to_openai_tool_call(tool_call: LlmToolCall) -> ChatCompletionMessageToolCalls {
+        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+            id: tool_call.id,
+            function: FunctionCall {
+                name: tool_call.name,
+                arguments: tool_call.arguments,
             },
+        })
+    }
+
+    fn to_openai_parameters(parameters: ToolParameters) -> Value {
+        let properties = parameters
+            .properties
+            .into_iter()
+            .map(|(name, parameter)| (name, Self::to_openai_parameter(parameter)))
+            .collect::<serde_json::Map<_, _>>();
+
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": parameters.required,
+        })
+    }
+
+    fn to_openai_parameter(parameter: ToolParameter) -> Value {
+        let kind = match parameter.kind {
+            ToolParameterKind::String => "string",
+            ToolParameterKind::Number => "number",
+            ToolParameterKind::Boolean => "boolean",
+        };
+
+        let mut value = json!({
+            "type": kind,
+            "description": parameter.description,
+        });
+
+        if !parameter.allowed_values.is_empty() {
+            value["enum"] = json!(parameter.allowed_values);
         }
+
+        value
     }
 }
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum ChatCompoletionRole {
-    User,
-    Assistant,
-    System,
+
+#[async_trait::async_trait]
+impl LlmClient for OpenAiClient {
+    async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse> {
+        let request = self.to_openai_request(llm_request)?;
+        let response = self.client.chat().create(request).await?;
+
+        Self::to_llm_response(response)
+    }
 }

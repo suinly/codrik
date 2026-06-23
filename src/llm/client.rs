@@ -5,7 +5,7 @@ use crate::agent::{message::Message, tool::Tool};
 
 #[async_trait]
 pub trait LlmClient {
-    async fn generate(&self, request: LlmRequest) -> Result<LlmResponse>;
+    async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse>;
 }
 
 pub struct LlmRequest {
@@ -13,7 +13,15 @@ pub struct LlmRequest {
     pub tools: Vec<Tool>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: String,
+    pub tool_calls: Vec<LlmToolCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }

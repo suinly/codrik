@@ -1,7 +1,11 @@
+use crate::llm::client::LlmToolCall;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    pub tool_calls: Vec<LlmToolCall>,
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -9,6 +13,8 @@ impl Message {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -16,6 +22,17 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<LlmToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
         }
     }
 
@@ -23,6 +40,17 @@ impl Message {
         Self {
             role: Role::System,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -32,4 +60,5 @@ pub enum Role {
     User,
     Assistant,
     System,
+    Tool,
 }
