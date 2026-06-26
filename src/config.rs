@@ -8,6 +8,12 @@ pub struct AppConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    pub telegram: Option<TelegramConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramConfig {
+    pub token: String,
 }
 
 impl AppConfig {

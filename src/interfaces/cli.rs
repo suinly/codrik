@@ -1,12 +1,25 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::env;
 
-use crate::app;
+use crate::{app, config::AppConfig, interfaces::telegram};
 
 pub async fn run() -> Result<()> {
-    let query = env::args().nth(1).context("missing query")?;
+    let mut args = env::args().skip(1);
+    let command = args.next().context("missing query or command")?;
 
-    let result = app::run_once(query).await?;
+    if command == "gateway" {
+        let gateway = args.next().context("missing gateway name")?;
+
+        return match gateway.as_str() {
+            "telegram" => {
+                let config = AppConfig::load("codrik.config.yml")?;
+                telegram::run(config).await
+            }
+            _ => bail!("unknown gateway: {gateway}"),
+        };
+    }
+
+    let result = app::run_once(command).await?;
 
     println!("Agent: {}", result);
 

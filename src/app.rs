@@ -17,7 +17,12 @@ pub fn build_agent(config: AppConfig) -> AppAgent {
 
 pub async fn run_once(query: String) -> Result<String> {
     let config = AppConfig::load("codrik.config.yml");
-    let agent = build_agent(config.unwrap());
+
+    run_once_with_config(query, config.unwrap()).await
+}
+
+pub async fn run_once_with_config(query: String, config: AppConfig) -> Result<String> {
+    let agent = build_agent(config);
 
     agent.execute(query).await
 }
