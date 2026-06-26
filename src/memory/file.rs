@@ -5,9 +5,14 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex};
 
-use crate::{agent::message::Message, memory::store::MemoryStore};
+use crate::{
+    agent::message::{Message, Role},
+    llm::client::LlmToolCall,
+    memory::store::MemoryStore,
+};
 
 #[derive(Clone, Debug)]
 pub struct FileMemoryStore {
@@ -41,8 +46,10 @@ impl FileMemoryStore {
             .await
             .with_context(|| format!("failed to read session file: {}", self.path.display()))?;
 
-        serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse session file: {}", self.path.display()))
+        let messages = serde_json::from_str::<Vec<SessionMessage>>(&content)
+            .with_context(|| format!("failed to parse session file: {}", self.path.display()))?;
+
+        Ok(messages.into_iter().map(Message::from).collect())
     }
 
     async fn write_messages(&self, messages: &[Message]) -> Result<()> {
@@ -52,8 +59,13 @@ impl FileMemoryStore {
             })?;
         }
 
+        let messages = messages
+            .iter()
+            .cloned()
+            .map(SessionMessage::from)
+            .collect::<Vec<_>>();
         let content =
-            serde_json::to_string_pretty(messages).context("failed to serialize session")?;
+            serde_json::to_string_pretty(&messages).context("failed to serialize session")?;
 
         fs::write(&self.path, content)
             .await
@@ -80,6 +92,73 @@ fn is_safe_session_id(session_id: &str) -> bool {
         && session_id
             .chars()
             .all(|char| char.is_ascii_alphanumeric() || matches!(char, '.' | '_' | '-'))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionMessage {
+    role: SessionRole,
+    content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<LlmToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl From<Message> for SessionMessage {
+    fn from(message: Message) -> Self {
+        Self {
+            role: SessionRole::from(message.role),
+            content: message.content,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+        }
+    }
+}
+
+impl From<SessionMessage> for Message {
+    fn from(message: SessionMessage) -> Self {
+        Self {
+            role: Role::from(message.role),
+            content: message.content,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionRole {
+    #[serde(alias = "User")]
+    User,
+    #[serde(alias = "Assistant")]
+    Assistant,
+    #[serde(alias = "System")]
+    System,
+    #[serde(alias = "Tool")]
+    Tool,
+}
+
+impl From<Role> for SessionRole {
+    fn from(role: Role) -> Self {
+        match role {
+            Role::User => Self::User,
+            Role::Assistant => Self::Assistant,
+            Role::System => Self::System,
+            Role::Tool => Self::Tool,
+        }
+    }
+}
+
+impl From<SessionRole> for Role {
+    fn from(role: SessionRole) -> Self {
+        match role {
+            SessionRole::User => Self::User,
+            SessionRole::Assistant => Self::Assistant,
+            SessionRole::System => Self::System,
+            SessionRole::Tool => Self::Tool,
+        }
+    }
 }
 
 #[cfg(test)]

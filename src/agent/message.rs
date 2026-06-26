@@ -1,13 +1,10 @@
 use crate::llm::client::LlmToolCall;
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub content: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<LlmToolCall>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
@@ -58,15 +55,10 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
-    #[serde(alias = "User")]
     User,
-    #[serde(alias = "Assistant")]
     Assistant,
-    #[serde(alias = "System")]
     System,
-    #[serde(alias = "Tool")]
     Tool,
 }
