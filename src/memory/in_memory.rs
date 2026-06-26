@@ -18,7 +18,7 @@ impl InMemoryStore {
 
 #[async_trait]
 impl MemoryStore for InMemoryStore {
-    async fn save(&self, message: Message) -> Result<()> {
+    async fn append(&self, message: Message) -> Result<()> {
         let mut messages = self.messages.lock().await;
         messages.push(message);
         Ok(())
@@ -39,15 +39,17 @@ mod tests {
     use super::InMemoryStore;
 
     #[tokio::test]
-    async fn message_is_saved_in_memory() -> Result<()> {
+    async fn messages_are_appended_in_order() -> Result<()> {
         let memory = InMemoryStore::new();
-        let message = Message::user("Test message");
+        let first = Message::user("First message");
+        let second = Message::assistant("Second message");
 
-        memory.save(message.clone()).await?;
+        memory.append(first.clone()).await?;
+        memory.append(second.clone()).await?;
 
         let context = memory.load_context().await?;
 
-        assert_eq!(context, vec![message]);
+        assert_eq!(context, vec![first, second]);
 
         Ok(())
     }

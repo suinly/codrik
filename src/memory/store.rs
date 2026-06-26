@@ -5,6 +5,6 @@ use crate::agent::message::Message;
 
 #[async_trait]
 pub trait MemoryStore {
-    async fn save(&self, message: Message) -> Result<()>;
+    async fn append(&self, message: Message) -> Result<()>;
     async fn load_context(&self) -> Result<Vec<Message>>;
 }

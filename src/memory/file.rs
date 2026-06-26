@@ -58,7 +58,7 @@ impl FileMemoryStore {
 
 #[async_trait]
 impl MemoryStore for FileMemoryStore {
-    async fn save(&self, message: Message) -> Result<()> {
+    async fn append(&self, message: Message) -> Result<()> {
         let mut messages = self.read_messages().await?;
         messages.push(message);
         self.write_messages(&messages).await
@@ -114,7 +114,7 @@ mod tests {
         let memory = FileMemoryStore::new(&root, "work")?;
         let message = Message::user("hello");
 
-        memory.save(message.clone()).await?;
+        memory.append(message.clone()).await?;
 
         let restored = FileMemoryStore::new(&root, "work")?.load_context().await?;
 
@@ -144,8 +144,8 @@ mod tests {
         );
         let tool_result = Message::tool_result("call_1", "2026-06-26");
 
-        memory.save(message.clone()).await?;
-        memory.save(tool_result.clone()).await?;
+        memory.append(message.clone()).await?;
+        memory.append(tool_result.clone()).await?;
 
         let restored = memory.load_context().await?;
 

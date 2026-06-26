@@ -35,7 +35,7 @@ where
     }
 
     pub async fn execute(&self, content: impl Into<String>) -> Result<String> {
-        self.memory.save(Message::user(content.into())).await?;
+        self.memory.append(Message::user(content.into())).await?;
 
         for _ in 0..5 {
             let mut messages = Vec::new();
@@ -54,14 +54,14 @@ where
 
             if response.tool_calls.is_empty() {
                 self.memory
-                    .save(Message::assistant(response.content.clone()))
+                    .append(Message::assistant(response.content.clone()))
                     .await?;
 
                 return Ok(response.content);
             }
 
             self.memory
-                .save(Message::assistant_tool_calls(
+                .append(Message::assistant_tool_calls(
                     response.content,
                     response.tool_calls.clone(),
                 ))
@@ -74,7 +74,7 @@ where
                     .await?;
 
                 self.memory
-                    .save(Message::tool_result(tool_call.id, result))
+                    .append(Message::tool_result(tool_call.id, result))
                     .await?;
             }
         }
