@@ -73,11 +73,6 @@ where
                     .execute(&tool_call.name, &tool_call.arguments)
                     .await?;
 
-                println!(
-                    "Tool: `{}` called with arguments `{}` returned: {}",
-                    &tool_call.name, &tool_call.arguments, &result
-                );
-
                 self.memory
                     .save(Message::tool_result(tool_call.id, result))
                     .await?;
