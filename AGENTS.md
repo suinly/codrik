@@ -34,6 +34,18 @@ JSON or stringly typed control flow. Keep async boundaries explicit and return
 `anyhow::Result` only at application/interface boundaries where context is
 useful.
 
+## Architecture & SOLID Guidelines
+
+Treat SOLID as a hard design constraint. Keep each module focused on one reason
+to change: `agent` orchestrates conversation turns, `llm` adapts provider APIs,
+`memory` persists context, `tools` owns tool definitions and dispatch, and
+`interfaces` handles CLI or gateway I/O. Extend behavior through traits such as
+`LlmClient`, `MemoryStore`, and `ToolExecutor` instead of branching on concrete
+implementations. Composition belongs in `src/app.rs`; application logic should
+depend on abstractions, not `OpenAiClient`, file storage, or Telegram details.
+Before opening a PR, check that new code does not mix orchestration, persistence,
+provider wire format, and user-interface concerns in the same function.
+
 ## Testing Guidelines
 
 Place focused unit tests in the module they exercise under `#[cfg(test)]`.
