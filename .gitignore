@@ -1,3 +1,4 @@
 /target
+dist/
 codrik.config.yml
 .codrik/
