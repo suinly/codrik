@@ -19,6 +19,17 @@ pub async fn run() -> Result<()> {
         };
     }
 
+    if command == "--session" {
+        let session_id = args.next().context("missing session id")?;
+        let query = args.next().context("missing query")?;
+        let config = AppConfig::load("codrik.config.yml")?;
+        let result = app::run_once_with_session(query, config, session_id).await?;
+
+        println!("Agent: {}", result);
+
+        return Ok(());
+    }
+
     let result = app::run_once(command).await?;
 
     println!("Agent: {}", result);

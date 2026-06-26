@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{message::Message, tool::Tool};
 
@@ -19,7 +20,7 @@ pub struct LlmResponse {
     pub tool_calls: Vec<LlmToolCall>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmToolCall {
     pub id: String,
     pub name: String,

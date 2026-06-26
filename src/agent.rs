@@ -35,13 +35,14 @@ where
     }
 
     pub async fn execute(&self, content: impl Into<String>) -> Result<String> {
-        self.memory
-            .save(Message::system(self.instructions.clone()))
-            .await?;
         self.memory.save(Message::user(content.into())).await?;
 
         for _ in 0..5 {
-            let messages = self.memory.load_context().await?;
+            let mut messages = Vec::new();
+            if !self.instructions.is_empty() {
+                messages.push(Message::system(self.instructions.clone()));
+            }
+            messages.extend(self.memory.load_context().await?);
 
             let response = self
                 .llm
@@ -84,5 +85,88 @@ where
         }
 
         bail!("tool call loop exceeeded max iterations (5)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
+
+    use crate::{
+        agent::{
+            Agent,
+            message::{Message, Role},
+            tool::{Tool, ToolExecutor},
+        },
+        llm::client::{LlmClient, LlmRequest, LlmResponse},
+        memory::{in_memory::InMemoryStore, store::MemoryStore},
+    };
+
+    #[derive(Clone)]
+    struct FakeClient {
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl FakeClient {
+        fn new() -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        async fn requests(&self) -> Vec<Vec<Message>> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for FakeClient {
+        async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse> {
+            self.requests.lock().await.push(llm_request.messages);
+
+            Ok(LlmResponse {
+                content: "answer".to_string(),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    struct NoTools;
+
+    #[async_trait]
+    impl ToolExecutor for NoTools {
+        fn definitions(&self) -> Vec<Tool> {
+            Vec::new()
+        }
+
+        async fn execute(&self, _name: &str, _arguments: &str) -> Result<String> {
+            unreachable!("no tools are defined")
+        }
+    }
+
+    #[tokio::test]
+    async fn system_instruction_is_sent_but_not_persisted() -> Result<()> {
+        let client = FakeClient::new();
+        let memory = InMemoryStore::new();
+        let agent = Agent::new(client.clone(), memory, NoTools).set_instructions("system prompt");
+
+        agent.execute("hello").await?;
+
+        let requests = client.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0][0], Message::system("system prompt"));
+
+        let context = agent.memory.load_context().await?;
+
+        assert_eq!(context.len(), 2);
+        assert!(context.iter().all(|message| message.role != Role::System));
+        assert_eq!(context[0], Message::user("hello"));
+        assert_eq!(context[1], Message::assistant("answer"));
+
+        Ok(())
     }
 }

@@ -21,10 +21,12 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 return Ok(());
             };
 
-            let answer = match app::run_once_with_config(text.to_string(), config).await {
-                Ok(answer) => answer,
-                Err(error) => format!("Gateway error: {error:#}"),
-            };
+            let session_id = format!("telegram-chat-{}", msg.chat.id);
+            let answer =
+                match app::run_once_with_session(text.to_string(), config, session_id).await {
+                    Ok(answer) => answer,
+                    Err(error) => format!("Gateway error: {error:#}"),
+                };
 
             bot.send_message(msg.chat.id, answer).await?;
 
