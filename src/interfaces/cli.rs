@@ -4,35 +4,107 @@ use std::env;
 use crate::{app, config::AppConfig, interfaces::telegram};
 
 pub async fn run() -> Result<()> {
-    let mut args = env::args().skip(1);
-    let command = args.next().context("missing query or command")?;
-
-    if command == "gateway" {
-        let gateway = args.next().context("missing gateway name")?;
-
-        return match gateway.as_str() {
+    match CliCommand::parse(env::args().skip(1))? {
+        CliCommand::Gateway { name } => match name.as_str() {
             "telegram" => {
                 let config = AppConfig::load("codrik.config.yml")?;
                 telegram::run(config).await
             }
-            _ => bail!("unknown gateway: {gateway}"),
-        };
+            _ => bail!("unknown gateway: {name}"),
+        },
+        CliCommand::Session { session_id, query } => {
+            let config = AppConfig::load("codrik.config.yml")?;
+            let result = app::run_once_with_session(query, config, session_id).await?;
+
+            println!("Agent: {}", result);
+
+            Ok(())
+        }
+        CliCommand::OneShot { query } => {
+            let result = app::run_once(query).await?;
+
+            println!("Agent: {}", result);
+
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    Gateway { name: String },
+    Session { session_id: String, query: String },
+    OneShot { query: String },
+}
+
+impl CliCommand {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut args = args.into_iter();
+        let command = args.next().context("missing query or command")?;
+
+        if command == "gateway" {
+            return Ok(Self::Gateway {
+                name: args.next().context("missing gateway name")?,
+            });
+        }
+
+        if command == "--session" {
+            return Ok(Self::Session {
+                session_id: args.next().context("missing session id")?,
+                query: args.next().context("missing query")?,
+            });
+        }
+
+        Ok(Self::OneShot { query: command })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::CliCommand;
+
+    #[test]
+    fn parses_gateway_command() -> Result<()> {
+        let command = CliCommand::parse(["gateway", "telegram"].map(String::from))?;
+
+        assert_eq!(
+            command,
+            CliCommand::Gateway {
+                name: "telegram".to_string()
+            }
+        );
+
+        Ok(())
     }
 
-    if command == "--session" {
-        let session_id = args.next().context("missing session id")?;
-        let query = args.next().context("missing query")?;
-        let config = AppConfig::load("codrik.config.yml")?;
-        let result = app::run_once_with_session(query, config, session_id).await?;
+    #[test]
+    fn parses_session_command() -> Result<()> {
+        let command = CliCommand::parse(["--session", "work", "hello"].map(String::from))?;
 
-        println!("Agent: {}", result);
+        assert_eq!(
+            command,
+            CliCommand::Session {
+                session_id: "work".to_string(),
+                query: "hello".to_string(),
+            }
+        );
 
-        return Ok(());
+        Ok(())
     }
 
-    let result = app::run_once(command).await?;
+    #[test]
+    fn parses_one_shot_query() -> Result<()> {
+        let command = CliCommand::parse(["hello"].map(String::from))?;
 
-    println!("Agent: {}", result);
+        assert_eq!(
+            command,
+            CliCommand::OneShot {
+                query: "hello".to_string()
+            }
+        );
 
-    Ok(())
+        Ok(())
+    }
 }
