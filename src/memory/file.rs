@@ -242,6 +242,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_legacy_capitalized_roles() -> Result<()> {
+        let root = temp_session_root();
+        fs::create_dir_all(&root).await?;
+        fs::write(
+            root.join("legacy.json"),
+            r#"[
+  {
+    "role": "User",
+    "content": "legacy hello"
+  }
+]"#,
+        )
+        .await?;
+
+        let memory = FileMemoryStore::new(&root, "legacy")?;
+        let context = memory.load_context().await?;
+
+        assert_eq!(context, vec![Message::user("legacy hello")]);
+
+        fs::remove_dir_all(root).await.ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn concurrent_appends_keep_all_messages() -> Result<()> {
         let root = temp_session_root();
         let memory = FileMemoryStore::new(&root, "concurrent")?;
