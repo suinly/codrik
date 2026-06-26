@@ -27,9 +27,9 @@ where
 }
 
 pub async fn run_once(query: String) -> Result<String> {
-    let config = AppConfig::load("codrik.config.yml");
+    let config = AppConfig::load("codrik.config.yml")?;
 
-    run_once_with_config(query, config.unwrap()).await
+    run_once_with_config(query, config).await
 }
 
 pub async fn run_once_with_config(query: String, config: AppConfig) -> Result<String> {
