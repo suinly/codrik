@@ -1,10 +1,8 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use tokio::fs;
 
 use crate::{agent::message::Message, memory::store::MemoryStore};
 
@@ -26,21 +24,25 @@ impl FileMemoryStore {
         })
     }
 
-    fn read_messages(&self) -> Result<Vec<Message>> {
-        if !self.path.exists() {
+    async fn read_messages(&self) -> Result<Vec<Message>> {
+        if !fs::try_exists(&self.path)
+            .await
+            .with_context(|| format!("failed to inspect session file: {}", self.path.display()))?
+        {
             return Ok(Vec::new());
         }
 
         let content = fs::read_to_string(&self.path)
+            .await
             .with_context(|| format!("failed to read session file: {}", self.path.display()))?;
 
         serde_json::from_str(&content)
             .with_context(|| format!("failed to parse session file: {}", self.path.display()))
     }
 
-    fn write_messages(&self, messages: &[Message]) -> Result<()> {
+    async fn write_messages(&self, messages: &[Message]) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            fs::create_dir_all(parent).await.with_context(|| {
                 format!("failed to create session directory: {}", parent.display())
             })?;
         }
@@ -49,6 +51,7 @@ impl FileMemoryStore {
             serde_json::to_string_pretty(messages).context("failed to serialize session")?;
 
         fs::write(&self.path, content)
+            .await
             .with_context(|| format!("failed to write session file: {}", self.path.display()))
     }
 }
@@ -56,13 +59,13 @@ impl FileMemoryStore {
 #[async_trait]
 impl MemoryStore for FileMemoryStore {
     async fn save(&self, message: Message) -> Result<()> {
-        let mut messages = self.read_messages()?;
+        let mut messages = self.read_messages().await?;
         messages.push(message);
-        self.write_messages(&messages)
+        self.write_messages(&messages).await
     }
 
     async fn load_context(&self) -> Result<Vec<Message>> {
-        self.read_messages()
+        self.read_messages().await
     }
 }
 
@@ -76,13 +79,13 @@ fn is_safe_session_id(session_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use anyhow::Result;
+    use tokio::fs;
 
     use crate::{
         agent::message::Message,
@@ -117,12 +120,12 @@ mod tests {
 
         assert_eq!(restored, vec![message]);
 
-        let content = fs::read_to_string(root.join("work.json"))?;
+        let content = fs::read_to_string(root.join("work.json")).await?;
         assert!(content.contains("\"role\": \"user\""));
         assert!(!content.contains("tool_calls"));
         assert!(!content.contains("tool_call_id"));
 
-        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(root).await.ok();
 
         Ok(())
     }
@@ -148,7 +151,7 @@ mod tests {
 
         assert_eq!(restored, vec![message, tool_result]);
 
-        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(root).await.ok();
 
         Ok(())
     }
