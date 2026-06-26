@@ -154,7 +154,7 @@ if [[ -n "${TEA_REPO:-}" ]]; then
 fi
 
 echo "Creating Forgejo release $TAG"
-tea releases create "${TEA_ARGS[@]}" \
+tea releases create ${TEA_ARGS+"${TEA_ARGS[@]}"} \
   --tag "$TAG" \
   --title "$TAG" \
   --note-file "$NOTE_FILE" \
