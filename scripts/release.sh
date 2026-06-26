@@ -5,6 +5,20 @@ BIN_NAME="codrik-rs"
 MAC_TARGET="aarch64-apple-darwin"
 PI_TARGET="aarch64-unknown-linux-gnu"
 DIST_DIR="dist"
+VERSION_FILES_UPDATED=0
+RELEASE_COMMIT_CREATED=0
+
+cleanup_on_error() {
+  local status=$?
+  if [[ "$status" -ne 0 && "$VERSION_FILES_UPDATED" == "1" && "$RELEASE_COMMIT_CREATED" == "0" ]]; then
+    echo "Release failed before commit; restoring Cargo.toml and Cargo.lock" >&2
+    git restore -- Cargo.toml Cargo.lock
+    rm -rf "$DIST_DIR/$TAG"
+  fi
+  exit "$status"
+}
+
+trap cleanup_on_error EXIT
 
 usage() {
   cat <<USAGE
@@ -85,6 +99,7 @@ echo "Updating Cargo.toml package version from $CURRENT_VERSION to $VERSION"
 VERSION="$VERSION" perl -0pi -e \
   's/(\[package\][\s\S]*?\nversion = ")[^"]+(")/$1$ENV{VERSION}$2/' \
   Cargo.toml
+VERSION_FILES_UPDATED=1
 
 echo "Updating Cargo.lock package version"
 cargo check
@@ -123,6 +138,7 @@ NOTES
 echo "Creating git tag $TAG"
 git add Cargo.toml Cargo.lock
 git commit -m "chore(release): $TAG"
+RELEASE_COMMIT_CREATED=1
 git tag -a "$TAG" -m "Release $TAG"
 
 echo "Pushing release commit and git tag $TAG to origin"
