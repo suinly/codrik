@@ -1,14 +1,18 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use tokio::fs;
+use tokio::{fs, sync::Mutex};
 
 use crate::{agent::message::Message, memory::store::MemoryStore};
 
 #[derive(Clone, Debug)]
 pub struct FileMemoryStore {
     path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl FileMemoryStore {
@@ -21,6 +25,7 @@ impl FileMemoryStore {
 
         Ok(Self {
             path: root.as_ref().join(format!("{session_id}.json")),
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -59,6 +64,7 @@ impl FileMemoryStore {
 #[async_trait]
 impl MemoryStore for FileMemoryStore {
     async fn append(&self, message: Message) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
         let mut messages = self.read_messages().await?;
         messages.push(message);
         self.write_messages(&messages).await
@@ -85,7 +91,7 @@ mod tests {
     };
 
     use anyhow::Result;
-    use tokio::fs;
+    use tokio::{fs, task::JoinSet};
 
     use crate::{
         agent::message::Message,
@@ -150,6 +156,37 @@ mod tests {
         let restored = memory.load_context().await?;
 
         assert_eq!(restored, vec![message, tool_result]);
+
+        fs::remove_dir_all(root).await.ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_keep_all_messages() -> Result<()> {
+        let root = temp_session_root();
+        let memory = FileMemoryStore::new(&root, "concurrent")?;
+        let mut tasks = JoinSet::new();
+
+        for index in 0..20 {
+            let memory = memory.clone();
+            tasks.spawn(async move {
+                memory
+                    .append(Message::user(format!("message {index}")))
+                    .await
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            result??;
+        }
+
+        let context = memory.load_context().await?;
+
+        assert_eq!(context.len(), 20);
+        for index in 0..20 {
+            assert!(context.contains(&Message::user(format!("message {index}"))));
+        }
 
         fs::remove_dir_all(root).await.ok();
 
