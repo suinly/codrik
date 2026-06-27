@@ -1,8 +1,6 @@
-use std::path::Path;
-
 use crate::{
     agent::Agent,
-    config::AppConfig,
+    config::{AppConfig, codrik_dir},
     llm::openai::OpenAiClient,
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
     tools::ToolRegistry,
@@ -27,7 +25,7 @@ where
 }
 
 pub async fn run_once(query: String) -> Result<String> {
-    let config = AppConfig::load("codrik.config.yml")?;
+    let config = AppConfig::load_default()?;
 
     run_once_with_config(query, config).await
 }
@@ -43,7 +41,7 @@ pub async fn run_once_with_session(
     config: AppConfig,
     session_id: impl AsRef<str>,
 ) -> Result<String> {
-    let memory = FileMemoryStore::new(Path::new(".codrik").join("sessions"), session_id)?;
+    let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
     let agent = build_agent_with_memory(config, memory);
 
     agent.execute(query).await

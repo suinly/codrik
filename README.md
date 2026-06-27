@@ -12,7 +12,9 @@ curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.
 ```
 
 The installer downloads the release binary for the current platform, verifies
-the `.sha256` checksum, and installs it as `codrik` into `~/.local/bin`.
+the `.sha256` checksum, and installs it as `codrik` into `~/.local/bin`. It can
+also create `~/.codrik/codrik.config.yml` interactively and install a user
+service for a configured gateway.
 Release assets are produced by `scripts/release.sh`.
 
 Supported release targets:
@@ -32,6 +34,18 @@ Install to another directory:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh | env CODRIK_INSTALL_DIR=/usr/local/bin sh
+```
+
+Skip interactive configuration:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh | env CODRIK_SKIP_CONFIG=1 sh
+```
+
+Skip gateway service setup:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh | env CODRIK_SKIP_SERVICE=1 sh
 ```
 
 Override the release repository or target:
@@ -62,3 +76,6 @@ Run the Telegram gateway:
 ```sh
 codrik gateway telegram
 ```
+
+By default, `codrik` loads config from `CODRIK_CONFIG`, then
+`./codrik.config.yml`, then `~/.codrik/codrik.config.yml`.

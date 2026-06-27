@@ -7,13 +7,13 @@ pub async fn run() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
         CliCommand::Gateway { name } => match name.as_str() {
             "telegram" => {
-                let config = AppConfig::load("codrik.config.yml")?;
+                let config = AppConfig::load_default()?;
                 telegram::run(config).await
             }
             _ => bail!("unknown gateway: {name}"),
         },
         CliCommand::Session { session_id, query } => {
-            let config = AppConfig::load("codrik.config.yml")?;
+            let config = AppConfig::load_default()?;
             let result = app::run_once_with_session(query, config, session_id).await?;
 
             println!("Agent: {}", result);
