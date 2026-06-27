@@ -7,6 +7,7 @@ MAC_X64_TARGET="x86_64-apple-darwin"
 PI_TARGET="aarch64-unknown-linux-gnu"
 LINUX_X64_TARGET="x86_64-unknown-linux-gnu"
 DIST_DIR="dist"
+INSTALL_URL="https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh"
 VERSION_FILES_UPDATED=0
 RELEASE_COMMIT_CREATED=0
 
@@ -45,6 +46,113 @@ die() {
 
 need_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+commit_lines_matching() {
+  local range="$1"
+  local pattern="$2"
+
+  git log --no-merges --format='%s' "$range" \
+    | grep -E "$pattern" \
+    | sed -E 's/^/- /' \
+    || true
+}
+
+write_commit_section() {
+  local note_file="$1"
+  local title="$2"
+  local range="$3"
+  local pattern="$4"
+  local lines
+
+  lines="$(commit_lines_matching "$range" "$pattern")"
+  if [[ -n "$lines" ]]; then
+    {
+      printf '\n## %s\n\n' "$title"
+      printf '%s\n' "$lines"
+    } >>"$note_file"
+  fi
+}
+
+write_other_commit_section() {
+  local note_file="$1"
+  local range="$2"
+  local lines
+
+  lines="$(
+    git log --no-merges --format='%s' "$range" \
+      | grep -Ev '^(feat|fix|docs|build|ci|chore|refactor|perf|test)(\([^)]+\))?!?:' \
+      | sed -E 's/^/- /' \
+      || true
+  )"
+
+  if [[ -n "$lines" ]]; then
+    {
+      printf '\n## Other Changes\n\n'
+      printf '%s\n' "$lines"
+    } >>"$note_file"
+  fi
+}
+
+write_closed_issues_section() {
+  local note_file="$1"
+  local range="$2"
+  local issues
+
+  issues="$(
+    git log --format='%B' "$range" \
+      | grep -Eio '(^|[[:space:]])(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#?[0-9]+' \
+      | grep -Eo '#?[0-9]+' \
+      | sed -E 's/^#?/#/' \
+      | sort -u \
+      | sed -E 's/^/- /' \
+      || true
+  )"
+
+  if [[ -n "$issues" ]]; then
+    {
+      printf '\n## Closed Issues\n\n'
+      printf '%s\n' "$issues"
+    } >>"$note_file"
+  fi
+}
+
+write_release_notes() {
+  local note_file="$1"
+  local tag="$2"
+  local range="$3"
+
+  cat >"$note_file" <<NOTES
+Release $tag
+NOTES
+
+  write_commit_section "$note_file" "Features" "$range" '^feat(\([^)]+\))?!?:'
+  write_commit_section "$note_file" "Fixes" "$range" '^fix(\([^)]+\))?!?:'
+  write_commit_section "$note_file" "Documentation" "$range" '^docs(\([^)]+\))?!?:'
+  write_commit_section "$note_file" "Build and Release" "$range" '^(build|ci|chore)(\([^)]+\))?!?:'
+  write_commit_section "$note_file" "Internal" "$range" '^(refactor|perf|test)(\([^)]+\))?!?:'
+  write_other_commit_section "$note_file" "$range"
+  write_closed_issues_section "$note_file" "$range"
+
+  cat >>"$note_file" <<NOTES
+
+## Install
+
+\`\`\`sh
+curl -fsSL $INSTALL_URL | sh
+\`\`\`
+
+## Compatibility
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+- Raspberry Pi 5
+
+## Checksums
+
+Checksums are published as \`.sha256\` files next to each binary.
+NOTES
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -88,6 +196,13 @@ fi
 
 if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
   die "remote tag already exists on origin: $TAG"
+fi
+
+PREVIOUS_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+if [[ -n "$PREVIOUS_TAG" ]]; then
+  CHANGELOG_RANGE="$PREVIOUS_TAG..HEAD"
+else
+  CHANGELOG_RANGE="HEAD"
 fi
 
 CURRENT_VERSION="$(perl -0ne 'if (/\[package\][\s\S]*?\nversion = "([^"]+)"/) { print $1; exit }' Cargo.toml)"
@@ -140,15 +255,7 @@ chmod 755 "$MAC_ASSET" "$MAC_X64_ASSET" "$PI_ASSET" "$LINUX_X64_ASSET"
 )
 
 NOTE_FILE="$DIST_DIR/$TAG/release-notes.md"
-cat >"$NOTE_FILE" <<NOTES
-Release $TAG
-
-Assets:
-- $BIN_NAME-$TAG-$MAC_TARGET
-- $BIN_NAME-$TAG-$MAC_X64_TARGET
-- $BIN_NAME-$TAG-raspberry-pi-5-$PI_TARGET
-- $BIN_NAME-$TAG-$LINUX_X64_TARGET
-NOTES
+write_release_notes "$NOTE_FILE" "$TAG" "$CHANGELOG_RANGE"
 
 echo "Creating git tag $TAG"
 git add Cargo.toml Cargo.lock
