@@ -2,7 +2,7 @@
 set -eu
 
 BIN_NAME="codrik"
-DEFAULT_REPO_URL="https://gitflow.suinly.com/codrik/codrik"
+DEFAULT_REPO_URL="https://github.com/suinly/codrik"
 if [ -n "${HOME:-}" ]; then
   DEFAULT_INSTALL_DIR="$HOME/.local/bin"
 else
@@ -23,7 +23,7 @@ usage() {
 Install codrik from release assets.
 
 Usage:
-  curl -fsSL ${DEFAULT_REPO_URL}/raw/branch/main/scripts/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh | sh
 
 Environment:
   CODRIK_REPO_URL      Release repository URL. Default: ${DEFAULT_REPO_URL}

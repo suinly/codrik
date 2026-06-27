@@ -8,7 +8,7 @@ optional tools, and session memory.
 Install the latest release on Linux or macOS:
 
 ```sh
-curl -fsSL https://gitflow.suinly.com/codrik/codrik/raw/branch/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh | sh
 ```
 
 The installer downloads the release binary for the current platform, verifies
@@ -25,20 +25,20 @@ Supported release targets:
 Install a specific release:
 
 ```sh
-curl -fsSL https://gitflow.suinly.com/codrik/codrik/raw/branch/main/scripts/install.sh | env CODRIK_VERSION=v0.2.0 sh
+curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh | env CODRIK_VERSION=v0.2.0 sh
 ```
 
 Install to another directory:
 
 ```sh
-curl -fsSL https://gitflow.suinly.com/codrik/codrik/raw/branch/main/scripts/install.sh | env CODRIK_INSTALL_DIR=/usr/local/bin sh
+curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh | env CODRIK_INSTALL_DIR=/usr/local/bin sh
 ```
 
 Override the release repository or target:
 
 ```sh
-curl -fsSL https://gitflow.suinly.com/codrik/codrik/raw/branch/main/scripts/install.sh \
-  | env CODRIK_REPO_URL=https://gitflow.suinly.com/codrik/codrik \
+curl -fsSL https://raw.githubusercontent.com/suinly/codrik/main/scripts/install.sh \
+  | env CODRIK_REPO_URL=https://github.com/suinly/codrik \
     CODRIK_TARGET=x86_64-unknown-linux-gnu \
     sh
 ```
