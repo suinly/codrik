@@ -1,6 +1,6 @@
-# codrik-rs Context
+# codrik Context
 
-codrik-rs is a small agent runtime that runs user turns through an LLM, optional tools, and session memory.
+codrik is a small agent runtime that runs user turns through an LLM, optional tools, and session memory.
 
 ## Language
 

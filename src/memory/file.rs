@@ -188,7 +188,7 @@ mod tests {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         std::env::temp_dir().join(format!(
-            "codrik-rs-test-{}-{suffix}-{counter}",
+            "codrik-test-{}-{suffix}-{counter}",
             std::process::id()
         ))
     }

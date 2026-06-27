@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN_NAME="codrik-rs"
+BIN_NAME="codrik"
 MAC_TARGET="aarch64-apple-darwin"
 PI_TARGET="aarch64-unknown-linux-gnu"
 DIST_DIR="dist"
