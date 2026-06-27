@@ -23,7 +23,7 @@ impl AppConfig {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
-        let config = serde_yaml::from_str(&content)
+        let config = yaml_serde::from_str(&content)
             .with_context(|| format!("failed to parse config file: {}", path.display()))?;
 
         Ok(config)
