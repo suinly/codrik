@@ -266,6 +266,37 @@ write_launchd_service() {
 PLIST
 }
 
+print_service_management_hint() {
+  os="$1"
+  gateway="$2"
+
+  case "$os" in
+    Linux)
+      cat <<HINT
+Manage the gateway service with:
+  systemctl --user status codrik-$gateway.service
+  systemctl --user restart codrik-$gateway.service
+  journalctl --user -u codrik-$gateway.service -f
+
+This is a user service, so do not use sudo, service, or systemctl without --user.
+To start it at boot without logging in, run:
+  loginctl enable-linger $(id -un 2>/dev/null || printf '%s' "\$USER")
+HINT
+      ;;
+    Darwin)
+      cat <<HINT
+Manage the gateway service with:
+  launchctl print gui/$(id -u)/com.suinly.codrik.$gateway
+  launchctl kickstart -k gui/$(id -u)/com.suinly.codrik.$gateway
+
+Logs:
+  ~/.codrik/$gateway.log
+  ~/.codrik/$gateway.err.log
+HINT
+      ;;
+  esac
+}
+
 install_gateway_service() {
   gateway="$1"
   bin_path="$2"
@@ -284,6 +315,7 @@ install_gateway_service() {
       systemctl --user daemon-reload
       systemctl --user enable --now "codrik-$gateway.service"
       echo "Started user service codrik-$gateway.service"
+      print_service_management_hint "$os" "$gateway"
       ;;
     Darwin)
       need_command launchctl
@@ -296,6 +328,7 @@ install_gateway_service() {
       launchctl enable "gui/$(id -u)/$label"
       launchctl kickstart -k "gui/$(id -u)/$label"
       echo "Started LaunchAgent $label"
+      print_service_management_hint "$os" "$gateway"
       ;;
     *)
       echo "Gateway service setup is not supported on $os." >&2

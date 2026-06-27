@@ -79,3 +79,20 @@ codrik gateway telegram
 
 By default, `codrik` loads config from `CODRIK_CONFIG`, then
 `./codrik.config.yml`, then `~/.codrik/codrik.config.yml`.
+
+## Gateway Service
+
+On Linux, the installer creates a user-level systemd service. Manage it without
+`sudo` and with `--user`:
+
+```sh
+systemctl --user status codrik-telegram.service
+systemctl --user restart codrik-telegram.service
+journalctl --user -u codrik-telegram.service -f
+```
+
+To start the gateway after reboot before the user logs in:
+
+```sh
+loginctl enable-linger "$USER"
+```
