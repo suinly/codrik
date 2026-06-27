@@ -3,7 +3,9 @@ set -euo pipefail
 
 BIN_NAME="codrik"
 MAC_TARGET="aarch64-apple-darwin"
+MAC_X64_TARGET="x86_64-apple-darwin"
 PI_TARGET="aarch64-unknown-linux-gnu"
+LINUX_X64_TARGET="x86_64-unknown-linux-gnu"
 DIST_DIR="dist"
 VERSION_FILES_UPDATED=0
 RELEASE_COMMIT_CREATED=0
@@ -93,7 +95,7 @@ CURRENT_VERSION="$(perl -0ne 'if (/\[package\][\s\S]*?\nversion = "([^"]+)"/) { 
 [[ -n "$CURRENT_VERSION" ]] || die "could not read package version from Cargo.toml"
 [[ "$CURRENT_VERSION" != "$VERSION" ]] || die "Cargo.toml already has version $VERSION"
 
-rustup target add "$MAC_TARGET" "$PI_TARGET"
+rustup target add "$MAC_TARGET" "$MAC_X64_TARGET" "$PI_TARGET" "$LINUX_X64_TARGET"
 
 echo "Updating Cargo.toml package version from $CURRENT_VERSION to $VERSION"
 VERSION="$VERSION" perl -0pi -e \
@@ -110,20 +112,32 @@ mkdir -p "$DIST_DIR/$TAG"
 echo "Building $BIN_NAME for macOS Apple Silicon ($MAC_TARGET)"
 cargo build --release --target "$MAC_TARGET"
 
+echo "Building $BIN_NAME for macOS Intel ($MAC_X64_TARGET)"
+cargo build --release --target "$MAC_X64_TARGET"
+
 echo "Building $BIN_NAME for Raspberry Pi 5 ($PI_TARGET)"
 cargo zigbuild --release --target "$PI_TARGET"
 
+echo "Building $BIN_NAME for Linux x86_64 ($LINUX_X64_TARGET)"
+cargo zigbuild --release --target "$LINUX_X64_TARGET"
+
 MAC_ASSET="$DIST_DIR/$TAG/$BIN_NAME-$TAG-$MAC_TARGET"
+MAC_X64_ASSET="$DIST_DIR/$TAG/$BIN_NAME-$TAG-$MAC_X64_TARGET"
 PI_ASSET="$DIST_DIR/$TAG/$BIN_NAME-$TAG-raspberry-pi-5-$PI_TARGET"
+LINUX_X64_ASSET="$DIST_DIR/$TAG/$BIN_NAME-$TAG-$LINUX_X64_TARGET"
 
 cp "target/$MAC_TARGET/release/$BIN_NAME" "$MAC_ASSET"
+cp "target/$MAC_X64_TARGET/release/$BIN_NAME" "$MAC_X64_ASSET"
 cp "target/$PI_TARGET/release/$BIN_NAME" "$PI_ASSET"
-chmod 755 "$MAC_ASSET" "$PI_ASSET"
+cp "target/$LINUX_X64_TARGET/release/$BIN_NAME" "$LINUX_X64_ASSET"
+chmod 755 "$MAC_ASSET" "$MAC_X64_ASSET" "$PI_ASSET" "$LINUX_X64_ASSET"
 
 (
   cd "$DIST_DIR/$TAG"
   shasum -a 256 "$(basename "$MAC_ASSET")" >"$(basename "$MAC_ASSET").sha256"
+  shasum -a 256 "$(basename "$MAC_X64_ASSET")" >"$(basename "$MAC_X64_ASSET").sha256"
   shasum -a 256 "$(basename "$PI_ASSET")" >"$(basename "$PI_ASSET").sha256"
+  shasum -a 256 "$(basename "$LINUX_X64_ASSET")" >"$(basename "$LINUX_X64_ASSET").sha256"
 )
 
 NOTE_FILE="$DIST_DIR/$TAG/release-notes.md"
@@ -132,7 +146,9 @@ Release $TAG
 
 Assets:
 - $BIN_NAME-$TAG-$MAC_TARGET
+- $BIN_NAME-$TAG-$MAC_X64_TARGET
 - $BIN_NAME-$TAG-raspberry-pi-5-$PI_TARGET
+- $BIN_NAME-$TAG-$LINUX_X64_TARGET
 NOTES
 
 echo "Creating git tag $TAG"
@@ -160,7 +176,11 @@ tea releases create ${TEA_ARGS+"${TEA_ARGS[@]}"} \
   --note-file "$NOTE_FILE" \
   --asset "$MAC_ASSET" \
   --asset "$MAC_ASSET.sha256" \
+  --asset "$MAC_X64_ASSET" \
+  --asset "$MAC_X64_ASSET.sha256" \
   --asset "$PI_ASSET" \
-  --asset "$PI_ASSET.sha256"
+  --asset "$PI_ASSET.sha256" \
+  --asset "$LINUX_X64_ASSET" \
+  --asset "$LINUX_X64_ASSET.sha256"
 
 echo "Release $TAG created"
