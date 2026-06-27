@@ -31,11 +31,10 @@ Examples:
   $0 v0.2.0
 
 Environment:
-  TEA_LOGIN  Optional tea login name, passed as: --login <value>
-  TEA_REPO   Optional repository slug, passed as: --repo <value>
+  GH_REPO  Optional GitHub repository slug, passed as: --repo <value>
 
 Required tools:
-  git, rustup, cargo, cargo-zigbuild, zig, tea, perl, shasum
+  git, rustup, cargo, cargo-zigbuild, zig, gh, perl, shasum
 USAGE
 }
 
@@ -70,7 +69,7 @@ need_command rustup
 need_command cargo
 command -v zig >/dev/null 2>&1 \
   || die "missing required command: zig; install it with: brew install zig"
-need_command tea
+need_command gh
 need_command perl
 need_command shasum
 
@@ -161,26 +160,22 @@ echo "Pushing release commit and git tag $TAG to origin"
 git push origin HEAD
 git push origin "$TAG"
 
-TEA_ARGS=()
-if [[ -n "${TEA_LOGIN:-}" ]]; then
-  TEA_ARGS+=(--login "$TEA_LOGIN")
-fi
-if [[ -n "${TEA_REPO:-}" ]]; then
-  TEA_ARGS+=(--repo "$TEA_REPO")
+GH_ARGS=()
+if [[ -n "${GH_REPO:-}" ]]; then
+  GH_ARGS+=(--repo "$GH_REPO")
 fi
 
-echo "Creating Forgejo release $TAG"
-tea releases create ${TEA_ARGS+"${TEA_ARGS[@]}"} \
-  --tag "$TAG" \
+echo "Creating GitHub release $TAG"
+gh release create "$TAG" ${GH_ARGS+"${GH_ARGS[@]}"} \
   --title "$TAG" \
-  --note-file "$NOTE_FILE" \
-  --asset "$MAC_ASSET" \
-  --asset "$MAC_ASSET.sha256" \
-  --asset "$MAC_X64_ASSET" \
-  --asset "$MAC_X64_ASSET.sha256" \
-  --asset "$PI_ASSET" \
-  --asset "$PI_ASSET.sha256" \
-  --asset "$LINUX_X64_ASSET" \
-  --asset "$LINUX_X64_ASSET.sha256"
+  --notes-file "$NOTE_FILE" \
+  "$MAC_ASSET" \
+  "$MAC_ASSET.sha256" \
+  "$MAC_X64_ASSET" \
+  "$MAC_X64_ASSET.sha256" \
+  "$PI_ASSET" \
+  "$PI_ASSET.sha256" \
+  "$LINUX_X64_ASSET" \
+  "$LINUX_X64_ASSET.sha256"
 
 echo "Release $TAG created"
