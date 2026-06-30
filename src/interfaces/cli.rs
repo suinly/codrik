@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
 use std::env;
 
-use crate::{app, config::AppConfig, interfaces::telegram};
+use crate::{app, config::AppConfig, interfaces::telegram, updater};
 
 pub async fn run() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
+        CliCommand::Update => updater::update().await,
         CliCommand::Gateway { name } => match name.as_str() {
             "telegram" => {
                 let config = AppConfig::load_default()?;
@@ -32,6 +33,7 @@ pub async fn run() -> Result<()> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CliCommand {
+    Update,
     Gateway { name: String },
     Session { session_id: String, query: String },
     OneShot { query: String },
@@ -41,6 +43,10 @@ impl CliCommand {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut args = args.into_iter();
         let command = args.next().context("missing query or command")?;
+
+        if command == "update" {
+            return Ok(Self::Update);
+        }
 
         if command == "gateway" {
             return Ok(Self::Gateway {
@@ -75,6 +81,15 @@ mod tests {
                 name: "telegram".to_string()
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parses_update_command() -> Result<()> {
+        let command = CliCommand::parse(["update"].map(String::from))?;
+
+        assert_eq!(command, CliCommand::Update);
 
         Ok(())
     }

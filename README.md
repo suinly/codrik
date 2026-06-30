@@ -77,6 +77,15 @@ Run the Telegram gateway:
 codrik gateway telegram
 ```
 
+Update to the latest release:
+
+```sh
+codrik update
+```
+
+If the Telegram gateway user service is running, `codrik update` restarts it
+after replacing the binary.
+
 By default, `codrik` loads config from `CODRIK_CONFIG`, then
 `./config.yml`, then `~/.codrik/config.yml`.
 

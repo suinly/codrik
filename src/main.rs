@@ -5,6 +5,7 @@ mod interfaces;
 mod llm;
 mod memory;
 mod tools;
+mod updater;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
