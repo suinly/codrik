@@ -42,15 +42,13 @@ fn default_config_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
 
-    let cwd_config = PathBuf::from("codrik.config.yml");
+    let cwd_config = PathBuf::from("config.yml");
     if cwd_config.exists() {
         return Ok(cwd_config);
     }
 
     let home = env::var("HOME").context("HOME is not set; set CODRIK_CONFIG explicitly")?;
-    Ok(PathBuf::from(home)
-        .join(".codrik")
-        .join("codrik.config.yml"))
+    Ok(PathBuf::from(home).join(".codrik").join("config.yml"))
 }
 
 pub fn codrik_dir() -> Result<PathBuf> {

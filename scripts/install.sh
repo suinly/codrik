@@ -297,6 +297,32 @@ HINT
   esac
 }
 
+enable_user_linger() {
+  user_name="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
+
+  if [ -z "$user_name" ]; then
+    echo "Could not determine current user; run loginctl enable-linger manually." >&2
+    return
+  fi
+
+  if ! command -v loginctl >/dev/null 2>&1; then
+    echo "loginctl is not available; user service may stop after logout." >&2
+    return
+  fi
+
+  if loginctl enable-linger "$user_name"; then
+    echo "Enabled lingering for $user_name so the gateway can run after logout."
+  else
+    cat >&2 <<HINT
+Could not enable lingering automatically.
+The gateway service may stop after logout. Run:
+  loginctl enable-linger $user_name
+or, if your system requires elevated privileges:
+  sudo loginctl enable-linger $user_name
+HINT
+  fi
+}
+
 install_gateway_service() {
   gateway="$1"
   bin_path="$2"
@@ -310,10 +336,12 @@ install_gateway_service() {
   case "$os" in
     Linux)
       need_command systemctl
+      need_command id
       service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/codrik-$gateway.service"
       write_systemd_user_service "$service_file" "$bin_path" "$config_file" "$gateway" "$runtime_dir"
       systemctl --user daemon-reload
       systemctl --user enable --now "codrik-$gateway.service"
+      enable_user_linger
       echo "Started user service codrik-$gateway.service"
       print_service_management_hint "$os" "$gateway"
       ;;
@@ -338,7 +366,8 @@ install_gateway_service() {
 
 configure_codrik() {
   config_dir="$1"
-  config_file="$config_dir/codrik.config.yml"
+  config_file="$config_dir/config.yml"
+  legacy_config_file="$config_dir/codrik.config.yml"
   CONFIGURED_GATEWAY="none"
   CONFIGURED_CONFIG_FILE="$config_file"
 
@@ -352,6 +381,11 @@ configure_codrik() {
 
   if ! ask_yes_no "Configure codrik now?" "y"; then
     return
+  fi
+
+  if [ ! -f "$config_file" ] && [ -f "$legacy_config_file" ]; then
+    mv "$legacy_config_file" "$config_file"
+    echo "Renamed existing config to $config_file"
   fi
 
   if [ -f "$config_file" ] && ! ask_yes_no "$config_file already exists. Overwrite it?" "n"; then

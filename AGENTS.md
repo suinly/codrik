@@ -64,4 +64,4 @@ Use concise subjects in the imperative mood and keep each commit focused.
 Pull requests should include the purpose, behavior changes, validation commands,
 and any linked issue. For CLI or Telegram-facing changes, include a short manual
 test transcript or describe the runtime path exercised. Do not include real API
-keys or private config values from `codrik.config.yml`.
+keys or private config values from `config.yml`.
