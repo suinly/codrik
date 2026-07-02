@@ -11,11 +11,16 @@ use tokio::{
     time::{Duration, Instant, sleep},
 };
 
+mod commands;
+
+use commands::{answer_session_command, is_command_addressed_to_other_bot, is_start_command};
+
 use crate::{
     app,
     auth::{AuthDecision, AuthorizationStore, AuthorizedActor, GatewayIdentity},
     config::AppConfig,
     llm::client::{LlmStreamEvent, LlmStreamSink},
+    memory::telegram_sessions::TelegramSessionStore,
 };
 
 const DRAFT_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
@@ -30,6 +35,8 @@ pub async fn run(config: AppConfig) -> Result<()> {
         .clone();
     let draft_api = TelegramDraftApi::new(token.clone());
     let auth_store = AuthorizationStore::new(crate::config::codrik_dir()?.join("users.json"));
+    let session_store =
+        TelegramSessionStore::new(crate::config::codrik_dir()?.join("telegram-sessions.json"));
 
     let bot = Bot::new(token);
     let me = bot
@@ -40,11 +47,14 @@ pub async fn run(config: AppConfig) -> Result<()> {
         "Telegram gateway started for @{}",
         me.user.username.as_deref().unwrap_or("<unknown>")
     );
+    let bot_username = me.user.username.clone();
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let config = config.clone();
         let draft_api = draft_api.clone();
         let auth_store = auth_store.clone();
+        let session_store = session_store.clone();
+        let bot_username = bot_username.clone();
 
         async move {
             let Some(text) = msg.text() else {
@@ -61,16 +71,45 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 return Ok(());
             };
 
-            let answer = if is_start_command(text) {
+            if is_command_addressed_to_other_bot(text, bot_username.as_deref()) {
+                return Ok(());
+            }
+
+            let answer = if is_start_command(text, bot_username.as_deref()) {
                 answer_start_command(&auth_store, identity).await
             } else {
                 match auth_store.authorize(&identity).await {
                     Ok(AuthDecision::Authorized(actor)) => {
-                        if msg.chat.is_private() {
-                            answer_private_chat(bot.clone(), &msg, text, config, actor, draft_api)
-                                .await
+                        if let Some(answer) = answer_session_command(
+                            &session_store,
+                            msg.chat.id,
+                            text,
+                            bot_username.as_deref(),
+                        )
+                        .await
+                        {
+                            answer
+                        } else if msg.chat.is_private() {
+                            answer_private_chat(
+                                bot.clone(),
+                                &session_store,
+                                &msg,
+                                text,
+                                config,
+                                actor,
+                                draft_api,
+                            )
+                            .await
                         } else {
-                            answer_regular_chat(bot.clone(), msg.chat.id, text, config, actor).await
+                            answer_regular_chat(
+                                bot.clone(),
+                                &session_store,
+                                msg.chat.id,
+                                text,
+                                config,
+                                actor,
+                            )
+                            .await
                         }
                     }
                     Ok(AuthDecision::Denied) => denied_message(),
@@ -102,19 +141,24 @@ pub async fn run(config: AppConfig) -> Result<()> {
 
 async fn answer_private_chat(
     bot: Bot,
+    session_store: &TelegramSessionStore,
     msg: &Message,
     text: &str,
     config: AppConfig,
     actor: AuthorizedActor,
     draft_api: TelegramDraftApi,
 ) -> String {
+    let session_id = match active_session_id_or_error(session_store, msg.chat.id).await {
+        Ok(session_id) => session_id,
+        Err(error) => return format!("Gateway error: {error:#}"),
+    };
     let typing = keep_typing(bot, msg.chat.id);
     let mut stream = TelegramDraftStream::new(draft_api, msg.chat.id, msg.id, typing);
     let result = app::run_once_with_actor_session_streaming(
         text.to_string(),
         config,
         actor,
-        session_id(msg.chat.id),
+        session_id,
         &mut stream,
     )
     .await;
@@ -125,18 +169,35 @@ async fn answer_private_chat(
 
 async fn answer_regular_chat(
     bot: Bot,
+    session_store: &TelegramSessionStore,
     chat_id: ChatId,
     text: &str,
     config: AppConfig,
     actor: AuthorizedActor,
 ) -> String {
+    let session_id = match active_session_id_or_error(session_store, chat_id).await {
+        Ok(session_id) => session_id,
+        Err(error) => return format!("Gateway error: {error:#}"),
+    };
     let typing = keep_typing(bot, chat_id);
     let result =
-        app::run_once_with_actor_session(text.to_string(), config, actor, session_id(chat_id))
-            .await;
+        app::run_once_with_actor_session(text.to_string(), config, actor, session_id).await;
     stop_typing(typing).await;
 
     answer_or_gateway_error(chat_id, result)
+}
+
+async fn active_session_id_or_error(
+    session_store: &TelegramSessionStore,
+    chat_id: ChatId,
+) -> Result<String> {
+    session_store
+        .active_session_id(chat_id.0)
+        .await
+        .map_err(|error| {
+            eprintln!("Telegram active session lookup failed for chat {chat_id}: {error:#}");
+            error
+        })
 }
 
 async fn answer_start_command(
@@ -155,11 +216,6 @@ async fn answer_start_command(
 fn denied_message() -> String {
     "Доступ к Кодрику не выдан. Отправь /start и попроси владельца включить тебе доступ."
         .to_string()
-}
-
-fn is_start_command(text: &str) -> bool {
-    let command = text.split_whitespace().next().unwrap_or_default();
-    command == "/start" || command.starts_with("/start@")
 }
 
 fn telegram_identity(msg: &Message) -> Option<GatewayIdentity> {
@@ -183,10 +239,6 @@ fn answer_or_gateway_error(chat_id: ChatId, result: Result<String>) -> String {
             format!("Gateway error: {error:#}")
         }
     }
-}
-
-fn session_id(chat_id: ChatId) -> String {
-    format!("telegram-chat-{chat_id}")
 }
 
 fn keep_typing(bot: Bot, chat_id: ChatId) -> JoinHandle<()> {
@@ -369,15 +421,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> &str {
 mod tests {
     use crate::auth::GatewayIdentity;
 
-    use super::{denied_message, is_start_command, telegram_identity_from_sender, truncate_chars};
-
-    #[test]
-    fn recognizes_plain_and_addressed_start_commands() {
-        assert!(is_start_command("/start"));
-        assert!(is_start_command("/start extra"));
-        assert!(is_start_command("/start@CodrikBot"));
-        assert!(!is_start_command("/restart"));
-    }
+    use super::{denied_message, telegram_identity_from_sender, truncate_chars};
 
     #[test]
     fn telegram_identity_uses_sender_user_id() {
