@@ -77,6 +77,33 @@ Run the Telegram gateway:
 codrik gateway telegram
 ```
 
+Telegram access is controlled by `~/.codrik/users.json`. The first Telegram
+user who sends `/start` is bootstrapped as enabled with access to every
+available tool. Later users who send `/start` are added as disabled entries;
+enable them manually and set their `tools` list:
+
+```json
+{
+  "version": 1,
+  "actors": {
+    "actor:telegram:12312931": {
+      "enabled": true,
+      "display_name": "SomeUserName",
+      "identities": [
+        {
+          "provider": "telegram",
+          "subject": "12312931",
+          "username": "SomeUserName"
+        }
+      ],
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Use `"tools": ["*"]` to grant access to every available tool.
+
 Update to the latest release:
 
 ```sh

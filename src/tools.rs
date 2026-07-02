@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 mod datetime;
 
 use anyhow::{Result, bail};
@@ -14,6 +16,21 @@ impl ToolRegistry {
         Self {
             handlers: vec![Box::new(datetime::DatetimeTool)],
         }
+    }
+
+    pub fn with_allowed_tools(allowed_tools: impl IntoIterator<Item = String>) -> Self {
+        let allowed_tools = allowed_tools.into_iter().collect::<HashSet<_>>();
+        if allowed_tools.contains("*") {
+            return Self::new();
+        }
+
+        let handlers = Self::new()
+            .handlers
+            .into_iter()
+            .filter(|handler| allowed_tools.contains(handler.name()))
+            .collect();
+
+        Self { handlers }
     }
 }
 
@@ -45,5 +62,29 @@ mod tests {
         let datetime_name = datetime::DatetimeTool.definition().name;
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
+    }
+
+    #[test]
+    fn definitions_hide_disallowed_tools() {
+        let tools = ToolRegistry::with_allowed_tools(Vec::<String>::new()).definitions();
+
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn wildcard_allows_all_tools() {
+        let tools = ToolRegistry::with_allowed_tools(vec!["*".to_string()]).definitions();
+        let datetime_name = datetime::DatetimeTool.definition().name;
+
+        assert!(tools.iter().any(|tool| tool.name == datetime_name));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_disallowed_tools() {
+        let result = ToolRegistry::with_allowed_tools(Vec::<String>::new())
+            .execute("datetime", "{}")
+            .await;
+
+        assert_eq!(result.unwrap_err().to_string(), "unknown tool: datetime");
     }
 }

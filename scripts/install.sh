@@ -432,6 +432,7 @@ configure_codrik() {
         echo "Telegram bot token is required for telegram gateway." >&2
       fi
     done
+    echo "Telegram access will be bootstrapped in $config_dir/users.json when the first user sends /start."
   fi
 
   mkdir -p "$config_dir"

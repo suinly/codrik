@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod auth;
 mod config;
 mod interfaces;
 mod llm;
