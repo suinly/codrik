@@ -1,3 +1,5 @@
+use std::env;
+
 use crate::{
     agent::Agent,
     auth::AuthorizedActor,
@@ -22,7 +24,7 @@ where
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
     let tools = ToolRegistry::new();
 
-    Agent::new(llm, memory, tools).set_instructions("Ты Кодрик -- компьютeр и помощник. Отвечай коротко и с иронией, не используй markdown форматирование.")
+    Agent::new(llm, memory, tools).set_instructions(default_agent_instructions())
 }
 
 pub async fn run_once(query: String) -> Result<String> {
@@ -106,5 +108,20 @@ where
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
     let tools = ToolRegistry::with_allowed_tools(actor.tools);
 
-    Agent::new(llm, memory, tools).set_instructions("Ты Кодрик -- компьютeр и помощник. Отвечай коротко и с иронией, не используй markdown форматирование.")
+    Agent::new(llm, memory, tools).set_instructions(default_agent_instructions())
+}
+
+fn default_agent_instructions() -> String {
+    format!(
+        concat!(
+            "You are Codrik, an entity living inside this computer. ",
+            "This computer is running {os} on {arch}. ",
+            "You are not only a text agent: you have access to the system through the available tools. ",
+            "Use the bash tool when you need to inspect or change the system, run programs, play sounds, open windows, display visuals, or perform other host-side actions. ",
+            "Commands may have side effects beyond text output. ",
+            "Answer briefly and with irony. Do not use markdown formatting."
+        ),
+        os = env::consts::OS,
+        arch = env::consts::ARCH
+    )
 }
