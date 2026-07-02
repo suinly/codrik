@@ -4,7 +4,9 @@ mod tool_observation;
 
 use crate::agent::message::Message;
 use crate::agent::tool::ToolExecutor;
-use crate::llm::client::{LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamSink};
+use crate::llm::client::{
+    LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
+};
 use crate::memory::store::MemoryStore;
 use anyhow::{Result, bail};
 
@@ -67,14 +69,30 @@ where
 
         for _ in 0..MAX_TOOL_CALL_ITERATIONS {
             let request = self.build_llm_request().await?;
-            let response = self.llm.stream(request, sink).await?;
+            let streamed_turn = self.stream_turn(request).await?;
+            let (response, stream_events) = streamed_turn.into_parts();
 
-            if let Some(answer) = self.record_response(response).await? {
+            if response.tool_calls.is_empty() {
+                let answer = response.content.clone();
+                self.record_response(response).await?;
+                stream_events.commit_to(sink).await?;
                 return Ok(answer);
             }
+
+            self.record_response(response).await?;
         }
 
         bail!("tool call loop exceeded max iterations ({MAX_TOOL_CALL_ITERATIONS})")
+    }
+
+    async fn stream_turn(&self, request: LlmRequest) -> Result<StreamedTurn> {
+        let mut stream_events = StreamEventBuffer::default();
+        let response = self.llm.stream(request, &mut stream_events).await?;
+
+        Ok(StreamedTurn {
+            response,
+            events: stream_events.into_events(),
+        })
     }
 }
 
@@ -131,6 +149,49 @@ where
     }
 }
 
+struct StreamedTurn {
+    response: LlmResponse,
+    events: StreamEvents,
+}
+
+impl StreamedTurn {
+    fn into_parts(self) -> (LlmResponse, StreamEvents) {
+        (self.response, self.events)
+    }
+}
+
+struct StreamEvents(Vec<LlmStreamEvent>);
+
+impl StreamEvents {
+    async fn commit_to(self, sink: &mut dyn LlmStreamSink) -> Result<()> {
+        for event in self.0 {
+            sink.on_event(event).await?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct StreamEventBuffer {
+    events: Vec<LlmStreamEvent>,
+}
+
+impl StreamEventBuffer {
+    fn into_events(self) -> StreamEvents {
+        StreamEvents(self.events)
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmStreamSink for StreamEventBuffer {
+    async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
+        self.events.push(event);
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -145,7 +206,10 @@ mod tests {
             message::{Message, Role},
             tool::{Tool, ToolExecutor},
         },
-        llm::client::{LlmClient, LlmRequest, LlmResponse, LlmToolCall},
+        llm::client::{
+            LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
+            LlmToolCall,
+        },
         memory::{in_memory::InMemoryStore, store::MemoryStore},
     };
 
@@ -184,6 +248,44 @@ mod tests {
             }
 
             Ok(responses.remove(0))
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for ScriptedClient {
+        async fn stream(
+            &self,
+            llm_request: LlmRequest,
+            sink: &mut dyn LlmStreamSink,
+        ) -> Result<LlmResponse> {
+            self.requests.lock().await.push(llm_request.messages);
+
+            let mut responses = self.responses.lock().await;
+            if responses.is_empty() {
+                bail!("scripted client has no response left");
+            }
+
+            let response = responses.remove(0);
+            if !response.content.is_empty() {
+                sink.on_event(LlmStreamEvent::TextDelta(response.content.clone()))
+                    .await?;
+            }
+
+            Ok(response)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Vec<LlmStreamEvent>,
+    }
+
+    #[async_trait]
+    impl LlmStreamSink for RecordingSink {
+        async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
+            self.events.push(event);
+
+            Ok(())
         }
     }
 
@@ -349,6 +451,43 @@ mod tests {
         let requests = client.requests().await;
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1][2], context[2]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_discards_text_from_tool_call_iterations() -> Result<()> {
+        let client = ScriptedClient::new(vec![
+            LlmResponse {
+                content: "<eos>".to_string(),
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "demo".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            LlmResponse {
+                content: "done".to_string(),
+                tool_calls: Vec::new(),
+            },
+        ]);
+        let memory = InMemoryStore::new();
+        let agent = Agent::new(
+            client,
+            memory,
+            OneTool {
+                behavior: ToolBehavior::Succeed("tool output"),
+            },
+        );
+        let mut sink = RecordingSink::default();
+
+        let answer = agent.execute_streaming("hello", &mut sink).await?;
+
+        assert_eq!(answer, "done");
+        assert_eq!(
+            sink.events,
+            vec![LlmStreamEvent::TextDelta("done".to_string())]
+        );
 
         Ok(())
     }
