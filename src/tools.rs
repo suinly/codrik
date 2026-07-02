@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+mod bash;
 mod datetime;
 
 use anyhow::{Result, bail};
@@ -14,7 +15,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            handlers: vec![Box::new(datetime::DatetimeTool)],
+            handlers: vec![Box::new(datetime::DatetimeTool), Box::new(bash::BashTool)],
         }
     }
 
@@ -65,6 +66,14 @@ mod tests {
     }
 
     #[test]
+    fn definitions_include_bash() {
+        let tools = ToolRegistry::new().definitions();
+        let bash_name = bash::BashTool.definition().name;
+
+        assert!(tools.iter().any(|tool| tool.name == bash_name));
+    }
+
+    #[test]
     fn definitions_hide_disallowed_tools() {
         let tools = ToolRegistry::with_allowed_tools(Vec::<String>::new()).definitions();
 
@@ -75,8 +84,10 @@ mod tests {
     fn wildcard_allows_all_tools() {
         let tools = ToolRegistry::with_allowed_tools(vec!["*".to_string()]).definitions();
         let datetime_name = datetime::DatetimeTool.definition().name;
+        let bash_name = bash::BashTool.definition().name;
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
+        assert!(tools.iter().any(|tool| tool.name == bash_name));
     }
 
     #[tokio::test]

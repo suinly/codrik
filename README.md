@@ -102,7 +102,8 @@ enable them manually and set their `tools` list:
 }
 ```
 
-Use `"tools": ["*"]` to grant access to every available tool.
+Use `"tools": ["*"]` to grant access to every available tool, including
+the host `bash` tool.
 
 Update to the latest release:
 
