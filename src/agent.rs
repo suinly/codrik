@@ -4,9 +4,11 @@ mod tool_observation;
 
 use crate::agent::message::Message;
 use crate::agent::tool::ToolExecutor;
-use crate::llm::client::{LlmClient, LlmRequest};
+use crate::llm::client::{LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamSink};
 use crate::memory::store::MemoryStore;
 use anyhow::{Result, bail};
+
+const MAX_TOOL_CALL_ITERATIONS: usize = 5;
 
 pub struct Agent<L, M, T> {
     instructions: String,
@@ -38,53 +40,94 @@ where
     pub async fn execute(&self, content: impl Into<String>) -> Result<String> {
         self.memory.append(Message::user(content.into())).await?;
 
-        for _ in 0..5 {
-            let mut messages = Vec::new();
-            if !self.instructions.is_empty() {
-                messages.push(Message::system(self.instructions.clone()));
-            }
-            messages.extend(self.memory.load_context().await?);
+        for _ in 0..MAX_TOOL_CALL_ITERATIONS {
+            let response = self.llm.generate(self.build_llm_request().await?).await?;
 
-            let response = self
-                .llm
-                .generate(LlmRequest {
-                    messages,
-                    tools: self.tools.definitions(),
-                })
-                .await?;
-
-            if response.tool_calls.is_empty() {
-                self.memory
-                    .append(Message::assistant(response.content.clone()))
-                    .await?;
-
-                return Ok(response.content);
-            }
-
-            self.memory
-                .append(Message::assistant_tool_calls(
-                    response.content,
-                    response.tool_calls.clone(),
-                ))
-                .await?;
-
-            for tool_call in response.tool_calls {
-                let observation = match self
-                    .tools
-                    .execute(&tool_call.name, &tool_call.arguments)
-                    .await
-                {
-                    Ok(result) => tool_observation::success(result),
-                    Err(error) => tool_observation::failure(&error),
-                };
-
-                self.memory
-                    .append(Message::tool_result(tool_call.id, observation))
-                    .await?;
+            if let Some(answer) = self.record_response(response).await? {
+                return Ok(answer);
             }
         }
 
-        bail!("tool call loop exceeded max iterations (5)")
+        bail!("tool call loop exceeded max iterations ({MAX_TOOL_CALL_ITERATIONS})")
+    }
+}
+
+impl<L, M, T> Agent<L, M, T>
+where
+    L: LlmClient + LlmStreamClient,
+    M: MemoryStore,
+    T: ToolExecutor,
+{
+    pub async fn execute_streaming(
+        &self,
+        content: impl Into<String>,
+        sink: &mut dyn LlmStreamSink,
+    ) -> Result<String> {
+        self.memory.append(Message::user(content.into())).await?;
+
+        for _ in 0..MAX_TOOL_CALL_ITERATIONS {
+            let request = self.build_llm_request().await?;
+            let response = self.llm.stream(request, sink).await?;
+
+            if let Some(answer) = self.record_response(response).await? {
+                return Ok(answer);
+            }
+        }
+
+        bail!("tool call loop exceeded max iterations ({MAX_TOOL_CALL_ITERATIONS})")
+    }
+}
+
+impl<L, M, T> Agent<L, M, T>
+where
+    M: MemoryStore,
+    T: ToolExecutor,
+{
+    async fn build_llm_request(&self) -> Result<LlmRequest> {
+        let mut messages = Vec::new();
+        if !self.instructions.is_empty() {
+            messages.push(Message::system(self.instructions.clone()));
+        }
+        messages.extend(self.memory.load_context().await?);
+
+        Ok(LlmRequest {
+            messages,
+            tools: self.tools.definitions(),
+        })
+    }
+
+    async fn record_response(&self, response: LlmResponse) -> Result<Option<String>> {
+        if response.tool_calls.is_empty() {
+            self.memory
+                .append(Message::assistant(response.content.clone()))
+                .await?;
+
+            return Ok(Some(response.content));
+        }
+
+        self.memory
+            .append(Message::assistant_tool_calls(
+                response.content,
+                response.tool_calls.clone(),
+            ))
+            .await?;
+
+        for tool_call in response.tool_calls {
+            let observation = match self
+                .tools
+                .execute(&tool_call.name, &tool_call.arguments)
+                .await
+            {
+                Ok(result) => tool_observation::success(result),
+                Err(error) => tool_observation::failure(&error),
+            };
+
+            self.memory
+                .append(Message::tool_result(tool_call.id, observation))
+                .await?;
+        }
+
+        Ok(None)
     }
 }
 

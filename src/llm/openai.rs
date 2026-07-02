@@ -3,7 +3,10 @@ use crate::{
         message::Role,
         tool::{Tool, ToolParameter, ToolParameterKind, ToolParameters},
     },
-    llm::client::{LlmClient, LlmRequest, LlmResponse, LlmToolCall},
+    llm::client::{
+        LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
+        LlmToolCall, LlmToolCallDelta,
+    },
 };
 use anyhow::{Context, Result};
 use async_openai::{
@@ -15,10 +18,13 @@ use async_openai::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
         ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage, ChatCompletionTool,
         ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-        CreateChatCompletionResponse, FunctionCall, FunctionObject,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
+        FunctionCallStream, FunctionObject,
     },
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub struct OpenAiClient {
     model: String,
@@ -138,6 +144,23 @@ impl OpenAiClient {
         })
     }
 
+    async fn collect_stream_response(
+        &self,
+        mut request: CreateChatCompletionRequest,
+        sink: &mut dyn LlmStreamSink,
+    ) -> Result<LlmResponse> {
+        request.stream = Some(true);
+
+        let mut stream = self.client.chat().create_stream(request).await?;
+        let mut accumulator = StreamAccumulator::default();
+
+        while let Some(chunk) = stream.next().await {
+            accumulator.push(chunk?, sink).await?;
+        }
+
+        accumulator.into_response()
+    }
+
     fn to_openai_tool(tool: Tool) -> ChatCompletionTools {
         ChatCompletionTools::Function(ChatCompletionTool {
             function: FunctionObject {
@@ -196,9 +219,322 @@ impl OpenAiClient {
 #[async_trait::async_trait]
 impl LlmClient for OpenAiClient {
     async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse> {
-        let request = self.to_openai_request(llm_request)?;
+        let mut request = self.to_openai_request(llm_request)?;
+        request.stream = Some(false);
         let response = self.client.chat().create(request).await?;
 
         Self::to_llm_response(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmStreamClient for OpenAiClient {
+    async fn stream(
+        &self,
+        llm_request: LlmRequest,
+        sink: &mut dyn LlmStreamSink,
+    ) -> Result<LlmResponse> {
+        let request = self.to_openai_request(llm_request)?;
+
+        self.collect_stream_response(request, sink).await
+    }
+}
+
+#[derive(Default)]
+struct StreamAccumulator {
+    content: String,
+    tool_calls: BTreeMap<u32, PartialToolCall>,
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl StreamAccumulator {
+    async fn push(
+        &mut self,
+        chunk: CreateChatCompletionStreamResponse,
+        sink: &mut dyn LlmStreamSink,
+    ) -> Result<()> {
+        for choice in chunk.choices {
+            if let Some(content) = choice.delta.content
+                && !content.is_empty()
+            {
+                self.content.push_str(&content);
+                sink.on_event(LlmStreamEvent::TextDelta(content)).await?;
+            }
+
+            for tool_call in choice.delta.tool_calls.unwrap_or_default() {
+                let entry = self.tool_calls.entry(tool_call.index).or_default();
+
+                if let Some(id) = tool_call.id {
+                    sink.on_event(LlmStreamEvent::ToolCallDelta(
+                        entry.record_id(tool_call.index, id),
+                    ))
+                    .await?;
+                }
+
+                if let Some(function) = tool_call.function
+                    && let Some(delta) = entry.record_function_delta(tool_call.index, function)
+                {
+                    sink.on_event(LlmStreamEvent::ToolCallDelta(delta)).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn into_response(self) -> Result<LlmResponse> {
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(|(index, tool_call)| -> Result<LlmToolCall> {
+                Ok(LlmToolCall {
+                    id: tool_call
+                        .id
+                        .with_context(|| format!("streamed tool call {index} is missing id"))?,
+                    name: tool_call
+                        .name
+                        .with_context(|| format!("streamed tool call {index} is missing name"))?,
+                    arguments: tool_call.arguments,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(LlmResponse {
+            content: self.content,
+            tool_calls,
+        })
+    }
+}
+
+impl PartialToolCall {
+    fn record_id(&mut self, index: u32, id: String) -> LlmToolCallDelta {
+        self.id = Some(id.clone());
+
+        LlmToolCallDelta {
+            index,
+            id: Some(id),
+            name: None,
+            arguments: None,
+        }
+    }
+
+    fn record_function_delta(
+        &mut self,
+        index: u32,
+        function: FunctionCallStream,
+    ) -> Option<LlmToolCallDelta> {
+        let mut name_delta = None;
+        if let Some(name) = function.name {
+            self.name = Some(match self.name.take() {
+                Some(existing) => existing + &name,
+                None => name.clone(),
+            });
+            name_delta = Some(name);
+        }
+
+        let mut arguments_delta = None;
+        if let Some(arguments) = function.arguments {
+            self.arguments.push_str(&arguments);
+            arguments_delta = Some(arguments);
+        }
+
+        if name_delta.is_none() && arguments_delta.is_none() {
+            return None;
+        }
+
+        Some(LlmToolCallDelta {
+            index,
+            id: None,
+            name: name_delta,
+            arguments: arguments_delta,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use async_openai::types::chat::{
+        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
+        FunctionCallStream, FunctionType,
+    };
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Vec<LlmStreamEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmStreamSink for RecordingSink {
+        async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
+            self.events.push(event);
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_accumulator_collects_text_deltas() -> Result<()> {
+        let mut accumulator = StreamAccumulator::default();
+        let mut sink = RecordingSink::default();
+
+        accumulator
+            .push(stream_chunk(delta_with_content("hello "), None), &mut sink)
+            .await?;
+        accumulator
+            .push(stream_chunk(delta_with_content("world"), None), &mut sink)
+            .await?;
+
+        let response = accumulator.into_response()?;
+
+        assert_eq!(response.content, "hello world");
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            sink.events,
+            vec![
+                LlmStreamEvent::TextDelta("hello ".to_string()),
+                LlmStreamEvent::TextDelta("world".to_string()),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_accumulator_collects_chunked_tool_calls_by_index() -> Result<()> {
+        let mut accumulator = StreamAccumulator::default();
+        let mut sink = RecordingSink::default();
+
+        accumulator
+            .push(
+                stream_chunk(
+                    empty_delta(),
+                    Some(vec![tool_call_delta(
+                        0,
+                        Some("call_1"),
+                        Some("demo"),
+                        Some("{\"city\""),
+                    )]),
+                ),
+                &mut sink,
+            )
+            .await?;
+        accumulator
+            .push(
+                stream_chunk(
+                    empty_delta(),
+                    Some(vec![tool_call_delta(0, None, None, Some(":\"Paris\"}"))]),
+                ),
+                &mut sink,
+            )
+            .await?;
+
+        let response = accumulator.into_response()?;
+
+        assert_eq!(
+            response.tool_calls,
+            vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "demo".to_string(),
+                arguments: "{\"city\":\"Paris\"}".to_string(),
+            }]
+        );
+        assert_eq!(
+            sink.events,
+            vec![
+                LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: None,
+                    arguments: None,
+                }),
+                LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: Some("demo".to_string()),
+                    arguments: Some("{\"city\"".to_string()),
+                }),
+                LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: Some(":\"Paris\"}".to_string()),
+                }),
+            ]
+        );
+
+        Ok(())
+    }
+
+    fn stream_chunk(
+        delta: ChatCompletionStreamResponseDelta,
+        tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    ) -> CreateChatCompletionStreamResponse {
+        let mut delta = delta;
+        delta.tool_calls = tool_calls;
+
+        #[allow(deprecated)]
+        CreateChatCompletionStreamResponse {
+            id: "chatcmpl_test".to_string(),
+            choices: vec![ChatChoiceStream {
+                index: 0,
+                delta,
+                finish_reason: None,
+                logprobs: None,
+            }],
+            created: 0,
+            model: "test-model".to_string(),
+            service_tier: None,
+            system_fingerprint: None,
+            object: "chat.completion.chunk".to_string(),
+            usage: None,
+        }
+    }
+
+    fn delta_with_content(content: impl Into<String>) -> ChatCompletionStreamResponseDelta {
+        #[allow(deprecated)]
+        ChatCompletionStreamResponseDelta {
+            content: Some(content.into()),
+            function_call: None,
+            tool_calls: None,
+            role: None,
+            refusal: None,
+        }
+    }
+
+    fn empty_delta() -> ChatCompletionStreamResponseDelta {
+        #[allow(deprecated)]
+        ChatCompletionStreamResponseDelta {
+            content: None,
+            function_call: None,
+            tool_calls: None,
+            role: None,
+            refusal: None,
+        }
+    }
+
+    fn tool_call_delta(
+        index: u32,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) -> ChatCompletionMessageToolCallChunk {
+        ChatCompletionMessageToolCallChunk {
+            index,
+            id: id.map(ToString::to_string),
+            r#type: Some(FunctionType::Function),
+            function: Some(FunctionCallStream {
+                name: name.map(ToString::to_string),
+                arguments: arguments.map(ToString::to_string),
+            }),
+        }
     }
 }

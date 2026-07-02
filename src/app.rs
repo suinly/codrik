@@ -1,7 +1,7 @@
 use crate::{
     agent::Agent,
     config::{AppConfig, codrik_dir},
-    llm::openai::OpenAiClient,
+    llm::{client::LlmStreamSink, openai::OpenAiClient},
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
     tools::ToolRegistry,
 };
@@ -36,6 +36,16 @@ pub async fn run_once_with_config(query: String, config: AppConfig) -> Result<St
     agent.execute(query).await
 }
 
+pub async fn run_once_streaming(
+    query: String,
+    config: AppConfig,
+    sink: &mut dyn LlmStreamSink,
+) -> Result<String> {
+    let agent = build_agent(config);
+
+    agent.execute_streaming(query, sink).await
+}
+
 pub async fn run_once_with_session(
     query: String,
     config: AppConfig,
@@ -45,4 +55,16 @@ pub async fn run_once_with_session(
     let agent = build_agent_with_memory(config, memory);
 
     agent.execute(query).await
+}
+
+pub async fn run_once_with_session_streaming(
+    query: String,
+    config: AppConfig,
+    session_id: impl AsRef<str>,
+    sink: &mut dyn LlmStreamSink,
+) -> Result<String> {
+    let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
+    let agent = build_agent_with_memory(config, memory);
+
+    agent.execute_streaming(query, sink).await
 }
