@@ -6,10 +6,10 @@ use crate::{
     config::{AppConfig, codrik_dir},
     llm::{client::LlmStreamSink, openai::OpenAiClient},
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
-    tools::ToolRegistry,
+    tools::{ToolRegistry, ToolRegistryConfig},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 pub type AppAgent = Agent<OpenAiClient, InMemoryStore, ToolRegistry>;
 
@@ -79,7 +79,7 @@ pub async fn run_once_with_actor_session(
     session_id: impl AsRef<str>,
 ) -> Result<String> {
     let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
-    let agent = build_agent_for_actor(config, memory, actor);
+    let agent = build_agent_for_actor(config, memory, actor)?;
 
     agent.execute(query).await
 }
@@ -92,7 +92,7 @@ pub async fn run_once_with_actor_session_streaming(
     sink: &mut dyn LlmStreamSink,
 ) -> Result<String> {
     let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
-    let agent = build_agent_for_actor(config, memory, actor);
+    let agent = build_agent_for_actor(config, memory, actor)?;
 
     agent.execute_streaming(query, sink).await
 }
@@ -101,14 +101,36 @@ fn build_agent_for_actor<M>(
     config: AppConfig,
     memory: M,
     actor: AuthorizedActor,
-) -> Agent<OpenAiClient, M, ToolRegistry>
+) -> Result<Agent<OpenAiClient, M, ToolRegistry>>
 where
     M: MemoryStore,
 {
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
-    let tools = ToolRegistry::with_allowed_tools(actor.tools);
+    let workspace = actor_workspace_path(&actor.id)?;
+    let tools = ToolRegistry::with_allowed_tools_and_config(
+        actor.tools,
+        ToolRegistryConfig {
+            bash_workspace: Some(workspace),
+        },
+    );
 
-    Agent::new(llm, memory, tools).set_instructions(default_agent_instructions())
+    Ok(Agent::new(llm, memory, tools).set_instructions(default_agent_instructions()))
+}
+
+fn actor_workspace_path(actor_id: &str) -> Result<std::path::PathBuf> {
+    if actor_id.is_empty()
+        || actor_id == "."
+        || actor_id == ".."
+        || actor_id.contains('/')
+        || actor_id.contains('\\')
+    {
+        bail!("unsafe actor id for workspace path: {actor_id}");
+    }
+
+    Ok(codrik_dir()
+        .context("failed to resolve codrik directory for actor workspace")?
+        .join("workspaces")
+        .join(actor_id))
 }
 
 fn default_agent_instructions() -> String {
@@ -117,7 +139,8 @@ fn default_agent_instructions() -> String {
             "You are Codrik, an entity living inside this computer. ",
             "This computer is running {os} on {arch}. ",
             "You are not only a text agent: you have access to the system through the available tools. ",
-            "Use the bash tool when you need to inspect or change the system, run programs, play sounds, open windows, display visuals, or perform other host-side actions. ",
+            "Use the bash tool when you need to inspect or change files, run programs, or perform other system-side actions. ",
+            "When a real filesystem workspace is available, it is mounted at /workspace and host filesystem access is limited to that workspace. ",
             "Commands may have side effects beyond text output. ",
             "Answer briefly and with irony. Do not use markdown formatting."
         ),

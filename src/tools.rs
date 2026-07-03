@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 mod bash;
 mod datetime;
@@ -12,20 +12,37 @@ pub struct ToolRegistry {
     handlers: Vec<Box<dyn ToolHandler>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolRegistryConfig {
+    pub bash_workspace: Option<PathBuf>,
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
+        Self::with_config(ToolRegistryConfig::default())
+    }
+
+    pub fn with_config(config: ToolRegistryConfig) -> Self {
         Self {
-            handlers: vec![Box::new(datetime::DatetimeTool), Box::new(bash::BashTool)],
+            handlers: vec![
+                Box::new(datetime::DatetimeTool),
+                Box::new(bash::BashTool::new(bash::BashToolConfig {
+                    workspace: config.bash_workspace,
+                })),
+            ],
         }
     }
 
-    pub fn with_allowed_tools(allowed_tools: impl IntoIterator<Item = String>) -> Self {
+    pub fn with_allowed_tools_and_config(
+        allowed_tools: impl IntoIterator<Item = String>,
+        config: ToolRegistryConfig,
+    ) -> Self {
         let allowed_tools = allowed_tools.into_iter().collect::<HashSet<_>>();
         if allowed_tools.contains("*") {
-            return Self::new();
+            return Self::with_config(config);
         }
 
-        let handlers = Self::new()
+        let handlers = Self::with_config(config)
             .handlers
             .into_iter()
             .filter(|handler| allowed_tools.contains(handler.name()))
@@ -68,23 +85,31 @@ mod tests {
     #[test]
     fn definitions_include_bash() {
         let tools = ToolRegistry::new().definitions();
-        let bash_name = bash::BashTool.definition().name;
+        let bash_name = bash::BashTool::new(bash::BashToolConfig::default())
+            .definition()
+            .name;
 
         assert!(tools.iter().any(|tool| tool.name == bash_name));
     }
 
     #[test]
     fn definitions_hide_disallowed_tools() {
-        let tools = ToolRegistry::with_allowed_tools(Vec::<String>::new()).definitions();
+        let tools =
+            ToolRegistry::with_allowed_tools_and_config(Vec::<String>::new(), default_config())
+                .definitions();
 
         assert!(tools.is_empty());
     }
 
     #[test]
     fn wildcard_allows_all_tools() {
-        let tools = ToolRegistry::with_allowed_tools(vec!["*".to_string()]).definitions();
+        let tools =
+            ToolRegistry::with_allowed_tools_and_config(vec!["*".to_string()], default_config())
+                .definitions();
         let datetime_name = datetime::DatetimeTool.definition().name;
-        let bash_name = bash::BashTool.definition().name;
+        let bash_name = bash::BashTool::new(bash::BashToolConfig::default())
+            .definition()
+            .name;
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
         assert!(tools.iter().any(|tool| tool.name == bash_name));
@@ -92,10 +117,15 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_disallowed_tools() {
-        let result = ToolRegistry::with_allowed_tools(Vec::<String>::new())
-            .execute("datetime", "{}")
-            .await;
+        let result =
+            ToolRegistry::with_allowed_tools_and_config(Vec::<String>::new(), default_config())
+                .execute("datetime", "{}")
+                .await;
 
         assert_eq!(result.unwrap_err().to_string(), "unknown tool: datetime");
+    }
+
+    fn default_config() -> ToolRegistryConfig {
+        ToolRegistryConfig::default()
     }
 }
