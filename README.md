@@ -106,9 +106,10 @@ Use `"tools": ["*"]` to grant access to standard tools such as `datetime` and
 the sandboxed `bashkit` tool. The real server `bash` tool is privileged and
 must be granted explicitly, for example `"tools": ["*", "bash"]`.
 
-Telegram sessions are stored under `~/.codrik/sessions`. Send `/new` to create
-and switch to a fresh session. Send `/sessions` to list recent sessions in the
-current chat, then `/sessions <id>` to switch back to one of them.
+Telegram sessions are stored under `~/.codrik/sessions/<telegram-chat-id>/`,
+with chat-local metadata in `index.json`. Send `/new` to create and switch to a
+fresh session. Send `/sessions` to list recent sessions in the current chat,
+then `/sessions <id>` to switch back to one of them.
 
 Update to the latest release:
 

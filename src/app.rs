@@ -7,6 +7,8 @@ use crate::{
     tools::{ToolRegistry, ToolRegistryConfig},
 };
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
 
 pub type AppAgent = Agent<OpenAiClient, InMemoryStore, ToolRegistry>;
@@ -70,26 +72,28 @@ pub async fn run_once_with_session_streaming(
     agent.execute_streaming(query, sink).await
 }
 
-pub async fn run_once_with_actor_session(
+pub async fn run_once_with_actor_session_in_root(
     query: String,
     config: AppConfig,
     actor: AuthorizedActor,
+    session_root: PathBuf,
     session_id: impl AsRef<str>,
 ) -> Result<String> {
-    let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
+    let memory = FileMemoryStore::new(session_root, session_id)?;
     let agent = build_agent_for_actor(config, memory, actor)?;
 
     agent.execute(query).await
 }
 
-pub async fn run_once_with_actor_session_streaming(
+pub async fn run_once_with_actor_session_streaming_in_root(
     query: String,
     config: AppConfig,
     actor: AuthorizedActor,
+    session_root: PathBuf,
     session_id: impl AsRef<str>,
     sink: &mut dyn LlmStreamSink,
 ) -> Result<String> {
-    let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
+    let memory = FileMemoryStore::new(session_root, session_id)?;
     let agent = build_agent_for_actor(config, memory, actor)?;
 
     agent.execute_streaming(query, sink).await

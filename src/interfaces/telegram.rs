@@ -35,8 +35,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         .clone();
     let draft_api = TelegramDraftApi::new(token.clone());
     let auth_store = AuthorizationStore::new(crate::config::codrik_dir()?.join("users.json"));
-    let session_store =
-        TelegramSessionStore::new(crate::config::codrik_dir()?.join("telegram-sessions.json"));
+    let session_store = TelegramSessionStore::new(crate::config::codrik_dir()?.join("sessions"));
 
     let bot = Bot::new(token);
     let me = bot
@@ -154,10 +153,11 @@ async fn answer_private_chat(
     };
     let typing = keep_typing(bot, msg.chat.id);
     let mut stream = TelegramDraftStream::new(draft_api, msg.chat.id, msg.id, typing);
-    let result = app::run_once_with_actor_session_streaming(
+    let result = app::run_once_with_actor_session_streaming_in_root(
         text.to_string(),
         config,
         actor,
+        session_store.session_root(msg.chat.id.0),
         session_id,
         &mut stream,
     )
@@ -180,8 +180,14 @@ async fn answer_regular_chat(
         Err(error) => return format!("Gateway error: {error:#}"),
     };
     let typing = keep_typing(bot, chat_id);
-    let result =
-        app::run_once_with_actor_session(text.to_string(), config, actor, session_id).await;
+    let result = app::run_once_with_actor_session_in_root(
+        text.to_string(),
+        config,
+        actor,
+        session_store.session_root(chat_id.0),
+        session_id,
+    )
+    .await;
     stop_typing(typing).await;
 
     answer_or_gateway_error(chat_id, result)

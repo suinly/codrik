@@ -11,59 +11,55 @@ use tokio::{fs, sync::Mutex};
 
 #[derive(Clone, Debug)]
 pub struct TelegramSessionStore {
-    path: PathBuf,
+    root: PathBuf,
     write_lock: Arc<Mutex<()>>,
 }
 
 impl TelegramSessionStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
+            root: root.into(),
             write_lock: Arc::new(Mutex::new(())),
         }
     }
 
+    pub fn session_root(&self, chat_id: i64) -> PathBuf {
+        self.chat_root(chat_id)
+    }
+
     pub async fn active_session_id(&self, chat_id: i64) -> Result<String> {
         let _guard = self.write_lock.lock().await;
-        let mut state = self.read_state().await?;
-        let chat = state
-            .chats
-            .entry(chat_key(chat_id))
-            .or_insert_with(|| StoredChat::new(legacy_session_id(chat_id), now_timestamp()));
+        let mut chat = self.read_chat(chat_id).await?;
 
         if !chat
             .sessions
             .iter()
             .any(|session| session.id == chat.active_session_id)
         {
-            chat.sessions.push(StoredSession::new(
+            chat.sessions.push(ChatSessionRecord::new(
                 chat.active_session_id.clone(),
                 now_timestamp(),
             ));
         }
 
         let active_session_id = chat.active_session_id.clone();
-        touch_session(chat, &active_session_id, now_timestamp());
-        self.write_state(&state).await?;
+        touch_session(&mut chat, &active_session_id, now_timestamp());
+        self.write_chat(chat_id, &chat).await?;
 
         Ok(active_session_id)
     }
 
     pub async fn create_session(&self, chat_id: i64) -> Result<String> {
         let _guard = self.write_lock.lock().await;
-        let mut state = self.read_state().await?;
-        let chat = state
-            .chats
-            .entry(chat_key(chat_id))
-            .or_insert_with(|| StoredChat::new(legacy_session_id(chat_id), now_timestamp()));
+        let mut chat = self.read_chat(chat_id).await?;
 
         let created_at = now_timestamp();
         let session_id = unique_session_id(chat_id, created_at, chat.sessions.len() + 1);
         chat.sessions
-            .push(StoredSession::new(session_id.clone(), created_at));
+            .push(ChatSessionRecord::new(session_id.clone(), created_at));
         chat.active_session_id = session_id.clone();
 
-        self.write_state(&state).await?;
+        self.write_chat(chat_id, &chat).await?;
 
         Ok(session_id)
     }
@@ -74,29 +70,22 @@ impl TelegramSessionStore {
         }
 
         let _guard = self.write_lock.lock().await;
-        let mut state = self.read_state().await?;
-        let Some(chat) = state.chats.get_mut(&chat_key(chat_id)) else {
-            return Ok(false);
-        };
+        let mut chat = self.read_chat(chat_id).await?;
 
         if !chat.sessions.iter().any(|session| session.id == session_id) {
             return Ok(false);
         }
 
         chat.active_session_id = session_id.to_string();
-        touch_session(chat, session_id, now_timestamp());
-        self.write_state(&state).await?;
+        touch_session(&mut chat, session_id, now_timestamp());
+        self.write_chat(chat_id, &chat).await?;
 
         Ok(true)
     }
 
     pub async fn list_sessions(&self, chat_id: i64) -> Result<Vec<TelegramSession>> {
         let _guard = self.write_lock.lock().await;
-        let mut state = self.read_state().await?;
-        let chat = state
-            .chats
-            .entry(chat_key(chat_id))
-            .or_insert_with(|| StoredChat::new(legacy_session_id(chat_id), now_timestamp()));
+        let chat = self.read_chat(chat_id).await?;
 
         let sessions = chat
             .sessions
@@ -109,54 +98,150 @@ impl TelegramSessionStore {
             })
             .collect();
 
-        self.write_state(&state).await?;
+        self.write_chat(chat_id, &chat).await?;
 
         Ok(sessions)
     }
 
-    async fn read_state(&self) -> Result<StoredTelegramSessions> {
-        if !fs::try_exists(&self.path).await.with_context(|| {
+    async fn read_chat(&self, chat_id: i64) -> Result<ChatSessionIndex> {
+        let index_path = self.index_path(chat_id);
+        if !fs::try_exists(&index_path).await.with_context(|| {
             format!(
-                "failed to inspect telegram sessions file: {}",
-                self.path.display()
+                "failed to inspect telegram sessions index: {}",
+                index_path.display()
             )
         })? {
-            return Ok(StoredTelegramSessions::default());
+            if let Some(chat) = self.read_legacy_chat(chat_id).await? {
+                self.migrate_legacy_session_files(chat_id, &chat).await?;
+                return Ok(chat);
+            }
+
+            return Ok(ChatSessionIndex::new(
+                legacy_session_id(chat_id),
+                now_timestamp(),
+            ));
         }
 
-        let content = fs::read_to_string(&self.path).await.with_context(|| {
+        let content = fs::read_to_string(&index_path).await.with_context(|| {
             format!(
-                "failed to read telegram sessions file: {}",
-                self.path.display()
+                "failed to read telegram sessions index: {}",
+                index_path.display()
             )
         })?;
 
         serde_json::from_str(&content).with_context(|| {
             format!(
-                "failed to parse telegram sessions file: {}",
-                self.path.display()
+                "failed to parse telegram sessions index: {}",
+                index_path.display()
             )
         })
     }
 
-    async fn write_state(&self, state: &StoredTelegramSessions) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).await.with_context(|| {
-                format!(
-                    "failed to create telegram sessions directory: {}",
-                    parent.display()
-                )
-            })?;
-        }
-
-        let content =
-            serde_json::to_string_pretty(state).context("failed to serialize telegram sessions")?;
-        fs::write(&self.path, content).await.with_context(|| {
+    async fn write_chat(&self, chat_id: i64, chat: &ChatSessionIndex) -> Result<()> {
+        let chat_root = self.chat_root(chat_id);
+        fs::create_dir_all(&chat_root).await.with_context(|| {
             format!(
-                "failed to write telegram sessions file: {}",
-                self.path.display()
+                "failed to create telegram session directory: {}",
+                chat_root.display()
+            )
+        })?;
+
+        let index_path = chat_root.join("index.json");
+        let content =
+            serde_json::to_string_pretty(chat).context("failed to serialize telegram sessions")?;
+        fs::write(&index_path, content).await.with_context(|| {
+            format!(
+                "failed to write telegram sessions index: {}",
+                index_path.display()
             )
         })
+    }
+
+    async fn read_legacy_chat(&self, chat_id: i64) -> Result<Option<ChatSessionIndex>> {
+        let legacy_path = self.legacy_state_path();
+        if !fs::try_exists(&legacy_path).await.with_context(|| {
+            format!(
+                "failed to inspect legacy telegram sessions file: {}",
+                legacy_path.display()
+            )
+        })? {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&legacy_path).await.with_context(|| {
+            format!(
+                "failed to read legacy telegram sessions file: {}",
+                legacy_path.display()
+            )
+        })?;
+        let state =
+            serde_json::from_str::<LegacyTelegramSessions>(&content).with_context(|| {
+                format!(
+                    "failed to parse legacy telegram sessions file: {}",
+                    legacy_path.display()
+                )
+            })?;
+
+        Ok(state.chats.get(&chat_key(chat_id)).cloned())
+    }
+
+    async fn migrate_legacy_session_files(
+        &self,
+        chat_id: i64,
+        chat: &ChatSessionIndex,
+    ) -> Result<()> {
+        let chat_root = self.chat_root(chat_id);
+        fs::create_dir_all(&chat_root).await.with_context(|| {
+            format!(
+                "failed to create telegram session directory: {}",
+                chat_root.display()
+            )
+        })?;
+
+        for session in &chat.sessions {
+            let source = self.root.join(format!("{}.json", session.id));
+            let destination = chat_root.join(format!("{}.json", session.id));
+            if fs::try_exists(&destination).await.with_context(|| {
+                format!(
+                    "failed to inspect migrated telegram session file: {}",
+                    destination.display()
+                )
+            })? {
+                continue;
+            }
+
+            if fs::try_exists(&source).await.with_context(|| {
+                format!(
+                    "failed to inspect legacy telegram session file: {}",
+                    source.display()
+                )
+            })? {
+                fs::copy(&source, &destination).await.with_context(|| {
+                    format!(
+                        "failed to migrate telegram session file from {} to {}",
+                        source.display(),
+                        destination.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn chat_root(&self, chat_id: i64) -> PathBuf {
+        self.root.join(legacy_session_id(chat_id))
+    }
+
+    fn index_path(&self, chat_id: i64) -> PathBuf {
+        self.chat_root(chat_id).join("index.json")
+    }
+
+    fn legacy_state_path(&self) -> PathBuf {
+        self.root
+            .parent()
+            .map(|parent| parent.join("telegram-sessions.json"))
+            .unwrap_or_else(|| PathBuf::from("telegram-sessions.json"))
     }
 }
 
@@ -169,43 +254,34 @@ pub struct TelegramSession {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredTelegramSessions {
+struct LegacyTelegramSessions {
     version: u32,
-    chats: BTreeMap<String, StoredChat>,
-}
-
-impl Default for StoredTelegramSessions {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            chats: BTreeMap::new(),
-        }
-    }
+    chats: BTreeMap<String, ChatSessionIndex>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredChat {
+struct ChatSessionIndex {
     active_session_id: String,
-    sessions: Vec<StoredSession>,
+    sessions: Vec<ChatSessionRecord>,
 }
 
-impl StoredChat {
+impl ChatSessionIndex {
     fn new(session_id: String, created_at: u64) -> Self {
         Self {
             active_session_id: session_id.clone(),
-            sessions: vec![StoredSession::new(session_id, created_at)],
+            sessions: vec![ChatSessionRecord::new(session_id, created_at)],
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredSession {
+struct ChatSessionRecord {
     id: String,
     created_at: u64,
     last_used_at: u64,
 }
 
-impl StoredSession {
+impl ChatSessionRecord {
     fn new(id: String, created_at: u64) -> Self {
         Self {
             id,
@@ -215,7 +291,7 @@ impl StoredSession {
     }
 }
 
-fn touch_session(chat: &mut StoredChat, session_id: &str, timestamp: u64) {
+fn touch_session(chat: &mut ChatSessionIndex, session_id: &str, timestamp: u64) {
     if let Some(session) = chat
         .sessions
         .iter_mut()
@@ -266,7 +342,7 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_store_path() -> PathBuf {
+    fn temp_store_root() -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
@@ -274,15 +350,15 @@ mod tests {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         std::env::temp_dir().join(format!(
-            "codrik-telegram-sessions-test-{}-{suffix}-{counter}.json",
+            "codrik-telegram-sessions-test-{}-{suffix}-{counter}",
             std::process::id()
         ))
     }
 
     #[tokio::test]
     async fn defaults_to_legacy_session_for_new_chat() -> Result<()> {
-        let path = temp_store_path();
-        let store = TelegramSessionStore::new(&path);
+        let root = temp_store_root();
+        let store = TelegramSessionStore::new(&root);
 
         let session_id = store.active_session_id(123).await?;
 
@@ -293,15 +369,15 @@ mod tests {
         assert_eq!(sessions[0].id, "telegram-chat-123");
         assert!(sessions[0].is_active);
 
-        fs::remove_file(path).await.ok();
+        fs::remove_dir_all(root).await.ok();
 
         Ok(())
     }
 
     #[tokio::test]
     async fn creates_new_active_session() -> Result<()> {
-        let path = temp_store_path();
-        let store = TelegramSessionStore::new(&path);
+        let root = temp_store_root();
+        let store = TelegramSessionStore::new(&root);
 
         let session_id = store.create_session(123).await?;
         let active_session_id = store.active_session_id(123).await?;
@@ -314,15 +390,15 @@ mod tests {
         assert_eq!(sessions[1].id, session_id);
         assert!(sessions[1].is_active);
 
-        fs::remove_file(path).await.ok();
+        fs::remove_dir_all(root).await.ok();
 
         Ok(())
     }
 
     #[tokio::test]
     async fn switches_only_to_known_chat_session() -> Result<()> {
-        let path = temp_store_path();
-        let store = TelegramSessionStore::new(&path);
+        let root = temp_store_root();
+        let store = TelegramSessionStore::new(&root);
         let session_id = store.create_session(123).await?;
         store.create_session(456).await?;
 
@@ -331,25 +407,64 @@ mod tests {
         assert!(!store.switch_session(123, "telegram-chat-456").await?);
         assert!(store.switch_session(123, &session_id).await?);
 
-        fs::remove_file(path).await.ok();
+        fs::remove_dir_all(root).await.ok();
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn persists_sessions_to_json() -> Result<()> {
-        let path = temp_store_path();
-        let store = TelegramSessionStore::new(&path);
+    async fn persists_sessions_to_chat_index_json() -> Result<()> {
+        let root = temp_store_root();
+        let store = TelegramSessionStore::new(&root);
         let session_id = store.create_session(-100).await?;
 
-        let restored = TelegramSessionStore::new(&path);
+        let restored = TelegramSessionStore::new(&root);
         assert_eq!(restored.active_session_id(-100).await?, session_id);
 
-        let content = fs::read_to_string(&path).await?;
-        assert!(content.contains("\"-100\""));
+        let index_path = root.join("telegram-chat--100").join("index.json");
+        let content = fs::read_to_string(&index_path).await?;
         assert!(content.contains("\"active_session_id\""));
+        assert_eq!(store.session_root(-100), root.join("telegram-chat--100"));
 
-        fs::remove_file(path).await.ok();
+        fs::remove_dir_all(root).await.ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_chat_index_and_session_file() -> Result<()> {
+        let base = temp_store_root();
+        let root = base.join("sessions");
+        fs::create_dir_all(&root).await?;
+        fs::write(
+            base.join("telegram-sessions.json"),
+            r#"{
+  "version": 1,
+  "chats": {
+    "123": {
+      "active_session_id": "telegram-chat-123",
+      "sessions": [
+        {
+          "id": "telegram-chat-123",
+          "created_at": 10,
+          "last_used_at": 20
+        }
+      ]
+    }
+  }
+}"#,
+        )
+        .await?;
+        fs::write(root.join("telegram-chat-123.json"), "[]").await?;
+
+        let store = TelegramSessionStore::new(&root);
+        assert_eq!(store.active_session_id(123).await?, "telegram-chat-123");
+
+        let chat_root = root.join("telegram-chat-123");
+        assert!(fs::try_exists(chat_root.join("index.json")).await?);
+        assert!(fs::try_exists(chat_root.join("telegram-chat-123.json")).await?);
+
+        fs::remove_dir_all(base).await.ok();
 
         Ok(())
     }
