@@ -3,8 +3,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use teloxide::{
     Bot,
+    payloads::SendMessageSetters,
     prelude::Requester,
-    types::{ChatAction, ChatId, Message, MessageId},
+    types::{ChatAction, ChatId, Message, MessageId, ParseMode},
 };
 use tokio::{
     task::JoinHandle,
@@ -12,8 +13,10 @@ use tokio::{
 };
 
 mod commands;
+mod format;
 
 use commands::{answer_session_command, is_command_addressed_to_other_bot, is_start_command};
+use format::markdown_to_telegram_markdown_v2;
 
 use crate::{
     app,
@@ -122,7 +125,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 }
             };
 
-            if let Err(error) = bot.send_message(msg.chat.id, answer).await {
+            if let Err(error) = send_telegram_answer(&bot, msg.chat.id, answer).await {
                 eprintln!(
                     "Telegram send_message failed for chat {}: {error:#}",
                     msg.chat.id
@@ -243,6 +246,37 @@ fn answer_or_gateway_error(chat_id: ChatId, result: Result<String>) -> String {
         Err(error) => {
             eprintln!("Telegram gateway error for chat {chat_id}: {error:#}");
             format!("Gateway error: {error:#}")
+        }
+    }
+}
+
+async fn send_telegram_answer(
+    bot: &Bot,
+    chat_id: ChatId,
+    answer: String,
+) -> Result<(), teloxide::RequestError> {
+    let markdown_v2 = match markdown_to_telegram_markdown_v2(&answer) {
+        Ok(markdown_v2) => markdown_v2,
+        Err(error) => {
+            eprintln!(
+                "Telegram MarkdownV2 conversion failed for chat {chat_id}; sending plain text: {error:#}"
+            );
+            return bot.send_message(chat_id, answer).await.map(|_| ());
+        }
+    };
+
+    let markdown_result = bot
+        .send_message(chat_id, markdown_v2)
+        .parse_mode(ParseMode::MarkdownV2)
+        .await;
+
+    match markdown_result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            eprintln!(
+                "Telegram MarkdownV2 send_message failed for chat {chat_id}; retrying as plain text: {error:#}"
+            );
+            bot.send_message(chat_id, answer).await.map(|_| ())
         }
     }
 }
