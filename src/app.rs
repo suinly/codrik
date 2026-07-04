@@ -1,5 +1,3 @@
-use std::env;
-
 use crate::{
     agent::Agent,
     auth::AuthorizedActor,
@@ -134,17 +132,7 @@ fn actor_workspace_path(actor_id: &str) -> Result<std::path::PathBuf> {
 }
 
 fn default_agent_instructions() -> String {
-    format!(
-        concat!(
-            "You are Codrik, an entity living inside this computer. ",
-            "This computer is running {os} on {arch}. ",
-            "You are not only a text agent: you have access to the system through the available tools. ",
-            "Use the bash tool when you need to inspect or change files, run programs, or perform other system-side actions. ",
-            "When a real filesystem workspace is available, it is mounted at /workspace and host filesystem access is limited to that workspace. ",
-            "Commands may have side effects beyond text output. ",
-            "Answer briefly and with irony. Do not use markdown formatting."
-        ),
-        os = env::consts::OS,
-        arch = env::consts::ARCH
-    )
+    include_str!("../agent_instructions.md")
+        .trim_end()
+        .to_string()
 }
