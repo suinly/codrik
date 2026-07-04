@@ -22,7 +22,9 @@ use crate::{
     app,
     auth::{AuthDecision, AuthorizationStore, AuthorizedActor, GatewayIdentity},
     config::AppConfig,
-    llm::client::{LlmStreamEvent, LlmStreamSink},
+    llm::client::{
+        LlmStreamEvent, LlmStreamSink, RUN_CANCELLED, RunContext, is_run_cancelled_error,
+    },
     memory::telegram_sessions::TelegramSessionStore,
 };
 
@@ -77,55 +79,49 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 return Ok(());
             }
 
+            let run_context = RunContext::new();
+            let _cancellation_watch = cancel_on_ctrl_c(msg.chat.id, run_context.clone());
             let answer = if is_start_command(text, bot_username.as_deref()) {
-                answer_start_command(&auth_store, identity).await
+                Some(answer_start_command(&auth_store, identity).await)
             } else {
                 match auth_store.authorize(&identity).await {
                     Ok(AuthDecision::Authorized(actor)) => {
-                        if let Some(answer) = answer_session_command(
+                        answer_authorized_message(
+                            bot.clone(),
                             &session_store,
-                            msg.chat.id,
+                            &msg,
                             text,
                             bot_username.as_deref(),
+                            draft_api,
+                            TelegramAgentRun {
+                                config,
+                                actor,
+                                run_context: &run_context,
+                            },
                         )
                         .await
-                        {
-                            answer
-                        } else if msg.chat.is_private() {
-                            answer_private_chat(
-                                bot.clone(),
-                                &session_store,
-                                &msg,
-                                text,
-                                config,
-                                actor,
-                                draft_api,
-                            )
-                            .await
-                        } else {
-                            answer_regular_chat(
-                                bot.clone(),
-                                &session_store,
-                                msg.chat.id,
-                                text,
-                                config,
-                                actor,
-                            )
-                            .await
-                        }
                     }
-                    Ok(AuthDecision::Denied) => denied_message(),
+                    Ok(AuthDecision::Denied) => Some(denied_message()),
                     Err(error) => {
                         eprintln!(
                             "Telegram authorization failed for chat {}: {error:#}",
                             msg.chat.id
                         );
-                        format!("Gateway error: {error:#}")
+                        Some(format!("Gateway error: {error:#}"))
                     }
                 }
             };
 
-            if let Err(error) = send_telegram_answer(&bot, msg.chat.id, answer).await {
+            let Some(answer) = answer else {
+                return Ok(());
+            };
+
+            if run_context.is_cancelled() {
+                return Ok(());
+            }
+
+            if let Err(error) = send_telegram_answer(&bot, msg.chat.id, answer, &run_context).await
+            {
                 eprintln!(
                     "Telegram send_message failed for chat {}: {error:#}",
                     msg.chat.id
@@ -141,33 +137,67 @@ pub async fn run(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
+struct TelegramAgentRun<'a> {
+    config: AppConfig,
+    actor: AuthorizedActor,
+    run_context: &'a RunContext,
+}
+
+async fn answer_authorized_message(
+    bot: Bot,
+    session_store: &TelegramSessionStore,
+    msg: &Message,
+    text: &str,
+    bot_username: Option<&str>,
+    draft_api: TelegramDraftApi,
+    run: TelegramAgentRun<'_>,
+) -> Option<String> {
+    if let Some(answer) =
+        answer_session_command(session_store, msg.chat.id, text, bot_username).await
+    {
+        return Some(answer);
+    }
+
+    if msg.chat.is_private() {
+        answer_private_chat(bot, session_store, msg, text, draft_api, run).await
+    } else {
+        answer_regular_chat(bot, session_store, msg.chat.id, text, run).await
+    }
+}
+
 async fn answer_private_chat(
     bot: Bot,
     session_store: &TelegramSessionStore,
     msg: &Message,
     text: &str,
-    config: AppConfig,
-    actor: AuthorizedActor,
     draft_api: TelegramDraftApi,
-) -> String {
+    run: TelegramAgentRun<'_>,
+) -> Option<String> {
     let session_id = match active_session_id_or_error(session_store, msg.chat.id).await {
         Ok(session_id) => session_id,
-        Err(error) => return format!("Gateway error: {error:#}"),
+        Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
     let typing = keep_typing(bot, msg.chat.id);
-    let mut stream = TelegramDraftStream::new(draft_api, msg.chat.id, msg.id, typing);
-    let result = app::run_once_with_actor_session_streaming_in_root(
+    let mut stream = TelegramDraftStream::new(
+        draft_api,
+        msg.chat.id,
+        msg.id,
+        typing,
+        run.run_context.clone(),
+    );
+    let result = app::run_once_with_actor_session_streaming_in_root_and_context(
         text.to_string(),
-        config,
-        actor,
+        run.config,
+        run.actor,
         session_store.session_root(msg.chat.id.0),
         session_id,
         &mut stream,
+        run.run_context,
     )
     .await;
     stream.finish().await;
 
-    answer_or_gateway_error(msg.chat.id, result)
+    answer_or_gateway_error(msg.chat.id, result, run.run_context)
 }
 
 async fn answer_regular_chat(
@@ -175,25 +205,25 @@ async fn answer_regular_chat(
     session_store: &TelegramSessionStore,
     chat_id: ChatId,
     text: &str,
-    config: AppConfig,
-    actor: AuthorizedActor,
-) -> String {
+    run: TelegramAgentRun<'_>,
+) -> Option<String> {
     let session_id = match active_session_id_or_error(session_store, chat_id).await {
         Ok(session_id) => session_id,
-        Err(error) => return format!("Gateway error: {error:#}"),
+        Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
     let typing = keep_typing(bot, chat_id);
-    let result = app::run_once_with_actor_session_in_root(
+    let result = app::run_once_with_actor_session_in_root_and_context(
         text.to_string(),
-        config,
-        actor,
+        run.config,
+        run.actor,
         session_store.session_root(chat_id.0),
         session_id,
+        run.run_context,
     )
     .await;
     stop_typing(typing).await;
 
-    answer_or_gateway_error(chat_id, result)
+    answer_or_gateway_error(chat_id, result, run.run_context)
 }
 
 async fn active_session_id_or_error(
@@ -240,12 +270,19 @@ fn telegram_identity_from_sender(sender: Option<(u64, Option<String>)>) -> Optio
     Some(GatewayIdentity::new("telegram", id.to_string(), username))
 }
 
-fn answer_or_gateway_error(chat_id: ChatId, result: Result<String>) -> String {
+fn answer_or_gateway_error(
+    chat_id: ChatId,
+    result: Result<String>,
+    context: &RunContext,
+) -> Option<String> {
     match result {
-        Ok(answer) => answer,
+        Ok(answer) => Some(answer),
         Err(error) => {
+            if context.is_cancelled() || is_run_cancelled_error(&error) {
+                return None;
+            }
             eprintln!("Telegram gateway error for chat {chat_id}: {error:#}");
-            format!("Gateway error: {error:#}")
+            Some(format!("Gateway error: {error:#}"))
         }
     }
 }
@@ -254,6 +291,7 @@ async fn send_telegram_answer(
     bot: &Bot,
     chat_id: ChatId,
     answer: String,
+    context: &RunContext,
 ) -> Result<(), teloxide::RequestError> {
     let markdown_v2 = match markdown_to_telegram_markdown_v2(&answer) {
         Ok(markdown_v2) => markdown_v2,
@@ -261,14 +299,17 @@ async fn send_telegram_answer(
             eprintln!(
                 "Telegram MarkdownV2 conversion failed for chat {chat_id}; sending plain text: {error:#}"
             );
-            return bot.send_message(chat_id, answer).await.map(|_| ());
+            return send_plain_telegram_answer(bot, chat_id, answer, context).await;
         }
     };
 
-    let markdown_result = bot
+    let markdown_request = bot
         .send_message(chat_id, markdown_v2)
-        .parse_mode(ParseMode::MarkdownV2)
-        .await;
+        .parse_mode(ParseMode::MarkdownV2);
+    let markdown_result = tokio::select! {
+        result = markdown_request => result,
+        _ = context.cancelled() => return Ok(()),
+    };
 
     match markdown_result {
         Ok(_) => Ok(()),
@@ -276,8 +317,47 @@ async fn send_telegram_answer(
             eprintln!(
                 "Telegram MarkdownV2 send_message failed for chat {chat_id}; retrying as plain text: {error:#}"
             );
-            bot.send_message(chat_id, answer).await.map(|_| ())
+            send_plain_telegram_answer(bot, chat_id, answer, context).await
         }
+    }
+}
+
+async fn send_plain_telegram_answer(
+    bot: &Bot,
+    chat_id: ChatId,
+    answer: String,
+    context: &RunContext,
+) -> Result<(), teloxide::RequestError> {
+    if context.is_cancelled() {
+        return Ok(());
+    }
+
+    tokio::select! {
+        result = bot.send_message(chat_id, answer) => result.map(|_| ()),
+        _ = context.cancelled() => Ok(()),
+    }
+}
+
+fn cancel_on_ctrl_c(chat_id: ChatId, context: RunContext) -> CancellationWatch {
+    CancellationWatch(tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                context.cancel();
+                eprintln!("Telegram run cancelled for chat {chat_id}");
+            }
+            Err(error) => {
+                context.cancel();
+                eprintln!("Telegram Ctrl-C listener failed for chat {chat_id}: {error:#}");
+            }
+        }
+    }))
+}
+
+struct CancellationWatch(JoinHandle<()>);
+
+impl Drop for CancellationWatch {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -355,6 +435,7 @@ struct TelegramDraftStream {
     last_update: Option<Instant>,
     disabled: bool,
     typing: Option<JoinHandle<()>>,
+    context: RunContext,
 }
 
 impl TelegramDraftStream {
@@ -363,6 +444,7 @@ impl TelegramDraftStream {
         chat_id: ChatId,
         message_id: MessageId,
         typing: JoinHandle<()>,
+        context: RunContext,
     ) -> Self {
         Self {
             api,
@@ -372,6 +454,7 @@ impl TelegramDraftStream {
             last_update: None,
             disabled: false,
             typing: Some(typing),
+            context,
         }
     }
 
@@ -404,9 +487,10 @@ impl TelegramDraftStream {
     }
 
     async fn send_draft(&self) -> Result<()> {
-        self.api
-            .send_message_draft(self.chat_id, self.draft_id, &self.text)
-            .await
+        tokio::select! {
+            result = self.api.send_message_draft(self.chat_id, self.draft_id, &self.text) => result,
+            _ = self.context.cancelled() => bail!(RUN_CANCELLED),
+        }
     }
 
     async fn stop_typing(&mut self) {
@@ -459,9 +543,14 @@ fn truncate_chars(text: &str, max_chars: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use crate::auth::GatewayIdentity;
+    use anyhow::bail;
+    use teloxide::types::ChatId;
 
-    use super::{denied_message, telegram_identity_from_sender, truncate_chars};
+    use crate::{auth::GatewayIdentity, llm::client::RunContext};
+
+    use super::{
+        answer_or_gateway_error, denied_message, telegram_identity_from_sender, truncate_chars,
+    };
 
     #[test]
     fn telegram_identity_uses_sender_user_id() {
@@ -489,6 +578,16 @@ mod tests {
         assert!(message.contains("/start"));
         assert!(!message.contains("users.json"));
         assert!(!message.contains("~/.codrik"));
+    }
+
+    #[test]
+    fn cancelled_run_does_not_render_gateway_error() {
+        let context = RunContext::new();
+        context.cancel();
+
+        let answer = answer_or_gateway_error(ChatId(123), (|| bail!("run cancelled"))(), &context);
+
+        assert_eq!(answer, None);
     }
 
     #[test]

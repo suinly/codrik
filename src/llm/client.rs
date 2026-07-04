@@ -1,12 +1,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::{message::Message, tool::Tool};
 
+pub const RUN_CANCELLED: &str = "run cancelled";
+
 #[async_trait]
 pub trait LlmClient {
-    async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse>;
+    async fn generate(&self, llm_request: LlmRequest, context: &RunContext) -> Result<LlmResponse>;
 }
 
 #[async_trait]
@@ -15,6 +18,7 @@ pub trait LlmStreamClient {
         &self,
         llm_request: LlmRequest,
         sink: &mut dyn LlmStreamSink,
+        context: &RunContext,
     ) -> Result<LlmResponse>;
 }
 
@@ -26,6 +30,43 @@ pub trait LlmStreamSink: Send {
 pub struct LlmRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,
+}
+
+#[derive(Clone, Default)]
+pub struct RunContext {
+    cancellation: CancellationToken,
+}
+
+impl RunContext {
+    pub fn new() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub fn ensure_not_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            anyhow::bail!(RUN_CANCELLED);
+        }
+
+        Ok(())
+    }
+}
+
+pub fn is_run_cancelled_error(error: &anyhow::Error) -> bool {
+    error.to_string() == RUN_CANCELLED
 }
 
 #[derive(Debug, Clone)]

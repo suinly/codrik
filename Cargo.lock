@@ -418,6 +418,7 @@ dependencies = [
  "telegram-markdown-v2",
  "teloxide",
  "tokio",
+ "tokio-util",
  "yaml_serde",
 ]
 

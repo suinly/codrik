@@ -5,10 +5,10 @@ use crate::{
     },
     llm::client::{
         LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
-        LlmToolCall, LlmToolCallDelta,
+        LlmToolCall, LlmToolCallDelta, RUN_CANCELLED, RunContext,
     },
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -148,13 +148,25 @@ impl OpenAiClient {
         &self,
         mut request: CreateChatCompletionRequest,
         sink: &mut dyn LlmStreamSink,
+        context: &RunContext,
     ) -> Result<LlmResponse> {
         request.stream = Some(true);
 
-        let mut stream = self.client.chat().create_stream(request).await?;
+        let chat = self.client.chat();
+        let mut stream = tokio::select! {
+            stream = chat.create_stream(request) => stream?,
+            _ = context.cancelled() => bail!(RUN_CANCELLED),
+        };
         let mut accumulator = StreamAccumulator::default();
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let Some(chunk) = (tokio::select! {
+                chunk = stream.next() => chunk,
+                _ = context.cancelled() => bail!(RUN_CANCELLED),
+            }) else {
+                break;
+            };
+
             accumulator.push(chunk?, sink).await?;
         }
 
@@ -218,10 +230,14 @@ impl OpenAiClient {
 
 #[async_trait::async_trait]
 impl LlmClient for OpenAiClient {
-    async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse> {
+    async fn generate(&self, llm_request: LlmRequest, context: &RunContext) -> Result<LlmResponse> {
         let mut request = self.to_openai_request(llm_request)?;
         request.stream = Some(false);
-        let response = self.client.chat().create(request).await?;
+        let chat = self.client.chat();
+        let response = tokio::select! {
+            response = chat.create(request) => response?,
+            _ = context.cancelled() => bail!(RUN_CANCELLED),
+        };
 
         Self::to_llm_response(response)
     }
@@ -233,10 +249,11 @@ impl LlmStreamClient for OpenAiClient {
         &self,
         llm_request: LlmRequest,
         sink: &mut dyn LlmStreamSink,
+        context: &RunContext,
     ) -> Result<LlmResponse> {
         let request = self.to_openai_request(llm_request)?;
 
-        self.collect_stream_response(request, sink).await
+        self.collect_stream_response(request, sink, context).await
     }
 }
 

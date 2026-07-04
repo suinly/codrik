@@ -6,6 +6,7 @@ use crate::agent::message::Message;
 use crate::agent::tool::ToolExecutor;
 use crate::llm::client::{
     LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
+    RUN_CANCELLED, RunContext,
 };
 use crate::memory::store::MemoryStore;
 use anyhow::{Result, bail};
@@ -40,10 +41,23 @@ where
     }
 
     pub async fn execute(&self, content: impl Into<String>) -> Result<String> {
+        self.execute_with_context(content, &RunContext::new()).await
+    }
+
+    pub async fn execute_with_context(
+        &self,
+        content: impl Into<String>,
+        context: &RunContext,
+    ) -> Result<String> {
         self.memory.append(Message::user(content.into())).await?;
 
         for _ in 0..MAX_TOOL_CALL_ITERATIONS {
-            let response = self.llm.generate(self.build_llm_request().await?).await?;
+            context.ensure_not_cancelled()?;
+            let request = self.build_llm_request().await?;
+            let response = tokio::select! {
+                response = self.llm.generate(request, context) => response?,
+                _ = context.cancelled() => bail!(RUN_CANCELLED),
+            };
 
             if let Some(answer) = self.record_response(response).await? {
                 return Ok(answer);
@@ -65,16 +79,28 @@ where
         content: impl Into<String>,
         sink: &mut dyn LlmStreamSink,
     ) -> Result<String> {
+        self.execute_streaming_with_context(content, sink, &RunContext::new())
+            .await
+    }
+
+    pub async fn execute_streaming_with_context(
+        &self,
+        content: impl Into<String>,
+        sink: &mut dyn LlmStreamSink,
+        context: &RunContext,
+    ) -> Result<String> {
         self.memory.append(Message::user(content.into())).await?;
 
         for _ in 0..MAX_TOOL_CALL_ITERATIONS {
+            context.ensure_not_cancelled()?;
             let request = self.build_llm_request().await?;
-            let streamed_turn = self.stream_turn(request).await?;
+            let streamed_turn = self.stream_turn(request, context).await?;
             let (response, stream_events) = streamed_turn.into_parts();
 
             if response.tool_calls.is_empty() {
                 let answer = response.content.clone();
                 self.record_response(response).await?;
+                context.ensure_not_cancelled()?;
                 stream_events.commit_to(sink).await?;
                 return Ok(answer);
             }
@@ -85,9 +111,12 @@ where
         bail!("tool call loop exceeded max iterations ({MAX_TOOL_CALL_ITERATIONS})")
     }
 
-    async fn stream_turn(&self, request: LlmRequest) -> Result<StreamedTurn> {
+    async fn stream_turn(&self, request: LlmRequest, context: &RunContext) -> Result<StreamedTurn> {
         let mut stream_events = StreamEventBuffer::default();
-        let response = self.llm.stream(request, &mut stream_events).await?;
+        let response = tokio::select! {
+            response = self.llm.stream(request, &mut stream_events, context) => response?,
+            _ = context.cancelled() => bail!(RUN_CANCELLED),
+        };
 
         Ok(StreamedTurn {
             response,
@@ -198,7 +227,7 @@ mod tests {
 
     use anyhow::{Result, bail};
     use async_trait::async_trait;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     use crate::{
         agent::{
@@ -208,7 +237,7 @@ mod tests {
         },
         llm::client::{
             LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
-            LlmToolCall,
+            LlmToolCall, RunContext,
         },
         memory::{in_memory::InMemoryStore, store::MemoryStore},
     };
@@ -216,6 +245,11 @@ mod tests {
     #[derive(Clone)]
     struct FakeClient {
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[derive(Clone)]
+    struct BlockingClient {
+        started: Arc<Notify>,
     }
 
     #[derive(Clone)]
@@ -239,7 +273,11 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for ScriptedClient {
-        async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse> {
+        async fn generate(
+            &self,
+            llm_request: LlmRequest,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
             self.requests.lock().await.push(llm_request.messages);
 
             let mut responses = self.responses.lock().await;
@@ -257,6 +295,7 @@ mod tests {
             &self,
             llm_request: LlmRequest,
             sink: &mut dyn LlmStreamSink,
+            _context: &RunContext,
         ) -> Result<LlmResponse> {
             self.requests.lock().await.push(llm_request.messages);
 
@@ -302,8 +341,24 @@ mod tests {
     }
 
     #[async_trait]
+    impl LlmClient for BlockingClient {
+        async fn generate(
+            &self,
+            _llm_request: LlmRequest,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.started.notify_waiters();
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
     impl LlmClient for FakeClient {
-        async fn generate(&self, llm_request: LlmRequest) -> Result<LlmResponse> {
+        async fn generate(
+            &self,
+            llm_request: LlmRequest,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
             self.requests.lock().await.push(llm_request.messages);
 
             Ok(LlmResponse {
@@ -369,6 +424,32 @@ mod tests {
         assert!(context.iter().all(|message| message.role != Role::System));
         assert_eq!(context[0], Message::user("hello"));
         assert_eq!(context[1], Message::assistant("answer"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_returns_when_context_is_cancelled_during_llm_request() -> Result<()> {
+        let started = Arc::new(Notify::new());
+        let client = BlockingClient {
+            started: started.clone(),
+        };
+        let agent = Agent::new(client, InMemoryStore::new(), NoTools);
+        let context = RunContext::new();
+        let task_context = context.clone();
+
+        let task = tokio::spawn(async move {
+            agent
+                .execute_with_context("hello", &task_context)
+                .await
+                .expect_err("run should be cancelled")
+        });
+
+        started.notified().await;
+        context.cancel();
+
+        let error = task.await?;
+        assert_eq!(error.to_string(), "run cancelled");
 
         Ok(())
     }

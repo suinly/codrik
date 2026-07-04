@@ -2,7 +2,10 @@ use crate::{
     agent::Agent,
     auth::AuthorizedActor,
     config::{AppConfig, codrik_dir},
-    llm::{client::LlmStreamSink, openai::OpenAiClient},
+    llm::{
+        client::{LlmStreamSink, RunContext},
+        openai::OpenAiClient,
+    },
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
     tools::{ToolRegistry, ToolRegistryConfig},
 };
@@ -72,31 +75,35 @@ pub async fn run_once_with_session_streaming(
     agent.execute_streaming(query, sink).await
 }
 
-pub async fn run_once_with_actor_session_in_root(
+pub async fn run_once_with_actor_session_in_root_and_context(
     query: String,
     config: AppConfig,
     actor: AuthorizedActor,
     session_root: PathBuf,
     session_id: impl AsRef<str>,
+    context: &RunContext,
 ) -> Result<String> {
     let memory = FileMemoryStore::new(session_root, session_id)?;
     let agent = build_agent_for_actor(config, memory, actor)?;
 
-    agent.execute(query).await
+    agent.execute_with_context(query, context).await
 }
 
-pub async fn run_once_with_actor_session_streaming_in_root(
+pub async fn run_once_with_actor_session_streaming_in_root_and_context(
     query: String,
     config: AppConfig,
     actor: AuthorizedActor,
     session_root: PathBuf,
     session_id: impl AsRef<str>,
     sink: &mut dyn LlmStreamSink,
+    context: &RunContext,
 ) -> Result<String> {
     let memory = FileMemoryStore::new(session_root, session_id)?;
     let agent = build_agent_for_actor(config, memory, actor)?;
 
-    agent.execute_streaming(query, sink).await
+    agent
+        .execute_streaming_with_context(query, sink, context)
+        .await
 }
 
 fn build_agent_for_actor<M>(
