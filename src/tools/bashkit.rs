@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bashkit::{BashTool as BashkitTool, ExecutionLimits, Tool as BashkitToolContract};
+use bashkit::{BashTool as BashkitRuntimeTool, ExecutionLimits, Tool as BashkitToolContract};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::tool::{Tool, ToolHandler, ToolParameter, ToolParameters};
@@ -13,22 +13,22 @@ const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
 const MAX_OUTPUT_CHARS: usize = 100_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BashToolConfig {
+pub struct BashkitToolConfig {
     pub workspace: Option<PathBuf>,
 }
 
-pub struct BashTool {
-    config: BashToolConfig,
+pub struct BashkitTool {
+    config: BashkitToolConfig,
 }
 
-impl BashTool {
-    pub fn new(config: BashToolConfig) -> Self {
+impl BashkitTool {
+    pub fn new(config: BashkitToolConfig) -> Self {
         Self { config }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct BashArguments {
+struct BashkitArguments {
     command: Option<String>,
     commands: Option<String>,
     cwd: Option<PathBuf>,
@@ -38,7 +38,7 @@ struct BashArguments {
 }
 
 #[derive(Debug, Serialize)]
-struct BashResult {
+struct BashkitResult {
     exit_code: i32,
     stdout: String,
     stderr: String,
@@ -50,15 +50,15 @@ struct BashResult {
 }
 
 #[async_trait]
-impl ToolHandler for BashTool {
+impl ToolHandler for BashkitTool {
     fn name(&self) -> &'static str {
-        "bash"
+        "bashkit"
     }
 
     fn definition(&self) -> Tool {
         Tool::new(
             self.name(),
-            "Execute bash-compatible commands in a Bashkit in-process sandbox. For authorized actors, the host workspace is mounted read-write at /workspace and is limited to that actor's configured host workspace directory. Other host filesystem and network access are not available unless Bashkit is configured with explicit opt-in capabilities.",
+            "Execute bash-compatible commands in a Bashkit in-process sandbox. For authorized actors, the host workspace is mounted read-write at /workspace and is limited to that actor's configured host workspace directory. This is not the real server shell. Other host filesystem and network access are not available unless Bashkit is configured with explicit opt-in capabilities.",
             ToolParameters::new()
                 .required(
                     "command",
@@ -88,13 +88,13 @@ impl ToolHandler for BashTool {
     }
 
     async fn execute(&self, arguments: &str) -> Result<String> {
-        let arguments: BashArguments =
-            serde_json::from_str(arguments).context("failed to parse bash tool arguments")?;
+        let arguments: BashkitArguments =
+            serde_json::from_str(arguments).context("failed to parse bashkit tool arguments")?;
         let command = arguments
             .command
             .as_deref()
             .or(arguments.commands.as_deref())
-            .context("bash tool requires `command`")?;
+            .context("bashkit tool requires `command`")?;
         let timeout_ms = timeout_ms(&arguments);
         let max_output_chars = arguments
             .max_output_chars
@@ -126,12 +126,12 @@ fn bashkit_tool(
     cwd: Option<PathBuf>,
     max_output_bytes: usize,
     workspace: Option<PathBuf>,
-) -> Result<BashkitTool> {
+) -> Result<BashkitRuntimeTool> {
     let limits = ExecutionLimits::new()
         .timeout(Duration::from_secs(MAX_TIMEOUT_SECONDS))
         .max_stdout_bytes(max_output_bytes)
         .max_stderr_bytes(max_output_bytes);
-    let mut builder = BashkitTool::builder()
+    let mut builder = BashkitRuntimeTool::builder()
         .username("agent")
         .hostname("sandbox")
         .limits(limits);
@@ -157,7 +157,7 @@ fn bashkit_tool(
     Ok(builder.build())
 }
 
-fn timeout_ms(arguments: &BashArguments) -> u64 {
+fn timeout_ms(arguments: &BashkitArguments) -> u64 {
     arguments
         .timeout_ms
         .or_else(|| arguments.timeout_seconds.map(|seconds| seconds * 1000))
@@ -165,14 +165,14 @@ fn timeout_ms(arguments: &BashArguments) -> u64 {
         .min(MAX_TIMEOUT_SECONDS * 1000)
 }
 
-fn to_bash_result(result: serde_json::Value) -> BashResult {
+fn to_bash_result(result: serde_json::Value) -> BashkitResult {
     let stderr = result["stderr"].as_str().unwrap_or_default().to_string();
     let error = result["error"].as_str().map(ToString::to_string);
     let timed_out = error.as_deref() == Some("timeout")
         || stderr.contains("timed out")
         || stderr.contains("execution timeout");
 
-    BashResult {
+    BashkitResult {
         exit_code: result["exit_code"].as_i64().unwrap_or(1) as i32,
         stdout: result["stdout"].as_str().unwrap_or_default().to_string(),
         stderr,
@@ -200,9 +200,9 @@ mod tests {
 
     #[test]
     fn definition_requires_command() {
-        let definition = BashTool::new(BashToolConfig::default()).definition();
+        let definition = BashkitTool::new(BashkitToolConfig::default()).definition();
 
-        assert_eq!(definition.name, "bash");
+        assert_eq!(definition.name, "bashkit");
         assert!(
             definition
                 .parameters
@@ -213,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_successful_command_output() {
-        let result = BashTool::new(BashToolConfig::default())
+        let result = BashkitTool::new(BashkitToolConfig::default())
             .execute(r#"{"command":"printf hello"}"#)
             .await
             .expect("shell command should execute");
@@ -227,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_nonzero_exit_as_tool_output() {
-        let result = BashTool::new(BashToolConfig::default())
+        let result = BashkitTool::new(BashkitToolConfig::default())
             .execute(r#"{"command":"printf nope >&2; exit 7"}"#)
             .await
             .expect("nonzero exit should still be tool output");
@@ -240,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_timeout() {
-        let result = BashTool::new(BashToolConfig::default())
+        let result = BashkitTool::new(BashkitToolConfig::default())
             .execute(r#"{"command":"sleep 2","timeout_seconds":1}"#)
             .await
             .expect("timeout should still be tool output");
@@ -253,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncates_large_output() {
-        let result = BashTool::new(BashToolConfig::default())
+        let result = BashkitTool::new(BashkitToolConfig::default())
             .execute(r#"{"command":"printf abcdef","max_output_chars":3}"#)
             .await
             .expect("shell command should execute");
@@ -265,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn caps_output_while_command_is_running() {
-        let result = BashTool::new(BashToolConfig::default())
+        let result = BashkitTool::new(BashkitToolConfig::default())
             .execute(r#"{"command":"printf abcdefghij","max_output_chars":8}"#)
             .await
             .expect("shell command should execute with capped output");
@@ -284,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_native_commands_alias() {
-        let result = BashTool::new(BashToolConfig::default())
+        let result = BashkitTool::new(BashkitToolConfig::default())
             .execute(r#"{"commands":"printf alias"}"#)
             .await
             .expect("shell command should execute");
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_inside_virtual_filesystem() {
-        let result = BashTool::new(BashToolConfig::default())
+        let result = BashkitTool::new(BashkitToolConfig::default())
             .execute(r#"{"command":"mkdir -p /tmp/data; printf hello > /tmp/data/out.txt; cat /tmp/data/out.txt"}"#)
             .await
             .expect("shell command should execute");
@@ -310,7 +310,7 @@ mod tests {
     async fn mounts_configured_workspace_at_workspace() {
         let workspace = temp_workspace_path();
         let _ = fs::remove_dir_all(&workspace);
-        let tool = BashTool::new(BashToolConfig {
+        let tool = BashkitTool::new(BashkitToolConfig {
             workspace: Some(workspace.clone()),
         });
 

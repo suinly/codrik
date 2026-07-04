@@ -108,7 +108,7 @@ where
     let tools = ToolRegistry::with_allowed_tools_and_config(
         actor.tools,
         ToolRegistryConfig {
-            bash_workspace: Some(workspace),
+            bashkit_workspace: Some(workspace),
         },
     );
 

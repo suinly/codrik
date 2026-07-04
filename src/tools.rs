@@ -1,6 +1,6 @@
 use std::{collections::HashSet, path::PathBuf};
 
-mod bash;
+mod bashkit;
 mod datetime;
 
 use anyhow::{Result, bail};
@@ -14,7 +14,7 @@ pub struct ToolRegistry {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolRegistryConfig {
-    pub bash_workspace: Option<PathBuf>,
+    pub bashkit_workspace: Option<PathBuf>,
 }
 
 impl ToolRegistry {
@@ -26,8 +26,8 @@ impl ToolRegistry {
         Self {
             handlers: vec![
                 Box::new(datetime::DatetimeTool),
-                Box::new(bash::BashTool::new(bash::BashToolConfig {
-                    workspace: config.bash_workspace,
+                Box::new(bashkit::BashkitTool::new(bashkit::BashkitToolConfig {
+                    workspace: config.bashkit_workspace,
                 })),
             ],
         }
@@ -83,13 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn definitions_include_bash() {
+    fn definitions_include_bashkit() {
         let tools = ToolRegistry::new().definitions();
-        let bash_name = bash::BashTool::new(bash::BashToolConfig::default())
+        let bashkit_name = bashkit::BashkitTool::new(bashkit::BashkitToolConfig::default())
             .definition()
             .name;
 
-        assert!(tools.iter().any(|tool| tool.name == bash_name));
+        assert!(tools.iter().any(|tool| tool.name == bashkit_name));
     }
 
     #[test]
@@ -107,12 +107,12 @@ mod tests {
             ToolRegistry::with_allowed_tools_and_config(vec!["*".to_string()], default_config())
                 .definitions();
         let datetime_name = datetime::DatetimeTool.definition().name;
-        let bash_name = bash::BashTool::new(bash::BashToolConfig::default())
+        let bashkit_name = bashkit::BashkitTool::new(bashkit::BashkitToolConfig::default())
             .definition()
             .name;
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
-        assert!(tools.iter().any(|tool| tool.name == bash_name));
+        assert!(tools.iter().any(|tool| tool.name == bashkit_name));
     }
 
     #[tokio::test]
@@ -123,6 +123,27 @@ mod tests {
                 .await;
 
         assert_eq!(result.unwrap_err().to_string(), "unknown tool: datetime");
+    }
+
+    #[test]
+    fn renamed_bashkit_tool_is_allowed_by_new_name() {
+        let tools = ToolRegistry::with_allowed_tools_and_config(
+            vec!["bashkit".to_string()],
+            default_config(),
+        )
+        .definitions();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "bashkit");
+    }
+
+    #[test]
+    fn old_bash_name_no_longer_allows_bashkit_tool() {
+        let tools =
+            ToolRegistry::with_allowed_tools_and_config(vec!["bash".to_string()], default_config())
+                .definitions();
+
+        assert!(tools.is_empty());
     }
 
     fn default_config() -> ToolRegistryConfig {
