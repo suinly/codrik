@@ -108,7 +108,17 @@ pub trait ToolExecutor {
 pub trait ToolHandler: Send + Sync {
     fn name(&self) -> &'static str;
 
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::Standard
+    }
+
     fn definition(&self) -> Tool;
 
     async fn execute(&self, arguments: &str) -> Result<String>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExposure {
+    Standard,
+    Privileged,
 }

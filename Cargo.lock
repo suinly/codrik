@@ -410,6 +410,7 @@ dependencies = [
  "async-trait",
  "bashkit",
  "futures-util",
+ "libc",
  "reqwest 0.13.4",
  "serde",
  "serde_json",

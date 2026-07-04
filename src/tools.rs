@@ -1,12 +1,13 @@
 use std::{collections::HashSet, path::PathBuf};
 
+mod bash;
 mod bashkit;
 mod datetime;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use crate::agent::tool::{Tool, ToolExecutor, ToolHandler};
+use crate::agent::tool::{Tool, ToolExecutor, ToolExposure, ToolHandler};
 
 pub struct ToolRegistry {
     handlers: Vec<Box<dyn ToolHandler>>,
@@ -29,6 +30,7 @@ impl ToolRegistry {
                 Box::new(bashkit::BashkitTool::new(bashkit::BashkitToolConfig {
                     workspace: config.bashkit_workspace,
                 })),
+                Box::new(bash::BashTool),
             ],
         }
     }
@@ -38,14 +40,13 @@ impl ToolRegistry {
         config: ToolRegistryConfig,
     ) -> Self {
         let allowed_tools = allowed_tools.into_iter().collect::<HashSet<_>>();
-        if allowed_tools.contains("*") {
-            return Self::with_config(config);
-        }
-
         let handlers = Self::with_config(config)
             .handlers
             .into_iter()
-            .filter(|handler| allowed_tools.contains(handler.name()))
+            .filter(|handler| {
+                allowed_tools.contains(handler.name())
+                    || (allowed_tools.contains("*") && handler.exposure() == ToolExposure::Standard)
+            })
             .collect();
 
         Self { handlers }
@@ -93,6 +94,14 @@ mod tests {
     }
 
     #[test]
+    fn definitions_include_privileged_bash() {
+        let tools = ToolRegistry::new().definitions();
+        let bash_name = bash::BashTool.definition().name;
+
+        assert!(tools.iter().any(|tool| tool.name == bash_name));
+    }
+
+    #[test]
     fn definitions_hide_disallowed_tools() {
         let tools =
             ToolRegistry::with_allowed_tools_and_config(Vec::<String>::new(), default_config())
@@ -102,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_allows_all_tools() {
+    fn wildcard_allows_standard_tools_only() {
         let tools =
             ToolRegistry::with_allowed_tools_and_config(vec!["*".to_string()], default_config())
                 .definitions();
@@ -110,9 +119,21 @@ mod tests {
         let bashkit_name = bashkit::BashkitTool::new(bashkit::BashkitToolConfig::default())
             .definition()
             .name;
+        let bash_name = bash::BashTool.definition().name;
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
         assert!(tools.iter().any(|tool| tool.name == bashkit_name));
+        assert!(!tools.iter().any(|tool| tool.name == bash_name));
+    }
+
+    #[test]
+    fn explicit_bash_grant_allows_privileged_bash() {
+        let tools =
+            ToolRegistry::with_allowed_tools_and_config(vec!["bash".to_string()], default_config())
+                .definitions();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "bash");
     }
 
     #[tokio::test]
@@ -138,12 +159,12 @@ mod tests {
     }
 
     #[test]
-    fn old_bash_name_no_longer_allows_bashkit_tool() {
+    fn explicit_bash_grant_does_not_allow_bashkit() {
         let tools =
             ToolRegistry::with_allowed_tools_and_config(vec!["bash".to_string()], default_config())
                 .definitions();
 
-        assert!(tools.is_empty());
+        assert!(!tools.iter().any(|tool| tool.name == "bashkit"));
     }
 
     fn default_config() -> ToolRegistryConfig {

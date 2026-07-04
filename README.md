@@ -78,8 +78,8 @@ codrik gateway telegram
 ```
 
 Telegram access is controlled by `~/.codrik/users.json`. The first Telegram
-user who sends `/start` is bootstrapped as enabled with access to every
-available tool. Later users who send `/start` are added as disabled entries;
+user who sends `/start` is bootstrapped as enabled with access to standard
+tools. Later users who send `/start` are added as disabled entries;
 enable them manually and set their `tools` list:
 
 ```json
@@ -102,8 +102,9 @@ enable them manually and set their `tools` list:
 }
 ```
 
-Use `"tools": ["*"]` to grant access to every available tool, including
-the host `bash` tool.
+Use `"tools": ["*"]` to grant access to standard tools such as `datetime` and
+the sandboxed `bashkit` tool. The real server `bash` tool is privileged and
+must be granted explicitly, for example `"tools": ["*", "bash"]`.
 
 Telegram sessions are stored under `~/.codrik/sessions`. Send `/new` to create
 and switch to a fresh session. Send `/sessions` to list recent sessions in the
