@@ -48,6 +48,22 @@ need_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+raise_file_descriptor_limit() {
+  local requested_limit=4096
+  local current_limit
+
+  current_limit="$(ulimit -n)"
+  if [[ "$current_limit" == "unlimited" ]]; then
+    return
+  fi
+
+  if [[ "$current_limit" =~ ^[0-9]+$ && "$current_limit" -lt "$requested_limit" ]]; then
+    echo "Raising file descriptor limit from $current_limit to $requested_limit"
+    ulimit -n "$requested_limit" 2>/dev/null \
+      || die "could not raise file descriptor limit to $requested_limit; run: ulimit -n $requested_limit"
+  fi
+}
+
 commit_lines_matching() {
   local range="$1"
   local pattern="$2"
@@ -208,6 +224,8 @@ fi
 CURRENT_VERSION="$(perl -0ne 'if (/\[package\][\s\S]*?\nversion = "([^"]+)"/) { print $1; exit }' Cargo.toml)"
 [[ -n "$CURRENT_VERSION" ]] || die "could not read package version from Cargo.toml"
 [[ "$CURRENT_VERSION" != "$VERSION" ]] || die "Cargo.toml already has version $VERSION"
+
+raise_file_descriptor_limit
 
 rustup target add "$MAC_TARGET" "$MAC_X64_TARGET" "$PI_TARGET" "$LINUX_X64_TARGET"
 
