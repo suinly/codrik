@@ -207,6 +207,7 @@ fn create_frontmatter(name: &str, description: &str) -> Result<String> {
 }
 
 fn write_skill_file(path: &Path, name: &str, description: &str, body: &str) -> Result<()> {
+    let body = strip_leading_frontmatter(body);
     fs::write(
         path,
         format!(
@@ -216,6 +217,17 @@ fn write_skill_file(path: &Path, name: &str, description: &str, body: &str) -> R
         ),
     )
     .with_context(|| format!("failed to write skill file: {}", path.display()))
+}
+
+fn strip_leading_frontmatter(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return content;
+    };
+    let Some((_frontmatter, body)) = rest.split_once("\n---") else {
+        return content;
+    };
+
+    body
 }
 
 fn validate_skill_name(name: &str) -> Result<()> {
@@ -620,6 +632,29 @@ mod tests {
                 source: "user".to_string(),
             }
         );
+        assert_eq!(
+            fs::read_to_string(root.join("release").join("SKILL.md"))?,
+            "---\nname: release\ndescription: New description.\n---\n\n# New\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_strips_frontmatter_from_full_skill_body() -> Result<()> {
+        let root = temp_root("update-full-skill-body")?;
+        write_skill(
+            &root,
+            "release",
+            "---\nname: release\ndescription: Old description.\n---\n\n# Old\n",
+        )?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+
+        registry.update(
+            "release",
+            "New description.",
+            "---\nname: release\ndescription: New description.\n---\n\n# New\n",
+        )?;
+
         assert_eq!(
             fs::read_to_string(root.join("release").join("SKILL.md"))?,
             "---\nname: release\ndescription: New description.\n---\n\n# New\n"
