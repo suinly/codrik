@@ -130,6 +130,59 @@ impl ToolHandler for SkillsCreateTool {
     }
 }
 
+pub struct SkillsUpdateTool {
+    registry: SkillRegistry,
+}
+
+impl SkillsUpdateTool {
+    pub fn new(registry: SkillRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[derive(Deserialize)]
+struct SkillsUpdateArguments {
+    name: String,
+    description: String,
+    body: String,
+}
+
+#[async_trait]
+impl ToolHandler for SkillsUpdateTool {
+    fn name(&self) -> &'static str {
+        "skills_update"
+    }
+
+    fn definition(&self) -> Tool {
+        Tool::new(
+            self.name(),
+            "Update an existing local user skill in a writable skill root and return the updated skill summary.",
+            ToolParameters::new()
+                .required("name", ToolParameter::string("Existing user skill name."))
+                .required(
+                    "description",
+                    ToolParameter::string(
+                        "Updated short description of when the skill should be used.",
+                    ),
+                )
+                .required(
+                    "body",
+                    ToolParameter::string("Updated Markdown body for SKILL.md."),
+                ),
+        )
+    }
+
+    async fn execute(&self, arguments: &str) -> Result<String> {
+        let arguments: SkillsUpdateArguments =
+            serde_json::from_str(arguments).context("failed to parse skills_update arguments")?;
+        let skill =
+            self.registry
+                .update(&arguments.name, &arguments.description, &arguments.body)?;
+
+        serialize_skill(skill)
+    }
+}
+
 #[derive(Serialize)]
 struct SkillSummary {
     name: String,
@@ -236,6 +289,35 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("release").join("SKILL.md"))?,
             "---\nname: release\ndescription: Release checklist.\n---\n\n# Release\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_returns_updated_skill_summary() -> Result<()> {
+        let root = temp_root("update")?;
+        write_skill(
+            &root,
+            "release",
+            "---\nname: release\ndescription: Old release.\n---\n\n# Old\n",
+        )?;
+        let tool = super::SkillsUpdateTool::new(SkillRegistry::new(vec![SkillRoot::writable(
+            &root, "user",
+        )]));
+
+        let result = tool
+            .execute(
+                r##"{"name":"release","description":"Updated release.","body":"# Updated\n"}"##,
+            )
+            .await?;
+
+        assert_eq!(
+            result,
+            r#"{"name":"release","description":"Updated release.","source":"user"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("release").join("SKILL.md"))?,
+            "---\nname: release\ndescription: Updated release.\n---\n\n# Updated\n"
         );
         Ok(())
     }

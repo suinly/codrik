@@ -116,13 +116,18 @@ codrik can discover local skills from:
 
 Project skills take precedence over user skills with the same name. Skills are
 available through standard tools, so actors with `"tools": ["*"]` can list,
-read, and create user skills.
+read, create, and update user skills.
 
 The runtime exposes:
 
 - `skills_list`: returns available skill names, descriptions, and sources
 - `skills_read`: reads `SKILL.md` or a relative reference file inside a skill
 - `skills_create`: writes `~/.codrik/skills/<name>/SKILL.md`
+- `skills_update`: rewrites an existing user skill in `~/.codrik/skills`
+
+Project skills are read-only through the skill tools. If a project skill and a
+user skill have the same name, the project skill remains active and
+`skills_update` refuses to edit the hidden user skill.
 
 Minimal skill:
 

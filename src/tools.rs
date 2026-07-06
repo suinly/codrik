@@ -34,7 +34,8 @@ impl ToolRegistry {
                 Box::new(datetime::DatetimeTool),
                 Box::new(skills::SkillsListTool::new(skill_registry.clone())),
                 Box::new(skills::SkillsReadTool::new(skill_registry.clone())),
-                Box::new(skills::SkillsCreateTool::new(skill_registry)),
+                Box::new(skills::SkillsCreateTool::new(skill_registry.clone())),
+                Box::new(skills::SkillsUpdateTool::new(skill_registry)),
                 Box::new(bashkit::BashkitTool::new(bashkit::BashkitToolConfig {
                     workspace: config.bashkit_workspace,
                 })),
@@ -145,6 +146,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "skills_list"));
         assert!(tools.iter().any(|tool| tool.name == "skills_read"));
         assert!(tools.iter().any(|tool| tool.name == "skills_create"));
+        assert!(tools.iter().any(|tool| tool.name == "skills_update"));
         assert!(!tools.iter().any(|tool| tool.name == bash_name));
     }
 

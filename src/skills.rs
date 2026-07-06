@@ -66,20 +66,33 @@ impl SkillRegistry {
             format!("failed to create skill directory: {}", skill_dir.display())
         })?;
         let skill_md = skill_dir.join("SKILL.md");
-        fs::write(
-            &skill_md,
-            format!(
-                "---\n{}---\n\n{}",
-                create_frontmatter(name, description)?,
-                body.trim_start()
-            ),
-        )
-        .with_context(|| format!("failed to write skill file: {}", skill_md.display()))?;
+        write_skill_file(&skill_md, name, description, body)?;
 
         Ok(Skill {
             name: name.to_string(),
             description: description.to_string(),
             source: root.source.clone(),
+        })
+    }
+
+    pub fn update(&self, name: &str, description: &str, body: &str) -> Result<Skill> {
+        validate_skill_name(name)?;
+        let skill = self
+            .discover()?
+            .into_iter()
+            .find(|entry| entry.skill.name == name)
+            .with_context(|| format!("unknown writable skill: {name}"))?;
+        if !skill.writable {
+            bail!("skill is read-only: {name}");
+        }
+
+        let skill_md = skill.dir.join("SKILL.md");
+        write_skill_file(&skill_md, name, description, body)?;
+
+        Ok(Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            source: skill.skill.source,
         })
     }
 
@@ -119,6 +132,7 @@ impl SkillRegistry {
 
                 skills.push(DiscoveredSkill {
                     dir: skill_dir,
+                    writable: root.writable,
                     skill: Skill {
                         name,
                         description: metadata.description.unwrap_or_default(),
@@ -135,6 +149,7 @@ impl SkillRegistry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DiscoveredSkill {
     dir: PathBuf,
+    writable: bool,
     skill: Skill,
 }
 
@@ -189,6 +204,18 @@ fn parse_metadata(content: &str) -> SkillMetadata {
 fn create_frontmatter(name: &str, description: &str) -> Result<String> {
     yaml_serde::to_string(&NewSkillMetadata { name, description })
         .context("failed to serialize skill frontmatter")
+}
+
+fn write_skill_file(path: &Path, name: &str, description: &str, body: &str) -> Result<()> {
+    fs::write(
+        path,
+        format!(
+            "---\n{}---\n\n{}",
+            create_frontmatter(name, description)?,
+            body.trim_start()
+        ),
+    )
+    .with_context(|| format!("failed to write skill file: {}", path.display()))
 }
 
 fn validate_skill_name(name: &str) -> Result<()> {
@@ -570,6 +597,69 @@ mod tests {
                 .to_string()
                 .contains("no writable skill root configured")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn update_rewrites_existing_writable_skill() -> Result<()> {
+        let root = temp_root("update-writable")?;
+        write_skill(
+            &root,
+            "release",
+            "---\nname: release\ndescription: Old description.\n---\n\n# Old\n",
+        )?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+
+        let skill = registry.update("release", "New description.", "# New\n")?;
+
+        assert_eq!(
+            skill,
+            Skill {
+                name: "release".to_string(),
+                description: "New description.".to_string(),
+                source: "user".to_string(),
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("release").join("SKILL.md"))?,
+            "---\nname: release\ndescription: New description.\n---\n\n# New\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_rejects_read_only_project_skill() -> Result<()> {
+        let project = temp_root("update-read-only-project")?;
+        let user = temp_root("update-read-only-user")?;
+        write_skill(
+            &project,
+            "release",
+            "---\nname: release\ndescription: Project release.\n---\n\n# Release\n",
+        )?;
+        let registry = SkillRegistry::new(vec![
+            SkillRoot::read_only(&project, "project"),
+            SkillRoot::writable(&user, "user"),
+        ]);
+
+        let error = registry
+            .update("release", "New release.", "# New\n")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("skill is read-only"));
+        assert!(!user.join("release").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn update_rejects_missing_writable_skill() -> Result<()> {
+        let root = temp_root("update-missing")?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+
+        let error = registry
+            .update("release", "Release checklist.", "# Release\n")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown writable skill"));
         Ok(())
     }
 
