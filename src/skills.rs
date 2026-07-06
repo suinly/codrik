@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
@@ -44,6 +44,43 @@ impl SkillRegistry {
 
         fs::read_to_string(&path)
             .with_context(|| format!("failed to read skill file: {}", path.display()))
+    }
+
+    pub fn create(&self, name: &str, description: &str, body: &str) -> Result<Skill> {
+        validate_skill_name(name)?;
+        if self
+            .discover()?
+            .iter()
+            .any(|entry| entry.skill.name == name)
+        {
+            bail!("skill already exists: {name}");
+        }
+
+        let root = self
+            .roots
+            .iter()
+            .find(|root| root.writable)
+            .context("no writable skill root configured")?;
+        let skill_dir = root.path.join(name);
+        fs::create_dir_all(&skill_dir).with_context(|| {
+            format!("failed to create skill directory: {}", skill_dir.display())
+        })?;
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_md,
+            format!(
+                "---\n{}---\n\n{}",
+                create_frontmatter(name, description)?,
+                body.trim_start()
+            ),
+        )
+        .with_context(|| format!("failed to write skill file: {}", skill_md.display()))?;
+
+        Ok(Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            source: root.source.clone(),
+        })
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredSkill>> {
@@ -116,12 +153,26 @@ impl SkillRoot {
             writable: false,
         }
     }
+
+    pub fn writable(path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            source: source.into(),
+            writable: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 struct SkillMetadata {
     name: Option<String>,
     description: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NewSkillMetadata<'a> {
+    name: &'a str,
+    description: &'a str,
 }
 
 fn parse_metadata(content: &str) -> SkillMetadata {
@@ -133,6 +184,24 @@ fn parse_metadata(content: &str) -> SkillMetadata {
     };
 
     yaml_serde::from_str(frontmatter).unwrap_or_default()
+}
+
+fn create_frontmatter(name: &str, description: &str) -> Result<String> {
+    yaml_serde::to_string(&NewSkillMetadata { name, description })
+        .context("failed to serialize skill frontmatter")
+}
+
+fn validate_skill_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(char::is_whitespace)
+    {
+        bail!("unsafe skill name: {name}");
+    }
+
+    Ok(())
 }
 
 fn resolve_inside(root: &Path, relative_path: &str) -> Result<PathBuf> {
@@ -364,6 +433,142 @@ mod tests {
             error
                 .to_string()
                 .contains("skill path escapes skill directory")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_writes_skill_to_first_writable_root() -> Result<()> {
+        let read_only = temp_root("create-read-only")?;
+        let writable = temp_root("create-writable")?;
+        let second_writable = temp_root("create-second-writable")?;
+        let registry = SkillRegistry::new(vec![
+            SkillRoot::read_only(&read_only, "project"),
+            SkillRoot::writable(&writable, "user"),
+            SkillRoot::writable(&second_writable, "fallback"),
+        ]);
+
+        let skill = registry.create("release", "Release checklist.", "\n# Release\n")?;
+
+        assert_eq!(
+            skill,
+            Skill {
+                name: "release".to_string(),
+                description: "Release checklist.".to_string(),
+                source: "user".to_string(),
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(writable.join("release").join("SKILL.md"))?,
+            "---\nname: release\ndescription: Release checklist.\n---\n\n# Release\n"
+        );
+        assert!(!read_only.join("release").exists());
+        assert!(!second_writable.join("release").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn create_writes_description_with_colon_as_valid_frontmatter() -> Result<()> {
+        let root = temp_root("create-colon-description")?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+        let description = "Use when logs say error: timeout.";
+
+        registry.create("incident", description, "# Incident\n")?;
+
+        let skills = registry.list()?;
+        assert_eq!(skills[0].description, description);
+        Ok(())
+    }
+
+    #[test]
+    fn create_writes_multiline_description_as_valid_frontmatter() -> Result<()> {
+        let root = temp_root("create-multiline-description")?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+        let description = "Use when debugging\nTelegram gateway failures.";
+
+        registry.create("telegram-debug", description, "# Telegram Debug\n")?;
+
+        let skills = registry.list()?;
+        assert_eq!(skills[0].description, description);
+        Ok(())
+    }
+
+    #[test]
+    fn create_rejects_duplicate_name_from_earlier_read_only_root() -> Result<()> {
+        let project = temp_root("create-duplicate-project")?;
+        let user = temp_root("create-duplicate-user")?;
+        write_skill(
+            &project,
+            "directory-name",
+            "---\nname: release\ndescription: Project release.\n---\n# Release\n",
+        )?;
+        let registry = SkillRegistry::new(vec![
+            SkillRoot::read_only(&project, "project"),
+            SkillRoot::writable(&user, "user"),
+        ]);
+
+        let error = registry
+            .create("release", "User release.", "# Release\n")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("skill already exists"));
+        assert!(!user.join("release").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn create_rejects_duplicate_name_from_writable_root() -> Result<()> {
+        let root = temp_root("create-duplicate-writable")?;
+        write_skill(
+            &root,
+            "release",
+            "---\ndescription: Existing release.\n---\n# Release\n",
+        )?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+
+        let error = registry
+            .create("release", "Replacement release.", "# Replacement\n")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("skill already exists"));
+        assert_eq!(
+            fs::read_to_string(root.join("release").join("SKILL.md"))?,
+            "---\ndescription: Existing release.\n---\n# Release\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_rejects_unsafe_skill_name() -> Result<()> {
+        let root = temp_root("create-unsafe")?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+
+        for name in ["", ".", "..", "with/slash", "with\\slash", "white space"] {
+            let error = registry
+                .create(name, "Description.", "# Body\n")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("unsafe skill name"),
+                "unexpected error for {name:?}: {error}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_rejects_when_no_writable_root_exists() -> Result<()> {
+        let root = temp_root("create-no-writable")?;
+        let registry = SkillRegistry::new(vec![SkillRoot::read_only(&root, "project")]);
+
+        let error = registry
+            .create("release", "Release checklist.", "# Release\n")
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no writable skill root configured")
         );
         Ok(())
     }
