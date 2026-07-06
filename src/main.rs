@@ -5,6 +5,7 @@ mod config;
 mod interfaces;
 mod llm;
 mod memory;
+mod skills;
 mod tools;
 mod updater;
 
