@@ -3,12 +3,14 @@ use std::{collections::HashSet, path::PathBuf};
 mod bash;
 mod bashkit;
 mod datetime;
+mod skills;
 mod web_browser;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use crate::agent::tool::{Tool, ToolExecutor, ToolExposure, ToolHandler};
+use crate::skills::SkillRegistry;
 
 pub struct ToolRegistry {
     handlers: Vec<Box<dyn ToolHandler>>,
@@ -17,6 +19,7 @@ pub struct ToolRegistry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolRegistryConfig {
     pub bashkit_workspace: Option<PathBuf>,
+    pub skill_roots: Vec<crate::skills::SkillRoot>,
 }
 
 impl ToolRegistry {
@@ -25,9 +28,13 @@ impl ToolRegistry {
     }
 
     pub fn with_config(config: ToolRegistryConfig) -> Self {
+        let skill_registry = SkillRegistry::new(config.skill_roots);
         Self {
             handlers: vec![
                 Box::new(datetime::DatetimeTool),
+                Box::new(skills::SkillsListTool::new(skill_registry.clone())),
+                Box::new(skills::SkillsReadTool::new(skill_registry.clone())),
+                Box::new(skills::SkillsCreateTool::new(skill_registry)),
                 Box::new(bashkit::BashkitTool::new(bashkit::BashkitToolConfig {
                     workspace: config.bashkit_workspace,
                 })),
@@ -135,6 +142,9 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
         assert!(tools.iter().any(|tool| tool.name == bashkit_name));
         assert!(tools.iter().any(|tool| tool.name == "web_browser"));
+        assert!(tools.iter().any(|tool| tool.name == "skills_list"));
+        assert!(tools.iter().any(|tool| tool.name == "skills_read"));
+        assert!(tools.iter().any(|tool| tool.name == "skills_create"));
         assert!(!tools.iter().any(|tool| tool.name == bash_name));
     }
 

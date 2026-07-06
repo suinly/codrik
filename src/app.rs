@@ -120,6 +120,7 @@ where
         actor.tools,
         ToolRegistryConfig {
             bashkit_workspace: Some(workspace),
+            ..ToolRegistryConfig::default()
         },
     );
 
