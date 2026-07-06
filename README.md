@@ -107,6 +107,38 @@ the embedded Obscura `web_browser`, and the sandboxed `bashkit` tool. The real
 server `bash` tool is privileged and must be granted explicitly, for example
 `"tools": ["*", "bash"]`.
 
+## Skills
+
+codrik can discover local skills from:
+
+- `.codrik/skills/<name>/SKILL.md` in the current working directory
+- `~/.codrik/skills/<name>/SKILL.md`
+
+Project skills take precedence over user skills with the same name. Skills are
+available through standard tools, so actors with `"tools": ["*"]` can list,
+read, and create user skills.
+
+The runtime exposes:
+
+- `skills_list`: returns available skill names, descriptions, and sources
+- `skills_read`: reads `SKILL.md` or a relative reference file inside a skill
+- `skills_create`: writes `~/.codrik/skills/<name>/SKILL.md`
+
+Minimal skill:
+
+```md
+---
+name: telegram-debug
+description: Use when debugging Telegram gateway behavior, auth, sessions, or delivery failures.
+---
+
+# Telegram Debug
+
+1. Check gateway logs.
+2. Inspect `~/.codrik/users.json`.
+3. Verify the active Telegram session.
+```
+
 `web_browser` uses Obscura as an embedded Rust browser API, pinned as a git
 dependency. The first build can take longer than usual because Obscura builds
 its browser runtime dependencies from source.
