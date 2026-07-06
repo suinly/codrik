@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::PathBuf};
 mod bash;
 mod bashkit;
 mod datetime;
+mod web_browser;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -30,6 +31,9 @@ impl ToolRegistry {
                 Box::new(bashkit::BashkitTool::new(bashkit::BashkitToolConfig {
                     workspace: config.bashkit_workspace,
                 })),
+                Box::new(web_browser::WebBrowserTool::new(
+                    web_browser::WebBrowserToolConfig::default(),
+                )),
                 Box::new(bash::BashTool),
             ],
         }
@@ -102,6 +106,13 @@ mod tests {
     }
 
     #[test]
+    fn definitions_include_web_browser() {
+        let tools = ToolRegistry::new().definitions();
+
+        assert!(tools.iter().any(|tool| tool.name == "web_browser"));
+    }
+
+    #[test]
     fn definitions_hide_disallowed_tools() {
         let tools =
             ToolRegistry::with_allowed_tools_and_config(Vec::<String>::new(), default_config())
@@ -123,6 +134,7 @@ mod tests {
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
         assert!(tools.iter().any(|tool| tool.name == bashkit_name));
+        assert!(tools.iter().any(|tool| tool.name == "web_browser"));
         assert!(!tools.iter().any(|tool| tool.name == bash_name));
     }
 

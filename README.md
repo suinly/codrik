@@ -102,9 +102,14 @@ enable them manually and set their `tools` list:
 }
 ```
 
-Use `"tools": ["*"]` to grant access to standard tools such as `datetime` and
-the sandboxed `bashkit` tool. The real server `bash` tool is privileged and
-must be granted explicitly, for example `"tools": ["*", "bash"]`.
+Use `"tools": ["*"]` to grant access to standard tools such as `datetime`,
+the embedded Obscura `web_browser`, and the sandboxed `bashkit` tool. The real
+server `bash` tool is privileged and must be granted explicitly, for example
+`"tools": ["*", "bash"]`.
+
+`web_browser` uses Obscura as an embedded Rust browser API, pinned as a git
+dependency. The first build can take longer than usual because Obscura builds
+its browser runtime dependencies from source.
 
 Telegram sessions are stored under `~/.codrik/sessions/<telegram-chat-id>/`,
 with chat-local metadata in `index.json`. Send `/new` to create and switch to a
