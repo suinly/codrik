@@ -118,6 +118,10 @@ Project skills take precedence over user skills with the same name. Skills are
 available through standard tools, so actors with `"tools": ["*"]` can list,
 read, create, and update user skills.
 
+codrik includes a compact skill index in the agent instructions so the model can
+match tasks against skill names and descriptions before it answers. The full
+`SKILL.md` content is still loaded on demand through `skills_read`.
+
 The runtime exposes:
 
 - `skills_list`: returns available skill names, descriptions, and sources

@@ -7,13 +7,15 @@ use crate::{
         openai::OpenAiClient,
     },
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
-    skills::SkillRoot,
+    skills::{Skill, SkillRegistry, SkillRoot},
     tools::{ToolRegistry, ToolRegistryConfig},
 };
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+
+const MAX_SKILL_INDEX_CHARS: usize = 8_000;
 
 pub type AppAgent = Agent<OpenAiClient, InMemoryStore, ToolRegistry>;
 
@@ -26,11 +28,11 @@ where
     M: MemoryStore,
 {
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
-    let tools = ToolRegistry::with_config(
-        default_tool_config().expect("failed to build default tool config"),
-    );
+    let tool_config = default_tool_config().expect("failed to build default tool config");
+    let instructions = agent_instructions_for_tool_config(&tool_config);
+    let tools = ToolRegistry::with_config(tool_config);
 
-    Agent::new(llm, memory, tools).set_instructions(default_agent_instructions())
+    Agent::new(llm, memory, tools).set_instructions(instructions)
 }
 
 pub async fn run_once(query: String) -> Result<String> {
@@ -119,9 +121,10 @@ where
 {
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
     let tool_config = actor_tool_config(&actor)?;
+    let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
 
-    Ok(Agent::new(llm, memory, tools).set_instructions(default_agent_instructions()))
+    Ok(Agent::new(llm, memory, tools).set_instructions(instructions))
 }
 
 fn default_tool_config() -> Result<ToolRegistryConfig> {
@@ -167,9 +170,66 @@ fn default_agent_instructions() -> String {
         .to_string()
 }
 
+fn agent_instructions_for_tool_config(tool_config: &ToolRegistryConfig) -> String {
+    let mut instructions = default_agent_instructions();
+    let Ok(skills) = SkillRegistry::new(tool_config.skill_roots.clone()).list() else {
+        return instructions;
+    };
+
+    if let Some(skill_index) = skill_index_section(&skills) {
+        instructions.push_str("\n\n");
+        instructions.push_str(&skill_index);
+    }
+
+    instructions
+}
+
+fn skill_index_section(skills: &[Skill]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+
+    let mut section = String::from("## Available Skills\n\n");
+    section.push_str(
+        "These local skills are available for implicit matching. Use `skills_read` to load the full `SKILL.md` before following a selected skill.\n\n",
+    );
+
+    let mut omitted = 0;
+    for skill in skills {
+        let line = format!(
+            "- {} ({}): {}\n",
+            skill.name, skill.source, skill.description
+        );
+        if section.len() + line.len() > MAX_SKILL_INDEX_CHARS {
+            omitted += 1;
+            continue;
+        }
+
+        section.push_str(&line);
+    }
+
+    if omitted > 0 {
+        let line = format!("- ... {omitted} more skills omitted from the compact index.\n");
+        if section.len() + line.len() <= MAX_SKILL_INDEX_CHARS {
+            section.push_str(&line);
+        }
+    }
+
+    Some(section.trim_end().to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::Path,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn default_skill_roots_prefer_project_then_user() -> Result<()> {
@@ -183,5 +243,61 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn agent_instructions_include_available_skill_metadata() -> Result<()> {
+        let root = temp_root("skill-index")?;
+        write_skill(
+            &root,
+            "meduza_daily_summary",
+            "---\nname: meduza_daily_summary\ndescription: Use for Meduza news digests and news today requests.\n---\n\n# Secret full instructions\n",
+        )?;
+        let tool_config = ToolRegistryConfig {
+            bashkit_workspace: None,
+            skill_roots: vec![SkillRoot::read_only(&root, "test")],
+        };
+
+        let instructions = agent_instructions_for_tool_config(&tool_config);
+
+        assert!(instructions.contains("## Available Skills"));
+        assert!(instructions.contains(
+            "- meduza_daily_summary (test): Use for Meduza news digests and news today requests."
+        ));
+        assert!(!instructions.contains("# Secret full instructions"));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_instructions_omit_skill_index_when_no_skills_exist() -> Result<()> {
+        let tool_config = ToolRegistryConfig {
+            bashkit_workspace: None,
+            skill_roots: vec![SkillRoot::read_only(temp_root("empty")?, "test")],
+        };
+
+        let instructions = agent_instructions_for_tool_config(&tool_config);
+
+        assert!(!instructions.contains("## Available Skills"));
+        Ok(())
+    }
+
+    fn write_skill(root: &Path, name: &str, content: &str) -> Result<()> {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("SKILL.md"), content)?;
+        Ok(())
+    }
+
+    fn temp_root(label: &str) -> Result<PathBuf> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos()
+            .to_string();
+        let path = std::env::temp_dir().join(format!(
+            "codrik-app-skills-{label}-{}-{unique}",
+            TEMP_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&path)?;
+        Ok(path)
     }
 }
