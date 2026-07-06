@@ -7,6 +7,7 @@ use crate::{
         openai::OpenAiClient,
     },
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
+    skills::SkillRoot,
     tools::{ToolRegistry, ToolRegistryConfig},
 };
 
@@ -25,7 +26,9 @@ where
     M: MemoryStore,
 {
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
-    let tools = ToolRegistry::new();
+    let tools = ToolRegistry::with_config(
+        default_tool_config().expect("failed to build default tool config"),
+    );
 
     Agent::new(llm, memory, tools).set_instructions(default_agent_instructions())
 }
@@ -115,16 +118,31 @@ where
     M: MemoryStore,
 {
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
-    let workspace = actor_workspace_path(&actor.id)?;
-    let tools = ToolRegistry::with_allowed_tools_and_config(
-        actor.tools,
-        ToolRegistryConfig {
-            bashkit_workspace: Some(workspace),
-            ..ToolRegistryConfig::default()
-        },
-    );
+    let tool_config = actor_tool_config(&actor)?;
+    let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
 
     Ok(Agent::new(llm, memory, tools).set_instructions(default_agent_instructions()))
+}
+
+fn default_tool_config() -> Result<ToolRegistryConfig> {
+    Ok(ToolRegistryConfig {
+        bashkit_workspace: None,
+        skill_roots: default_skill_roots()?,
+    })
+}
+
+fn actor_tool_config(actor: &AuthorizedActor) -> Result<ToolRegistryConfig> {
+    Ok(ToolRegistryConfig {
+        bashkit_workspace: Some(actor_workspace_path(&actor.id)?),
+        skill_roots: default_skill_roots()?,
+    })
+}
+
+fn default_skill_roots() -> Result<Vec<SkillRoot>> {
+    Ok(vec![
+        SkillRoot::read_only(PathBuf::from(".codrik").join("skills"), "project"),
+        SkillRoot::writable(codrik_dir()?.join("skills"), "user"),
+    ])
 }
 
 fn actor_workspace_path(actor_id: &str) -> Result<std::path::PathBuf> {
@@ -147,4 +165,23 @@ fn default_agent_instructions() -> String {
     include_str!("../agent_instructions.md")
         .trim_end()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_skill_roots_prefer_project_then_user() -> Result<()> {
+        let roots = default_skill_roots()?;
+
+        assert_eq!(
+            roots,
+            vec![
+                SkillRoot::read_only(PathBuf::from(".codrik").join("skills"), "project"),
+                SkillRoot::writable(codrik_dir()?.join("skills"), "user"),
+            ]
+        );
+        Ok(())
+    }
 }
