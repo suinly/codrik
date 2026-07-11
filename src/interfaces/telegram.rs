@@ -3,9 +3,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use teloxide::{
     Bot,
+    dispatching::{Dispatcher, UpdateFilterExt},
     payloads::SendMessageSetters,
     prelude::Requester,
-    types::{ChatAction, ChatId, Message, MessageId, ParseMode},
+    types::{ChatAction, ChatId, Message, MessageId, ParseMode, Update},
 };
 use tokio::{
     task::JoinHandle,
@@ -56,7 +57,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
     );
     let bot_username = me.user.username.clone();
 
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
+    let handler = Update::filter_message().endpoint(move |bot: Bot, msg: Message| {
         let config = config.clone();
         let draft_api = draft_api.clone();
         let auth_store = auth_store.clone();
@@ -129,10 +130,20 @@ pub async fn run(config: AppConfig) -> Result<()> {
 
             Ok(())
         }
-    })
-    .await;
+    });
+
+    Dispatcher::builder(bot, handler)
+        .distribution_function(telegram_update_distribution)
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
 
     Ok(())
+}
+
+fn telegram_update_distribution(_update: &Update) -> Option<()> {
+    None
 }
 
 struct TelegramAgentRun<'a> {
@@ -608,13 +619,24 @@ fn truncate_chars(text: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use anyhow::bail;
-    use teloxide::types::ChatId;
+    use teloxide::types::{ChatId, Update, UpdateId, UpdateKind};
 
     use crate::{auth::GatewayIdentity, llm::client::RunContext};
 
     use super::{
-        answer_or_gateway_error, denied_message, telegram_identity_from_sender, truncate_chars,
+        answer_or_gateway_error, denied_message, telegram_identity_from_sender,
+        telegram_update_distribution, truncate_chars,
     };
+
+    #[test]
+    fn telegram_updates_are_not_grouped_by_chat() {
+        let update = Update {
+            id: UpdateId(1),
+            kind: UpdateKind::Error(serde_json::json!({})),
+        };
+
+        assert_eq!(telegram_update_distribution(&update), None);
+    }
 
     #[test]
     fn telegram_identity_uses_sender_user_id() {
