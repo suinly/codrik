@@ -95,8 +95,11 @@ pub async fn run(config: AppConfig) -> Result<()> {
                             text,
                             bot_username.as_deref(),
                             draft_api,
-                            &run_coordinator,
-                            TelegramAgentRun { config, actor },
+                            TelegramAgentRun {
+                                config,
+                                actor,
+                                coordinator: &run_coordinator,
+                            },
                         )
                         .await
                     }
@@ -132,9 +135,10 @@ pub async fn run(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
-struct TelegramAgentRun {
+struct TelegramAgentRun<'a> {
     config: AppConfig,
     actor: AuthorizedActor,
+    coordinator: &'a TelegramRunCoordinator,
 }
 
 async fn answer_authorized_message(
@@ -144,8 +148,7 @@ async fn answer_authorized_message(
     text: &str,
     bot_username: Option<&str>,
     draft_api: TelegramDraftApi,
-    coordinator: &TelegramRunCoordinator,
-    run: TelegramAgentRun,
+    run: TelegramAgentRun<'_>,
 ) -> Option<String> {
     if let Some(answer) =
         answer_session_command(session_store, msg.chat.id, text, bot_username).await
@@ -154,9 +157,9 @@ async fn answer_authorized_message(
     }
 
     if msg.chat.is_private() {
-        answer_private_chat(bot, session_store, msg, text, draft_api, coordinator, run).await
+        answer_private_chat(bot, session_store, msg, text, draft_api, run).await
     } else {
-        answer_regular_chat(bot, session_store, msg.chat.id, text, coordinator, run).await
+        answer_regular_chat(bot, session_store, msg.chat.id, text, run).await
     }
 }
 
@@ -166,14 +169,16 @@ async fn answer_private_chat(
     msg: &Message,
     text: &str,
     draft_api: TelegramDraftApi,
-    coordinator: &TelegramRunCoordinator,
-    run: TelegramAgentRun,
+    run: TelegramAgentRun<'_>,
 ) -> Option<String> {
     let session_id = match active_session_id_or_error(session_store, msg.chat.id).await {
         Ok(session_id) => session_id,
         Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
-    let permit = coordinator.register(msg.chat.id, session_id.clone()).await;
+    let permit = run
+        .coordinator
+        .register(msg.chat.id, session_id.clone())
+        .await;
     let _cancellation_watch = cancel_on_ctrl_c(msg.chat.id, permit.context().clone());
     let execution = permit.enter().await;
     if permit.context().is_cancelled() {
@@ -234,14 +239,13 @@ async fn answer_regular_chat(
     session_store: &TelegramSessionStore,
     chat_id: ChatId,
     text: &str,
-    coordinator: &TelegramRunCoordinator,
-    run: TelegramAgentRun,
+    run: TelegramAgentRun<'_>,
 ) -> Option<String> {
     let session_id = match active_session_id_or_error(session_store, chat_id).await {
         Ok(session_id) => session_id,
         Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
-    let permit = coordinator.register(chat_id, session_id.clone()).await;
+    let permit = run.coordinator.register(chat_id, session_id.clone()).await;
     let _cancellation_watch = cancel_on_ctrl_c(chat_id, permit.context().clone());
     let execution = permit.enter().await;
     if permit.context().is_cancelled() {
