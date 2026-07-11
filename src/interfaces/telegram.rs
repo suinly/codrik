@@ -14,6 +14,7 @@ use tokio::{
 
 mod commands;
 mod format;
+mod run_coordinator;
 
 use commands::{answer_session_command, is_command_addressed_to_other_bot, is_start_command};
 use format::markdown_to_telegram_markdown_v2;
