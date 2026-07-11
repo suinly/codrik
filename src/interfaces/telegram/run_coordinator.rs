@@ -98,6 +98,15 @@ impl TelegramRunPermit {
             state.sessions.remove(&self.key);
         }
     }
+
+    pub(super) async fn complete<F, T>(self, operation: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let output = operation.await;
+        self.finish().await;
+        output
+    }
 }
 
 #[cfg(test)]
@@ -105,7 +114,7 @@ mod tests {
     use std::sync::Arc;
 
     use teloxide::types::ChatId;
-    use tokio::sync::{Barrier, oneshot};
+    use tokio::sync::{Barrier, Mutex, Notify, oneshot};
 
     use super::TelegramRunCoordinator;
 
@@ -163,5 +172,68 @@ mod tests {
 
         assert!(second.context().is_cancelled());
         assert!(!third.context().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn complete_keeps_run_registered_until_operation_finishes() {
+        let coordinator = TelegramRunCoordinator::new();
+        let first = coordinator.register(ChatId(1), "session-a").await;
+        let first_context = first.context().clone();
+        let replacement_coordinator = coordinator.clone();
+
+        first
+            .complete(async move {
+                let _second = replacement_coordinator
+                    .register(ChatId(1), "session-a")
+                    .await;
+                assert!(first_context.is_cancelled());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn superseding_run_persists_both_messages_and_only_newest_generates() {
+        let coordinator = TelegramRunCoordinator::new();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let first_persisted = Arc::new(Notify::new());
+
+        let first = coordinator.register(ChatId(1), "session-a").await;
+        let first_context = first.context().clone();
+        let first_messages = messages.clone();
+        let persisted = first_persisted.clone();
+        let first_task = tokio::spawn(async move {
+            let _execution = first.enter().await;
+            first_messages.lock().await.push("first");
+            persisted.notify_one();
+            first_context.cancelled().await;
+            first.finish().await;
+        });
+
+        first_persisted.notified().await;
+        let second = coordinator.register(ChatId(1), "session-a").await;
+        let second_context = second.context().clone();
+        let second_messages = messages.clone();
+        let second_requests = requests.clone();
+        let second_answers = answers.clone();
+        let second_task = tokio::spawn(async move {
+            let _execution = second.enter().await;
+            second_messages.lock().await.push("second");
+            assert!(!second_context.is_cancelled());
+            second_requests
+                .lock()
+                .await
+                .push(second_messages.lock().await.clone());
+            second_answers.lock().await.push("answer to second");
+            second.finish().await;
+        });
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+
+        assert_eq!(messages.lock().await.as_slice(), ["first", "second"]);
+        assert_eq!(requests.lock().await.as_slice(), [vec!["first", "second"]]);
+        assert_eq!(answers.lock().await.as_slice(), ["answer to second"]);
     }
 }

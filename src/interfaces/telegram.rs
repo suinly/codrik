@@ -18,6 +18,7 @@ mod run_coordinator;
 
 use commands::{answer_session_command, is_command_addressed_to_other_bot, is_start_command};
 use format::markdown_to_telegram_markdown_v2;
+use run_coordinator::TelegramRunCoordinator;
 
 use crate::{
     app,
@@ -42,6 +43,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let draft_api = TelegramDraftApi::new(token.clone());
     let auth_store = AuthorizationStore::new(crate::config::codrik_dir()?.join("users.json"));
     let session_store = TelegramSessionStore::new(crate::config::codrik_dir()?.join("sessions"));
+    let run_coordinator = TelegramRunCoordinator::new();
 
     let bot = Bot::new(token);
     let me = bot
@@ -60,6 +62,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         let auth_store = auth_store.clone();
         let session_store = session_store.clone();
         let bot_username = bot_username.clone();
+        let run_coordinator = run_coordinator.clone();
 
         async move {
             let Some(text) = msg.text() else {
@@ -80,8 +83,6 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 return Ok(());
             }
 
-            let run_context = RunContext::new();
-            let _cancellation_watch = cancel_on_ctrl_c(msg.chat.id, run_context.clone());
             let answer = if is_start_command(text, bot_username.as_deref()) {
                 Some(answer_start_command(&auth_store, identity).await)
             } else {
@@ -94,11 +95,8 @@ pub async fn run(config: AppConfig) -> Result<()> {
                             text,
                             bot_username.as_deref(),
                             draft_api,
-                            TelegramAgentRun {
-                                config,
-                                actor,
-                                run_context: &run_context,
-                            },
+                            &run_coordinator,
+                            TelegramAgentRun { config, actor },
                         )
                         .await
                     }
@@ -117,12 +115,8 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 return Ok(());
             };
 
-            if run_context.is_cancelled() {
-                return Ok(());
-            }
-
-            if let Err(error) = send_telegram_answer(&bot, msg.chat.id, answer, &run_context).await
-            {
+            let context = RunContext::new();
+            if let Err(error) = send_telegram_answer(&bot, msg.chat.id, answer, &context).await {
                 eprintln!(
                     "Telegram send_message failed for chat {}: {error:#}",
                     msg.chat.id
@@ -138,10 +132,9 @@ pub async fn run(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
-struct TelegramAgentRun<'a> {
+struct TelegramAgentRun {
     config: AppConfig,
     actor: AuthorizedActor,
-    run_context: &'a RunContext,
 }
 
 async fn answer_authorized_message(
@@ -151,7 +144,8 @@ async fn answer_authorized_message(
     text: &str,
     bot_username: Option<&str>,
     draft_api: TelegramDraftApi,
-    run: TelegramAgentRun<'_>,
+    coordinator: &TelegramRunCoordinator,
+    run: TelegramAgentRun,
 ) -> Option<String> {
     if let Some(answer) =
         answer_session_command(session_store, msg.chat.id, text, bot_username).await
@@ -160,9 +154,9 @@ async fn answer_authorized_message(
     }
 
     if msg.chat.is_private() {
-        answer_private_chat(bot, session_store, msg, text, draft_api, run).await
+        answer_private_chat(bot, session_store, msg, text, draft_api, coordinator, run).await
     } else {
-        answer_regular_chat(bot, session_store, msg.chat.id, text, run).await
+        answer_regular_chat(bot, session_store, msg.chat.id, text, coordinator, run).await
     }
 }
 
@@ -172,19 +166,38 @@ async fn answer_private_chat(
     msg: &Message,
     text: &str,
     draft_api: TelegramDraftApi,
-    run: TelegramAgentRun<'_>,
+    coordinator: &TelegramRunCoordinator,
+    run: TelegramAgentRun,
 ) -> Option<String> {
     let session_id = match active_session_id_or_error(session_store, msg.chat.id).await {
         Ok(session_id) => session_id,
         Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
-    let typing = keep_typing(bot, msg.chat.id);
+    let permit = coordinator.register(msg.chat.id, session_id.clone()).await;
+    let _cancellation_watch = cancel_on_ctrl_c(msg.chat.id, permit.context().clone());
+    let execution = permit.enter().await;
+    if permit.context().is_cancelled() {
+        let _ = app::run_once_with_actor_session_in_root_and_context(
+            text.to_string(),
+            run.config,
+            run.actor,
+            session_store.session_root(msg.chat.id.0),
+            session_id,
+            permit.context(),
+        )
+        .await;
+        drop(execution);
+        permit.finish().await;
+        return None;
+    }
+
+    let typing = keep_typing(bot.clone(), msg.chat.id);
     let mut stream = TelegramDraftStream::new(
         draft_api,
         msg.chat.id,
         msg.id,
         typing,
-        run.run_context.clone(),
+        permit.context().clone(),
     );
     let result = app::run_once_with_actor_session_streaming_in_root_and_context(
         text.to_string(),
@@ -193,12 +206,27 @@ async fn answer_private_chat(
         session_store.session_root(msg.chat.id.0),
         session_id,
         &mut stream,
-        run.run_context,
+        permit.context(),
     )
     .await;
     stream.finish().await;
 
-    answer_or_gateway_error(msg.chat.id, result, run.run_context)
+    let answer = answer_or_gateway_error(msg.chat.id, result, permit.context());
+    drop(execution);
+    let context = permit.context().clone();
+    permit
+        .complete(async {
+            if let Some(answer) = answer
+                && let Err(error) = send_telegram_answer(&bot, msg.chat.id, answer, &context).await
+            {
+                eprintln!(
+                    "Telegram send_message failed for chat {}: {error:#}",
+                    msg.chat.id
+                );
+            }
+        })
+        .await;
+    None
 }
 
 async fn answer_regular_chat(
@@ -206,25 +234,56 @@ async fn answer_regular_chat(
     session_store: &TelegramSessionStore,
     chat_id: ChatId,
     text: &str,
-    run: TelegramAgentRun<'_>,
+    coordinator: &TelegramRunCoordinator,
+    run: TelegramAgentRun,
 ) -> Option<String> {
     let session_id = match active_session_id_or_error(session_store, chat_id).await {
         Ok(session_id) => session_id,
         Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
-    let typing = keep_typing(bot, chat_id);
+    let permit = coordinator.register(chat_id, session_id.clone()).await;
+    let _cancellation_watch = cancel_on_ctrl_c(chat_id, permit.context().clone());
+    let execution = permit.enter().await;
+    if permit.context().is_cancelled() {
+        let _ = app::run_once_with_actor_session_in_root_and_context(
+            text.to_string(),
+            run.config,
+            run.actor,
+            session_store.session_root(chat_id.0),
+            session_id,
+            permit.context(),
+        )
+        .await;
+        drop(execution);
+        permit.finish().await;
+        return None;
+    }
+
+    let typing = keep_typing(bot.clone(), chat_id);
     let result = app::run_once_with_actor_session_in_root_and_context(
         text.to_string(),
         run.config,
         run.actor,
         session_store.session_root(chat_id.0),
         session_id,
-        run.run_context,
+        permit.context(),
     )
     .await;
     stop_typing(typing).await;
 
-    answer_or_gateway_error(chat_id, result, run.run_context)
+    let answer = answer_or_gateway_error(chat_id, result, permit.context());
+    drop(execution);
+    let context = permit.context().clone();
+    permit
+        .complete(async {
+            if let Some(answer) = answer
+                && let Err(error) = send_telegram_answer(&bot, chat_id, answer, &context).await
+            {
+                eprintln!("Telegram send_message failed for chat {chat_id}: {error:#}");
+            }
+        })
+        .await;
+    None
 }
 
 async fn active_session_id_or_error(

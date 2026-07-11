@@ -455,6 +455,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn already_cancelled_run_records_user_message_without_calling_llm() -> Result<()> {
+        let client = FakeClient::new();
+        let memory = InMemoryStore::new();
+        let agent = Agent::new(client.clone(), memory, NoTools);
+        let context = RunContext::new();
+        context.cancel();
+
+        let error = agent
+            .execute_with_context("queued", &context)
+            .await
+            .expect_err("run should be cancelled");
+
+        assert_eq!(error.to_string(), "run cancelled");
+        assert_eq!(
+            agent.memory.load_context().await?,
+            vec![Message::user("queued")]
+        );
+        assert!(client.requests().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn successful_tool_result_is_recorded_as_observation() -> Result<()> {
         let client = ScriptedClient::new(vec![
             LlmResponse {
