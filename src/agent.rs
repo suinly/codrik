@@ -11,8 +11,6 @@ use crate::llm::client::{
 use crate::memory::store::MemoryStore;
 use anyhow::{Result, bail};
 
-const MAX_TOOL_CALL_ITERATIONS: usize = 5;
-
 pub struct Agent<L, M, T> {
     instructions: String,
     tools: T,
@@ -51,7 +49,7 @@ where
     ) -> Result<String> {
         self.memory.append(Message::user(content.into())).await?;
 
-        for _ in 0..MAX_TOOL_CALL_ITERATIONS {
+        loop {
             context.ensure_not_cancelled()?;
             let request = self.build_llm_request().await?;
             let response = tokio::select! {
@@ -63,8 +61,6 @@ where
                 return Ok(answer);
             }
         }
-
-        bail!("tool call loop exceeded max iterations ({MAX_TOOL_CALL_ITERATIONS})")
     }
 }
 
@@ -91,7 +87,7 @@ where
     ) -> Result<String> {
         self.memory.append(Message::user(content.into())).await?;
 
-        for _ in 0..MAX_TOOL_CALL_ITERATIONS {
+        loop {
             context.ensure_not_cancelled()?;
             let request = self.build_llm_request().await?;
             let streamed_turn = self.stream_turn(request, context).await?;
@@ -107,8 +103,6 @@ where
 
             self.record_response(response).await?;
         }
-
-        bail!("tool call loop exceeded max iterations ({MAX_TOOL_CALL_ITERATIONS})")
     }
 
     async fn stream_turn(&self, request: LlmRequest, context: &RunContext) -> Result<StreamedTurn> {
@@ -269,6 +263,24 @@ mod tests {
         async fn requests(&self) -> Vec<Vec<Message>> {
             self.requests.lock().await.clone()
         }
+    }
+
+    fn tool_rounds_then_answer(rounds: usize, answer: &str) -> Vec<LlmResponse> {
+        let mut responses = (0..rounds)
+            .map(|index| LlmResponse {
+                content: String::new(),
+                tool_calls: vec![LlmToolCall {
+                    id: format!("call_{index}"),
+                    name: "demo".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        responses.push(LlmResponse {
+            content: answer.to_string(),
+            tool_calls: Vec::new(),
+        });
+        responses
     }
 
     #[async_trait]
@@ -473,6 +485,39 @@ mod tests {
             vec![Message::user("queued")]
         );
         assert!(client.requests().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_allows_more_than_five_tool_call_rounds() -> Result<()> {
+        let client = ScriptedClient::new(tool_rounds_then_answer(6, "done"));
+        let agent = Agent::new(
+            client.clone(),
+            InMemoryStore::new(),
+            OneTool {
+                behavior: ToolBehavior::Succeed("ok"),
+            },
+        );
+
+        assert_eq!(agent.execute("hello").await?, "done");
+        assert_eq!(client.requests().await.len(), 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_allows_more_than_five_tool_call_rounds() -> Result<()> {
+        let client = ScriptedClient::new(tool_rounds_then_answer(6, "done"));
+        let agent = Agent::new(
+            client.clone(),
+            InMemoryStore::new(),
+            OneTool {
+                behavior: ToolBehavior::Succeed("ok"),
+            },
+        );
+        let mut sink = RecordingSink::default();
+
+        assert_eq!(agent.execute_streaming("hello", &mut sink).await?, "done");
+        assert_eq!(client.requests().await.len(), 7);
         Ok(())
     }
 
