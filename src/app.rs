@@ -3,7 +3,7 @@ use crate::{
     auth::AuthorizedActor,
     config::{AppConfig, codrik_dir},
     llm::{
-        client::{LlmStreamSink, RunContext},
+        client::{AgentActivitySink, LlmStreamSink, NoopAgentActivitySink, RunContext},
         openai::OpenAiClient,
     },
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
@@ -103,11 +103,35 @@ pub async fn run_once_with_actor_session_streaming_in_root_and_context(
     sink: &mut dyn LlmStreamSink,
     context: &RunContext,
 ) -> Result<String> {
+    let mut activity = NoopAgentActivitySink;
+    run_once_with_actor_session_streaming_and_activity_in_root_and_context(
+        query,
+        config,
+        actor,
+        session_root,
+        session_id,
+        sink,
+        &mut activity,
+        context,
+    )
+    .await
+}
+
+pub async fn run_once_with_actor_session_streaming_and_activity_in_root_and_context(
+    query: String,
+    config: AppConfig,
+    actor: AuthorizedActor,
+    session_root: PathBuf,
+    session_id: impl AsRef<str>,
+    sink: &mut dyn LlmStreamSink,
+    activity: &mut dyn AgentActivitySink,
+    context: &RunContext,
+) -> Result<String> {
     let memory = FileMemoryStore::new(session_root, session_id)?;
     let agent = build_agent_for_actor(config, memory, actor)?;
 
     agent
-        .execute_streaming_with_context(query, sink, context)
+        .execute_streaming_with_context_and_activity(query, sink, activity, context)
         .await
 }
 

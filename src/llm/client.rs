@@ -27,6 +27,29 @@ pub trait LlmStreamSink: Send {
     async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActivityEvent {
+    ModelStepStarted,
+    Description(String),
+    ToolStarted { name: String },
+    ToolFinished { name: String, succeeded: bool },
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[async_trait]
+pub trait AgentActivitySink: Send {
+    async fn on_activity(&mut self, event: AgentActivityEvent);
+}
+
+pub struct NoopAgentActivitySink;
+
+#[async_trait]
+impl AgentActivitySink for NoopAgentActivitySink {
+    async fn on_activity(&mut self, _event: AgentActivityEvent) {}
+}
+
 pub struct LlmRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,

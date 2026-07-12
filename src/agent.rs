@@ -5,8 +5,9 @@ mod tool_observation;
 use crate::agent::message::Message;
 use crate::agent::tool::ToolExecutor;
 use crate::llm::client::{
-    LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
-    RUN_CANCELLED, RunContext,
+    AgentActivityEvent, AgentActivitySink, LlmClient, LlmRequest, LlmResponse, LlmStreamClient,
+    LlmStreamEvent, LlmStreamSink, NoopAgentActivitySink, RUN_CANCELLED, RunContext,
+    is_run_cancelled_error,
 };
 use crate::memory::store::MemoryStore;
 use anyhow::{Result, bail};
@@ -48,6 +49,7 @@ where
         context: &RunContext,
     ) -> Result<String> {
         self.memory.append(Message::user(content.into())).await?;
+        let mut activity = NoopAgentActivitySink;
 
         loop {
             context.ensure_not_cancelled()?;
@@ -57,7 +59,7 @@ where
                 _ = context.cancelled() => bail!(RUN_CANCELLED),
             };
 
-            if let Some(answer) = self.record_response(response).await? {
+            if let Some(answer) = self.record_response(response, &mut activity).await? {
                 return Ok(answer);
             }
         }
@@ -85,23 +87,64 @@ where
         sink: &mut dyn LlmStreamSink,
         context: &RunContext,
     ) -> Result<String> {
+        let mut activity = NoopAgentActivitySink;
+        self.execute_streaming_with_context_and_activity(content, sink, &mut activity, context)
+            .await
+    }
+
+    pub async fn execute_streaming_with_context_and_activity(
+        &self,
+        content: impl Into<String>,
+        sink: &mut dyn LlmStreamSink,
+        activity: &mut dyn AgentActivitySink,
+        context: &RunContext,
+    ) -> Result<String> {
+        let result = self
+            .execute_streaming_with_context_and_activity_inner(content, sink, activity, context)
+            .await;
+        let terminal = match &result {
+            Ok(_) => AgentActivityEvent::Completed,
+            Err(error) if context.is_cancelled() || is_run_cancelled_error(error) => {
+                AgentActivityEvent::Cancelled
+            }
+            Err(_) => AgentActivityEvent::Failed,
+        };
+        activity.on_activity(terminal).await;
+        result
+    }
+
+    async fn execute_streaming_with_context_and_activity_inner(
+        &self,
+        content: impl Into<String>,
+        sink: &mut dyn LlmStreamSink,
+        activity: &mut dyn AgentActivitySink,
+        context: &RunContext,
+    ) -> Result<String> {
         self.memory.append(Message::user(content.into())).await?;
 
         loop {
             context.ensure_not_cancelled()?;
+            activity
+                .on_activity(AgentActivityEvent::ModelStepStarted)
+                .await;
             let request = self.build_llm_request().await?;
             let streamed_turn = self.stream_turn(request, context).await?;
             let (response, stream_events) = streamed_turn.into_parts();
 
             if response.tool_calls.is_empty() {
                 let answer = response.content.clone();
-                self.record_response(response).await?;
+                self.record_response(response, activity).await?;
                 context.ensure_not_cancelled()?;
                 stream_events.commit_to(sink).await?;
                 return Ok(answer);
             }
 
-            self.record_response(response).await?;
+            if !response.content.trim().is_empty() {
+                activity
+                    .on_activity(AgentActivityEvent::Description(response.content.clone()))
+                    .await;
+            }
+            self.record_response(response, activity).await?;
         }
     }
 
@@ -137,7 +180,11 @@ where
         })
     }
 
-    async fn record_response(&self, response: LlmResponse) -> Result<Option<String>> {
+    async fn record_response(
+        &self,
+        response: LlmResponse,
+        activity: &mut dyn AgentActivitySink,
+    ) -> Result<Option<String>> {
         if response.tool_calls.is_empty() {
             self.memory
                 .append(Message::assistant(response.content.clone()))
@@ -154,13 +201,34 @@ where
             .await?;
 
         for tool_call in response.tool_calls {
+            activity
+                .on_activity(AgentActivityEvent::ToolStarted {
+                    name: tool_call.name.clone(),
+                })
+                .await;
             let observation = match self
                 .tools
                 .execute(&tool_call.name, &tool_call.arguments)
                 .await
             {
-                Ok(result) => tool_observation::success(result),
-                Err(error) => tool_observation::failure(&error),
+                Ok(result) => {
+                    activity
+                        .on_activity(AgentActivityEvent::ToolFinished {
+                            name: tool_call.name.clone(),
+                            succeeded: true,
+                        })
+                        .await;
+                    tool_observation::success(result)
+                }
+                Err(error) => {
+                    activity
+                        .on_activity(AgentActivityEvent::ToolFinished {
+                            name: tool_call.name.clone(),
+                            succeeded: false,
+                        })
+                        .await;
+                    tool_observation::failure(&error)
+                }
             };
 
             self.memory
@@ -230,8 +298,8 @@ mod tests {
             tool::{Tool, ToolExecutor},
         },
         llm::client::{
-            LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
-            LlmToolCall, RunContext,
+            AgentActivityEvent, AgentActivitySink, LlmClient, LlmRequest, LlmResponse,
+            LlmStreamClient, LlmStreamEvent, LlmStreamSink, LlmToolCall, RUN_CANCELLED, RunContext,
         },
         memory::{in_memory::InMemoryStore, store::MemoryStore},
     };
@@ -329,6 +397,18 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         events: Vec<LlmStreamEvent>,
+    }
+
+    #[derive(Default)]
+    struct RecordingActivitySink {
+        events: Vec<AgentActivityEvent>,
+    }
+
+    #[async_trait]
+    impl AgentActivitySink for RecordingActivitySink {
+        async fn on_activity(&mut self, event: AgentActivityEvent) {
+            self.events.push(event);
+        }
     }
 
     #[async_trait]
@@ -518,6 +598,133 @@ mod tests {
 
         assert_eq!(agent.execute_streaming("hello", &mut sink).await?, "done");
         assert_eq!(client.requests().await.len(), 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_events_describe_model_and_tool_lifecycle() -> Result<()> {
+        let client = ScriptedClient::new(vec![
+            LlmResponse {
+                content: "Смотрю структуру проекта\nи нужные файлы".to_string(),
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "demo".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            LlmResponse {
+                content: "done".to_string(),
+                tool_calls: Vec::new(),
+            },
+        ]);
+        let agent = Agent::new(
+            client,
+            InMemoryStore::new(),
+            OneTool {
+                behavior: ToolBehavior::Succeed("ok"),
+            },
+        );
+        let context = RunContext::new();
+        let mut stream = RecordingSink::default();
+        let mut activity = RecordingActivitySink::default();
+
+        assert_eq!(
+            agent
+                .execute_streaming_with_context_and_activity(
+                    "hello",
+                    &mut stream,
+                    &mut activity,
+                    &context,
+                )
+                .await?,
+            "done"
+        );
+        assert_eq!(
+            activity.events,
+            vec![
+                AgentActivityEvent::ModelStepStarted,
+                AgentActivityEvent::Description(
+                    "Смотрю структуру проекта\nи нужные файлы".to_string()
+                ),
+                AgentActivityEvent::ToolStarted {
+                    name: "demo".to_string()
+                },
+                AgentActivityEvent::ToolFinished {
+                    name: "demo".to_string(),
+                    succeeded: true,
+                },
+                AgentActivityEvent::ModelStepStarted,
+                AgentActivityEvent::Completed,
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_reports_failed_tool_and_cancelled_run() -> Result<()> {
+        let client = ScriptedClient::new(vec![
+            LlmResponse {
+                content: String::new(),
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "demo".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            LlmResponse {
+                content: "recovered".to_string(),
+                tool_calls: Vec::new(),
+            },
+        ]);
+        let agent = Agent::new(
+            client,
+            InMemoryStore::new(),
+            OneTool {
+                behavior: ToolBehavior::Fail("boom"),
+            },
+        );
+        let context = RunContext::new();
+        let mut stream = RecordingSink::default();
+        let mut activity = RecordingActivitySink::default();
+
+        agent
+            .execute_streaming_with_context_and_activity(
+                "hello",
+                &mut stream,
+                &mut activity,
+                &context,
+            )
+            .await?;
+        assert!(activity.events.contains(&AgentActivityEvent::ToolFinished {
+            name: "demo".to_string(),
+            succeeded: false,
+        }));
+        assert_eq!(activity.events.last(), Some(&AgentActivityEvent::Completed));
+
+        let cancelled_agent = Agent::new(
+            ScriptedClient::new(Vec::new()),
+            InMemoryStore::new(),
+            NoTools,
+        );
+        let cancelled_context = RunContext::new();
+        cancelled_context.cancel();
+        let mut cancelled_stream = RecordingSink::default();
+        let mut cancelled_activity = RecordingActivitySink::default();
+        let error = cancelled_agent
+            .execute_streaming_with_context_and_activity(
+                "queued",
+                &mut cancelled_stream,
+                &mut cancelled_activity,
+                &cancelled_context,
+            )
+            .await
+            .expect_err("run should be cancelled");
+
+        assert_eq!(error.to_string(), RUN_CANCELLED);
+        assert_eq!(
+            cancelled_activity.events,
+            vec![AgentActivityEvent::Cancelled]
+        );
         Ok(())
     }
 
