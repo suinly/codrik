@@ -109,14 +109,21 @@ server `bash` tool is privileged and must be granted explicitly, for example
 
 ## Skills
 
-codrik can discover local skills from:
+codrik discovers skills from these sources, in precedence order:
 
-- `.codrik/skills/<name>/SKILL.md` in the current working directory
-- `~/.codrik/skills/<name>/SKILL.md`
+1. `.codrik/skills/<name>/SKILL.md` in the current working directory
+2. `~/.codrik/skills/<name>/SKILL.md`
+3. skills compiled into the codrik binary
 
-Project skills take precedence over user skills with the same name. Skills are
-available through standard tools, so actors with `"tools": ["*"]` can list,
+The first skill with a given name wins, so project skills can override user and
+built-in skills, and user skills can override built-ins. Built-in and project
+skills are read-only through the skill tools; user skills are writable. Skills
+are available through standard tools, so actors with `"tools": ["*"]` can list,
 read, create, and update user skills.
+
+codrik ships with `skill-creator`, a built-in workflow for creating and
+reviewing reusable user skills. It is available without installing additional
+files and can be overridden by a project or user skill with the same name.
 
 codrik includes a compact skill index in the agent instructions so the model can
 match tasks against skill names and descriptions before it answers. The full
@@ -129,9 +136,9 @@ The runtime exposes:
 - `skills_create`: writes `~/.codrik/skills/<name>/SKILL.md`
 - `skills_update`: rewrites an existing user skill in `~/.codrik/skills`
 
-Project skills are read-only through the skill tools. If a project skill and a
-user skill have the same name, the project skill remains active and
-`skills_update` refuses to edit the hidden user skill.
+Project and built-in skills are read-only through the skill tools. If a higher
+precedence skill hides a user skill with the same name, `skills_update` refuses
+to edit the hidden user skill.
 
 Minimal skill:
 
