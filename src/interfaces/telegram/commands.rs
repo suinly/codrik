@@ -25,7 +25,7 @@ pub(super) async fn answer_session_command(
                 Err(error) => Err(error),
             }
         }
-        TelegramCommand::Start => return None,
+        TelegramCommand::Start | TelegramCommand::Stop => return None,
     };
 
     Some(match result {
@@ -41,6 +41,13 @@ pub(super) fn is_start_command(text: &str, bot_username: Option<&str>) -> bool {
     matches!(
         TelegramCommand::parse(text, bot_username),
         Some(TelegramCommand::Start)
+    )
+}
+
+pub(super) fn is_stop_command(text: &str, bot_username: Option<&str>) -> bool {
+    matches!(
+        TelegramCommand::parse(text, bot_username),
+        Some(TelegramCommand::Stop)
     )
 }
 
@@ -71,6 +78,7 @@ fn format_sessions(sessions: Vec<TelegramSession>) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TelegramCommand {
     Start,
+    Stop,
     New,
     Sessions,
     SwitchSession(String),
@@ -83,6 +91,7 @@ impl TelegramCommand {
 
         match command.as_str() {
             "/start" => Some(Self::Start),
+            "/stop" => Some(Self::Stop),
             "/new" => Some(Self::New),
             "/sessions" => match parts.next() {
                 Some(session_id) => Some(Self::SwitchSession(session_id.to_string())),
@@ -112,6 +121,7 @@ mod tests {
 
     use super::{
         TelegramCommand, format_sessions, is_command_addressed_to_other_bot, is_start_command,
+        is_stop_command,
     };
 
     #[test]
@@ -122,6 +132,14 @@ mod tests {
         assert!(is_start_command("/start@codrikbot", Some("CodrikBot")));
         assert!(!is_start_command("/start@OtherBot", Some("CodrikBot")));
         assert!(!is_start_command("/restart", Some("CodrikBot")));
+    }
+
+    #[test]
+    fn recognizes_plain_and_addressed_stop_commands() {
+        assert!(is_stop_command("/stop", Some("CodrikBot")));
+        assert!(is_stop_command("/stop@CodrikBot", Some("CodrikBot")));
+        assert!(!is_stop_command("/stop@OtherBot", Some("CodrikBot")));
+        assert!(!is_stop_command("/stopping", Some("CodrikBot")));
     }
 
     #[test]

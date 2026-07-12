@@ -77,6 +77,25 @@ impl TelegramRunCoordinator {
             execution,
         }
     }
+
+    pub(super) async fn cancel(&self, chat_id: ChatId, session_id: impl Into<String>) -> bool {
+        let key = TelegramSessionKey {
+            chat_id,
+            session_id: session_id.into(),
+        };
+        let context = self
+            .state
+            .lock()
+            .await
+            .sessions
+            .get(&key)
+            .map(|run| run.context.clone());
+        let Some(context) = context else {
+            return false;
+        };
+        context.cancel();
+        true
+    }
 }
 
 impl TelegramRunPermit {
@@ -126,6 +145,16 @@ mod tests {
 
         assert!(first.context().is_cancelled());
         assert!(!second.context().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_current_run_without_registering_replacement() {
+        let coordinator = TelegramRunCoordinator::new();
+        let permit = coordinator.register(ChatId(1), "session-a").await;
+
+        assert!(coordinator.cancel(ChatId(1), "session-a").await);
+        assert!(permit.context().is_cancelled());
+        assert!(!coordinator.cancel(ChatId(1), "missing").await);
     }
 
     #[tokio::test]

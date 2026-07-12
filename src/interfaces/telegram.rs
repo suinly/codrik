@@ -18,7 +18,9 @@ mod commands;
 mod format;
 mod run_coordinator;
 
-use commands::{answer_session_command, is_command_addressed_to_other_bot, is_start_command};
+use commands::{
+    answer_session_command, is_command_addressed_to_other_bot, is_start_command, is_stop_command,
+};
 use format::markdown_to_telegram_markdown_v2;
 use run_coordinator::TelegramRunCoordinator;
 
@@ -162,6 +164,21 @@ async fn answer_authorized_message(
     draft_api: TelegramDraftApi,
     run: TelegramAgentRun<'_>,
 ) -> Option<String> {
+    if is_stop_command(text, bot_username) {
+        let session_id = match active_session_id_or_error(session_store, msg.chat.id).await {
+            Ok(session_id) => session_id,
+            Err(error) => return Some(format!("Gateway error: {error:#}")),
+        };
+        return Some(
+            if run.coordinator.cancel(msg.chat.id, session_id).await {
+                "Останавливаю текущую задачу"
+            } else {
+                "Сейчас нет активной задачи"
+            }
+            .to_string(),
+        );
+    }
+
     if let Some(answer) =
         answer_session_command(session_store, msg.chat.id, text, bot_username).await
     {
