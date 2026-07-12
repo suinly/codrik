@@ -7,6 +7,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+mod builtin;
+
+use builtin::{BuiltinSkill, BuiltinSkillFile};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
@@ -33,17 +37,21 @@ impl SkillRegistry {
     }
 
     pub fn read(&self, name: &str, relative_path: Option<&str>) -> Result<String> {
-        let skill_dir = self
+        let discovered = self
             .discover()?
             .into_iter()
             .find(|entry| entry.skill.name == name)
-            .map(|entry| entry.dir)
             .with_context(|| format!("unknown skill: {name}"))?;
         let relative_path = relative_path.unwrap_or("SKILL.md");
-        let path = resolve_inside(&skill_dir, relative_path)?;
 
-        fs::read_to_string(&path)
-            .with_context(|| format!("failed to read skill file: {}", path.display()))
+        match discovered.location {
+            SkillLocation::Directory(dir) => {
+                let path = resolve_inside(&dir, relative_path)?;
+                fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read skill file: {}", path.display()))
+            }
+            SkillLocation::Builtin(files) => read_builtin_file(files, relative_path),
+        }
     }
 
     pub fn create(&self, name: &str, description: &str, body: &str) -> Result<Skill> {
@@ -56,12 +64,15 @@ impl SkillRegistry {
             bail!("skill already exists: {name}");
         }
 
-        let root = self
+        let (root_path, source) = self
             .roots
             .iter()
-            .find(|root| root.writable)
+            .find_map(|root| match (&root.kind, root.writable) {
+                (SkillRootKind::Directory(path), true) => Some((path, &root.source)),
+                _ => None,
+            })
             .context("no writable skill root configured")?;
-        let skill_dir = root.path.join(name);
+        let skill_dir = root_path.join(name);
         fs::create_dir_all(&skill_dir).with_context(|| {
             format!("failed to create skill directory: {}", skill_dir.display())
         })?;
@@ -71,91 +82,72 @@ impl SkillRegistry {
         Ok(Skill {
             name: name.to_string(),
             description: description.to_string(),
-            source: root.source.clone(),
+            source: source.clone(),
         })
     }
 
     pub fn update(&self, name: &str, description: &str, body: &str) -> Result<Skill> {
         validate_skill_name(name)?;
-        let skill = self
+        let discovered = self
             .discover()?
             .into_iter()
             .find(|entry| entry.skill.name == name)
             .with_context(|| format!("unknown writable skill: {name}"))?;
-        if !skill.writable {
+        if !discovered.writable {
             bail!("skill is read-only: {name}");
         }
 
-        let skill_md = skill.dir.join("SKILL.md");
+        let SkillLocation::Directory(dir) = discovered.location else {
+            bail!("skill is read-only: {name}");
+        };
+        let skill_md = dir.join("SKILL.md");
         write_skill_file(&skill_md, name, description, body)?;
 
         Ok(Skill {
             name: name.to_string(),
             description: description.to_string(),
-            source: skill.skill.source,
+            source: discovered.skill.source,
         })
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredSkill>> {
-        let mut skills = Vec::new();
+        let mut discovered = Vec::new();
         let mut seen_names = BTreeSet::new();
 
         for root in &self.roots {
-            if !root.path.is_dir() {
-                continue;
-            }
-
-            let mut entries = fs::read_dir(&root.path)
-                .with_context(|| format!("failed to read skills root: {}", root.path.display()))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            entries.sort_by_key(|entry| entry.file_name());
-
-            for entry in entries {
-                if !entry.file_type()?.is_dir() {
-                    continue;
+            for skill in discover_root(root)? {
+                if seen_names.insert(skill.skill.name.clone()) {
+                    discovered.push(skill);
                 }
-
-                let skill_dir = entry.path();
-                let skill_md = skill_dir.join("SKILL.md");
-                if !skill_md.is_file() {
-                    continue;
-                }
-
-                let fallback_name = entry.file_name().to_string_lossy().to_string();
-                let content = fs::read_to_string(&skill_md)
-                    .with_context(|| format!("failed to read skill: {}", skill_md.display()))?;
-                let metadata = parse_metadata(&content);
-                let name = metadata.name.unwrap_or(fallback_name);
-                if !seen_names.insert(name.clone()) {
-                    continue;
-                }
-
-                skills.push(DiscoveredSkill {
-                    dir: skill_dir,
-                    writable: root.writable,
-                    skill: Skill {
-                        name,
-                        description: metadata.description.unwrap_or_default(),
-                        source: root.source.clone(),
-                    },
-                });
             }
         }
 
-        Ok(skills)
+        Ok(discovered)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum SkillLocation {
+    Directory(PathBuf),
+    Builtin(&'static [BuiltinSkillFile]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DiscoveredSkill {
-    dir: PathBuf,
+    location: SkillLocation,
     writable: bool,
     skill: Skill,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum SkillRootKind {
+    Directory(PathBuf),
+    Builtin(&'static [BuiltinSkill]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillRoot {
-    path: PathBuf,
+    kind: SkillRootKind,
     source: String,
     writable: bool,
 }
@@ -163,7 +155,7 @@ pub struct SkillRoot {
 impl SkillRoot {
     pub fn read_only(path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
         Self {
-            path: path.into(),
+            kind: SkillRootKind::Directory(path.into()),
             source: source.into(),
             writable: false,
         }
@@ -171,11 +163,81 @@ impl SkillRoot {
 
     pub fn writable(path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
         Self {
-            path: path.into(),
+            kind: SkillRootKind::Directory(path.into()),
             source: source.into(),
             writable: true,
         }
     }
+
+    fn builtin(skills: &'static [BuiltinSkill], source: impl Into<String>) -> Self {
+        Self {
+            kind: SkillRootKind::Builtin(skills),
+            source: source.into(),
+            writable: false,
+        }
+    }
+}
+
+pub fn builtin_skill_root() -> SkillRoot {
+    SkillRoot::builtin(builtin::SKILLS, "built-in")
+}
+
+fn discover_root(root: &SkillRoot) -> Result<Vec<DiscoveredSkill>> {
+    match &root.kind {
+        SkillRootKind::Directory(path) => discover_directory(path, root),
+        SkillRootKind::Builtin(skills) => Ok(skills
+            .iter()
+            .map(|builtin| DiscoveredSkill {
+                location: SkillLocation::Builtin(builtin.files),
+                writable: false,
+                skill: Skill {
+                    name: builtin.name.to_string(),
+                    description: builtin.description.to_string(),
+                    source: root.source.clone(),
+                },
+            })
+            .collect()),
+    }
+}
+
+fn discover_directory(path: &Path, root: &SkillRoot) -> Result<Vec<DiscoveredSkill>> {
+    if !path.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("failed to read skills root: {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut skills = Vec::new();
+    for entry in entries {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let skill_dir = entry.path();
+        let skill_md = skill_dir.join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&skill_md)
+            .with_context(|| format!("failed to read skill: {}", skill_md.display()))?;
+        let metadata = parse_metadata(&content);
+        let fallback_name = entry.file_name().to_string_lossy().to_string();
+        skills.push(DiscoveredSkill {
+            location: SkillLocation::Directory(skill_dir),
+            writable: root.writable,
+            skill: Skill {
+                name: metadata.name.unwrap_or(fallback_name),
+                description: metadata.description.unwrap_or_default(),
+                source: root.source.clone(),
+            },
+        });
+    }
+
+    Ok(skills)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -243,6 +305,25 @@ fn validate_skill_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn read_builtin_file(files: &[BuiltinSkillFile], relative_path: &str) -> Result<String> {
+    let path = Path::new(relative_path);
+    if path.is_absolute() {
+        bail!("skill path must be relative");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("skill path escapes skill directory");
+    }
+
+    files
+        .iter()
+        .find(|file| file.path == relative_path)
+        .map(|file| file.content.to_string())
+        .with_context(|| format!("unknown built-in skill asset: {relative_path}"))
+}
+
 fn resolve_inside(root: &Path, relative_path: &str) -> Result<PathBuf> {
     let relative = Path::new(relative_path);
     if relative.is_absolute() {
@@ -304,6 +385,72 @@ mod tests {
                 source: "test".to_string(),
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn list_includes_builtin_skill_creator() -> Result<()> {
+        let registry = SkillRegistry::new(vec![builtin_skill_root()]);
+
+        let skills = registry.list()?;
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "skill-creator");
+        assert_eq!(skills[0].source, "built-in");
+        assert!(skills[0].description.contains("creating"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_returns_compiled_builtin_skill() -> Result<()> {
+        let registry = SkillRegistry::new(vec![builtin_skill_root()]);
+
+        let content = registry.read("skill-creator", None)?;
+
+        assert!(content.starts_with("---\nname: skill-creator\n"));
+        assert!(content.contains("# Skill Creator"));
+        assert!(content.contains("skills_create"));
+        assert!(content.contains("skills_update"));
+        assert!(content.contains("skills_read"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_rejects_unknown_builtin_asset() -> Result<()> {
+        let registry = SkillRegistry::new(vec![builtin_skill_root()]);
+
+        let error = registry
+            .read("skill-creator", Some("references/missing.md"))
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unknown built-in skill asset: references/missing.md"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_rejects_builtin_parent_traversal() -> Result<()> {
+        let registry = SkillRegistry::new(vec![builtin_skill_root()]);
+
+        let error = registry
+            .read("skill-creator", Some("../SKILL.md"))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "skill path escapes skill directory");
+        Ok(())
+    }
+
+    #[test]
+    fn update_rejects_builtin_skill() -> Result<()> {
+        let registry = SkillRegistry::new(vec![builtin_skill_root()]);
+
+        let error = registry
+            .update("skill-creator", "Changed.", "# Changed\n")
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "skill is read-only: skill-creator");
         Ok(())
     }
 
