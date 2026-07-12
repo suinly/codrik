@@ -3,7 +3,7 @@ use crate::{
     auth::AuthorizedActor,
     config::{AppConfig, codrik_dir},
     llm::{
-        client::{AgentActivitySink, LlmStreamSink, NoopAgentActivitySink, RunContext},
+        client::{AgentActivitySink, LlmStreamSink, RunContext},
         openai::OpenAiClient,
     },
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
@@ -18,6 +18,11 @@ use anyhow::{Context, Result, bail};
 const MAX_SKILL_INDEX_CHARS: usize = 8_000;
 
 pub type AppAgent = Agent<OpenAiClient, InMemoryStore, ToolRegistry>;
+
+pub struct AgentRunSinks<'a> {
+    pub output: &'a mut dyn LlmStreamSink,
+    pub activity: &'a mut dyn AgentActivitySink,
+}
 
 pub fn build_agent(config: AppConfig) -> AppAgent {
     build_agent_with_memory(config, InMemoryStore::new())
@@ -94,44 +99,20 @@ pub async fn run_once_with_actor_session_in_root_and_context(
     agent.execute_with_context(query, context).await
 }
 
-pub async fn run_once_with_actor_session_streaming_in_root_and_context(
-    query: String,
-    config: AppConfig,
-    actor: AuthorizedActor,
-    session_root: PathBuf,
-    session_id: impl AsRef<str>,
-    sink: &mut dyn LlmStreamSink,
-    context: &RunContext,
-) -> Result<String> {
-    let mut activity = NoopAgentActivitySink;
-    run_once_with_actor_session_streaming_and_activity_in_root_and_context(
-        query,
-        config,
-        actor,
-        session_root,
-        session_id,
-        sink,
-        &mut activity,
-        context,
-    )
-    .await
-}
-
 pub async fn run_once_with_actor_session_streaming_and_activity_in_root_and_context(
     query: String,
     config: AppConfig,
     actor: AuthorizedActor,
     session_root: PathBuf,
     session_id: impl AsRef<str>,
-    sink: &mut dyn LlmStreamSink,
-    activity: &mut dyn AgentActivitySink,
+    sinks: AgentRunSinks<'_>,
     context: &RunContext,
 ) -> Result<String> {
     let memory = FileMemoryStore::new(session_root, session_id)?;
     let agent = build_agent_for_actor(config, memory, actor)?;
 
     agent
-        .execute_streaming_with_context_and_activity(query, sink, activity, context)
+        .execute_streaming_with_context_and_activity(query, sinks.output, sinks.activity, context)
         .await
 }
 

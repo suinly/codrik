@@ -18,6 +18,7 @@ mod commands;
 mod format;
 mod run_coordinator;
 
+use activity_status::{TelegramActivityStatus, TerminalStatus};
 use commands::{
     answer_session_command, is_command_addressed_to_other_bot, is_start_command, is_stop_command,
 };
@@ -226,6 +227,7 @@ async fn answer_private_chat(
     }
 
     let typing = keep_typing(bot.clone(), msg.chat.id);
+    let mut activity = TelegramActivityStatus::start(bot.clone(), msg.chat.id);
     let mut stream = TelegramDraftStream::new(
         draft_api,
         msg.chat.id,
@@ -233,17 +235,23 @@ async fn answer_private_chat(
         typing,
         permit.context().clone(),
     );
-    let result = app::run_once_with_actor_session_streaming_in_root_and_context(
+    let result = app::run_once_with_actor_session_streaming_and_activity_in_root_and_context(
         text.to_string(),
         run.config,
         run.actor,
         session_store.session_root(msg.chat.id.0),
         session_id,
-        &mut stream,
+        app::AgentRunSinks {
+            output: &mut stream,
+            activity: &mut activity,
+        },
         permit.context(),
     )
     .await;
     stream.finish().await;
+    activity
+        .finish(terminal_status(&result, permit.context()))
+        .await;
 
     let answer = answer_or_gateway_error(msg.chat.id, result, permit.context());
     drop(execution);
@@ -292,17 +300,24 @@ async fn answer_regular_chat(
         return None;
     }
 
-    let typing = keep_typing(bot.clone(), chat_id);
-    let result = app::run_once_with_actor_session_in_root_and_context(
+    let mut stream = DiscardingStreamSink;
+    let mut activity = TelegramActivityStatus::start(bot.clone(), chat_id);
+    let result = app::run_once_with_actor_session_streaming_and_activity_in_root_and_context(
         text.to_string(),
         run.config,
         run.actor,
         session_store.session_root(chat_id.0),
         session_id,
+        app::AgentRunSinks {
+            output: &mut stream,
+            activity: &mut activity,
+        },
         permit.context(),
     )
     .await;
-    stop_typing(typing).await;
+    activity
+        .finish(terminal_status(&result, permit.context()))
+        .await;
 
     let answer = answer_or_gateway_error(chat_id, result, permit.context());
     drop(execution);
@@ -377,6 +392,16 @@ fn answer_or_gateway_error(
             eprintln!("Telegram gateway error for chat {chat_id}: {error:#}");
             Some(format!("Gateway error: {error:#}"))
         }
+    }
+}
+
+fn terminal_status<T>(result: &Result<T>, context: &RunContext) -> TerminalStatus {
+    match result {
+        Ok(_) => TerminalStatus::Success,
+        Err(error) if context.is_cancelled() || is_run_cancelled_error(error) => {
+            TerminalStatus::Cancelled
+        }
+        Err(_) => TerminalStatus::Failed,
     }
 }
 
@@ -615,6 +640,15 @@ impl LlmStreamSink for TelegramDraftStream {
     }
 }
 
+struct DiscardingStreamSink;
+
+#[async_trait::async_trait]
+impl LlmStreamSink for DiscardingStreamSink {
+    async fn on_event(&mut self, _event: LlmStreamEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize)]
 struct TelegramDraftRequest<'a> {
     chat_id: i64,
@@ -636,14 +670,15 @@ fn truncate_chars(text: &str, max_chars: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::bail;
+    use anyhow::{anyhow, bail};
     use teloxide::types::{ChatId, Update, UpdateId, UpdateKind};
 
     use crate::{auth::GatewayIdentity, llm::client::RunContext};
 
     use super::{
-        answer_or_gateway_error, denied_message, telegram_identity_from_sender,
-        telegram_update_distribution, truncate_chars,
+        activity_status::TerminalStatus, answer_or_gateway_error, denied_message,
+        telegram_identity_from_sender, telegram_update_distribution, terminal_status,
+        truncate_chars,
     };
 
     #[test]
@@ -692,6 +727,26 @@ mod tests {
         let answer = answer_or_gateway_error(ChatId(123), (|| bail!("run cancelled"))(), &context);
 
         assert_eq!(answer, None);
+    }
+
+    #[test]
+    fn terminal_status_reflects_success_cancellation_and_failure() {
+        let active = RunContext::new();
+        assert_eq!(
+            terminal_status(&Ok("done".to_string()), &active),
+            TerminalStatus::Success
+        );
+        assert_eq!(
+            terminal_status(&Err::<String, _>(anyhow!("boom")), &active),
+            TerminalStatus::Failed
+        );
+
+        let cancelled = RunContext::new();
+        cancelled.cancel();
+        assert_eq!(
+            terminal_status(&Err::<String, _>(anyhow!("run cancelled")), &cancelled),
+            TerminalStatus::Cancelled
+        );
     }
 
     #[test]
