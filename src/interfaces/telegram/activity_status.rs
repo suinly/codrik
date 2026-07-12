@@ -38,6 +38,7 @@ impl TerminalStatus {
 }
 
 enum StatusCommand {
+    Activate,
     Description(String),
     Terminal(TerminalStatus),
 }
@@ -110,14 +111,13 @@ impl AgentActivitySink for TelegramActivityStatus {
             AgentActivityEvent::Description(description) => {
                 Some(StatusCommand::Description(description))
             }
+            AgentActivityEvent::ToolStarted { .. } => Some(StatusCommand::Activate),
             AgentActivityEvent::Completed => Some(StatusCommand::Terminal(TerminalStatus::Success)),
             AgentActivityEvent::Cancelled => {
                 Some(StatusCommand::Terminal(TerminalStatus::Cancelled))
             }
             AgentActivityEvent::Failed => Some(StatusCommand::Terminal(TerminalStatus::Failed)),
-            AgentActivityEvent::ModelStepStarted
-            | AgentActivityEvent::ToolStarted { .. }
-            | AgentActivityEvent::ToolFinished { .. } => None,
+            AgentActivityEvent::ModelStepStarted | AgentActivityEvent::ToolFinished { .. } => None,
         };
         if let Some(command) = command {
             let _ = self.sender.send(command);
@@ -135,17 +135,7 @@ async fn run_status_worker(
     let mut description = DEFAULT_DESCRIPTION.to_string();
     let mut dirty = false;
     let mut disabled = false;
-    let message_id = match api
-        .send(render_status(&description, started_at.elapsed()))
-        .await
-    {
-        Ok(message_id) => Some(message_id),
-        Err(error) => {
-            eprintln!("Telegram activity status send failed: {error:#}");
-            disabled = true;
-            None
-        }
-    };
+    let mut message_id = None;
     let mut update_interval = interval(status_update_interval);
     update_interval.tick().await;
     let mut elapsed_interval = interval(status_tick_interval);
@@ -154,11 +144,33 @@ async fn run_status_worker(
     loop {
         tokio::select! {
             command = receiver.recv() => match command {
+                Some(StatusCommand::Activate) => {
+                    if message_id.is_none() && !disabled {
+                        match api.send(render_status(&description, started_at.elapsed())).await {
+                            Ok(sent_message_id) => message_id = Some(sent_message_id),
+                            Err(error) => {
+                                eprintln!("Telegram activity status send failed: {error:#}");
+                                disabled = true;
+                            }
+                        }
+                    }
+                }
                 Some(StatusCommand::Description(candidate)) => {
                     let normalized = normalize_description(&candidate, MAX_STATUS_DESCRIPTION_CHARS);
                     if !normalized.is_empty() && normalized != description {
                         description = normalized;
-                        dirty = true;
+                        if message_id.is_some() {
+                            dirty = true;
+                        }
+                    }
+                    if message_id.is_none() && !disabled {
+                        match api.send(render_status(&description, started_at.elapsed())).await {
+                            Ok(sent_message_id) => message_id = Some(sent_message_id),
+                            Err(error) => {
+                                eprintln!("Telegram activity status send failed: {error:#}");
+                                disabled = true;
+                            }
+                        }
                     }
                 }
                 Some(StatusCommand::Terminal(terminal)) => {
@@ -332,5 +344,23 @@ mod tests {
             .on_activity(AgentActivityEvent::Description("Работаю".to_string()))
             .await;
         status.finish(TerminalStatus::Failed).await;
+    }
+
+    #[tokio::test]
+    async fn run_without_tools_does_not_create_status_message() {
+        let api = Arc::new(FakeStatusApi::default());
+        let mut status = TelegramActivityStatus::start_with_api(
+            api.clone(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        status
+            .on_activity(AgentActivityEvent::ModelStepStarted)
+            .await;
+        status.on_activity(AgentActivityEvent::Completed).await;
+        status.finish(TerminalStatus::Success).await;
+
+        assert!(api.sent.lock().await.is_empty());
+        assert!(api.edited.lock().await.is_empty());
     }
 }
