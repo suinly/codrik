@@ -7,7 +7,7 @@ use crate::{
         openai::OpenAiClient,
     },
     memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
-    skills::{Skill, SkillRegistry, SkillRoot},
+    skills::{Skill, SkillRegistry, SkillRoot, builtin_skill_root},
     tools::{ToolRegistry, ToolRegistryConfig},
 };
 
@@ -150,6 +150,7 @@ fn default_skill_roots() -> Result<Vec<SkillRoot>> {
     Ok(vec![
         SkillRoot::read_only(PathBuf::from(".codrik").join("skills"), "project"),
         SkillRoot::writable(codrik_dir()?.join("skills"), "user"),
+        builtin_skill_root(),
     ])
 }
 
@@ -237,7 +238,7 @@ mod tests {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn default_skill_roots_prefer_project_then_user() -> Result<()> {
+    fn default_skill_roots_order_project_user_then_builtin() -> Result<()> {
         let roots = default_skill_roots()?;
 
         assert_eq!(
@@ -245,7 +246,64 @@ mod tests {
             vec![
                 SkillRoot::read_only(PathBuf::from(".codrik").join("skills"), "project"),
                 SkillRoot::writable(codrik_dir()?.join("skills"), "user"),
+                crate::skills::builtin_skill_root(),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_instructions_index_builtin_skill_creator() -> Result<()> {
+        let tool_config = default_tool_config()?;
+
+        let instructions = agent_instructions_for_tool_config(&tool_config);
+
+        assert!(instructions.contains(
+            "- skill-creator (built-in): Use when creating, writing, saving, or updating reusable skills."
+        ));
+        assert!(!instructions.contains("# Skill Creator"));
+        Ok(())
+    }
+
+    #[test]
+    fn project_and_user_skills_override_builtin_by_order() -> Result<()> {
+        let project = temp_root("project-builtin-override")?;
+        let user = temp_root("user-builtin-override")?;
+        write_skill(
+            &project,
+            "skill-creator",
+            "---\nname: skill-creator\ndescription: Project creator.\n---\n# Project\n",
+        )?;
+        write_skill(
+            &user,
+            "skill-creator",
+            "---\nname: skill-creator\ndescription: User creator.\n---\n# User\n",
+        )?;
+        let registry = SkillRegistry::new(vec![
+            SkillRoot::read_only(&project, "project"),
+            SkillRoot::writable(&user, "user"),
+            crate::skills::builtin_skill_root(),
+        ]);
+
+        let skills = registry.list()?;
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].source, "project");
+        assert_eq!(
+            registry.read("skill-creator", None)?,
+            "---\nname: skill-creator\ndescription: Project creator.\n---\n# Project\n"
+        );
+
+        let registry = SkillRegistry::new(vec![
+            SkillRoot::writable(&user, "user"),
+            crate::skills::builtin_skill_root(),
+        ]);
+        let skills = registry.list()?;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].source, "user");
+        assert_eq!(
+            registry.read("skill-creator", None)?,
+            "---\nname: skill-creator\ndescription: User creator.\n---\n# User\n"
         );
         Ok(())
     }
