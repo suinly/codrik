@@ -13,6 +13,7 @@ use tokio::{
     time::{Duration, Instant, sleep},
 };
 
+mod activity_status;
 mod commands;
 mod format;
 mod run_coordinator;
