@@ -166,7 +166,7 @@ fn openai_client_with_attachments(config: &AppConfig, memory: &FileMemoryStore) 
 
 fn default_tool_config() -> Result<ToolRegistryConfig> {
     Ok(ToolRegistryConfig {
-        bashkit_workspace: None,
+        actor_workspace: None,
         skill_roots: default_skill_roots()?,
         file_roots: Vec::new(),
     })
@@ -174,8 +174,14 @@ fn default_tool_config() -> Result<ToolRegistryConfig> {
 
 fn actor_tool_config(actor: &AuthorizedActor) -> Result<ToolRegistryConfig> {
     let workspace = actor_workspace_path(&actor.id)?;
+    tool_config_for_actor_workspace(workspace)
+}
+
+fn tool_config_for_actor_workspace(workspace: PathBuf) -> Result<ToolRegistryConfig> {
+    std::fs::create_dir_all(&workspace)
+        .with_context(|| format!("failed to create actor workspace: {}", workspace.display()))?;
     Ok(ToolRegistryConfig {
-        bashkit_workspace: Some(workspace.clone()),
+        actor_workspace: Some(workspace.clone()),
         skill_roots: default_skill_roots()?,
         file_roots: vec![FileRoot::new("workspace", workspace)],
     })
@@ -352,7 +358,7 @@ mod tests {
             "---\nname: meduza_daily_summary\ndescription: Use for Meduza news digests and news today requests.\n---\n\n# Secret full instructions\n",
         )?;
         let tool_config = ToolRegistryConfig {
-            bashkit_workspace: None,
+            actor_workspace: None,
             skill_roots: vec![SkillRoot::read_only(&root, "test")],
             file_roots: Vec::new(),
         };
@@ -370,7 +376,7 @@ mod tests {
     #[test]
     fn agent_instructions_omit_skill_index_when_no_skills_exist() -> Result<()> {
         let tool_config = ToolRegistryConfig {
-            bashkit_workspace: None,
+            actor_workspace: None,
             skill_roots: vec![SkillRoot::read_only(temp_root("empty")?, "test")],
             file_roots: Vec::new(),
         };
@@ -378,6 +384,20 @@ mod tests {
         let instructions = agent_instructions_for_tool_config(&tool_config);
 
         assert!(!instructions.contains("## Available Skills"));
+        Ok(())
+    }
+
+    #[test]
+    fn actor_tool_config_creates_shared_shell_workspace() -> Result<()> {
+        let workspace = temp_root("actor-workspace")?;
+        std::fs::remove_dir_all(&workspace)?;
+
+        let config = tool_config_for_actor_workspace(workspace.clone())?;
+
+        assert!(workspace.is_dir());
+        assert_eq!(config.actor_workspace, Some(workspace.clone()));
+        assert_eq!(config.file_roots[0], FileRoot::new("workspace", &workspace));
+        std::fs::remove_dir_all(workspace).ok();
         Ok(())
     }
 

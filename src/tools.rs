@@ -20,7 +20,7 @@ pub struct ToolRegistry {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolRegistryConfig {
-    pub bashkit_workspace: Option<PathBuf>,
+    pub actor_workspace: Option<PathBuf>,
     pub skill_roots: Vec<crate::skills::SkillRoot>,
     pub file_roots: Vec<FileRoot>,
 }
@@ -31,6 +31,7 @@ impl ToolRegistry {
     }
 
     pub fn with_config(config: ToolRegistryConfig) -> Self {
+        let actor_workspace = config.actor_workspace;
         let skill_registry = SkillRegistry::new(config.skill_roots);
         Self {
             handlers: vec![
@@ -45,12 +46,14 @@ impl ToolRegistry {
                 Box::new(skills::SkillsCreateTool::new(skill_registry.clone())),
                 Box::new(skills::SkillsUpdateTool::new(skill_registry)),
                 Box::new(bashkit::BashkitTool::new(bashkit::BashkitToolConfig {
-                    workspace: config.bashkit_workspace,
+                    workspace: actor_workspace.clone(),
                 })),
                 Box::new(web_browser::WebBrowserTool::new(
                     web_browser::WebBrowserToolConfig::default(),
                 )),
-                Box::new(bash::BashTool::default()),
+                Box::new(bash::BashTool::new(bash::BashToolConfig {
+                    default_cwd: actor_workspace,
+                })),
             ],
         }
     }
@@ -171,6 +174,35 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "bash");
+    }
+
+    #[tokio::test]
+    async fn configured_actor_workspace_is_real_bash_default_cwd() {
+        let workspace = std::env::current_dir()
+            .expect("current dir should exist")
+            .join("src");
+        let registry = ToolRegistry::with_allowed_tools_and_config(
+            vec!["bash".to_string()],
+            ToolRegistryConfig {
+                actor_workspace: Some(workspace.clone()),
+                ..default_config()
+            },
+        );
+
+        let execution = registry
+            .execute("bash", r#"{"command":"pwd"}"#)
+            .await
+            .expect("bash should execute");
+        let result: serde_json::Value =
+            serde_json::from_str(&execution.observation).expect("bash observation should be json");
+
+        assert_eq!(
+            result["stdout"]
+                .as_str()
+                .expect("stdout should be a string")
+                .trim(),
+            workspace.to_string_lossy()
+        );
     }
 
     #[tokio::test]

@@ -107,6 +107,11 @@ the embedded Obscura `web_browser`, and the sandboxed `bashkit` tool. The real
 server `bash` tool is privileged and must be granted explicitly, for example
 `"tools": ["*", "bash"]`.
 
+For actor-scoped runs, real `bash` starts in that actor's workspace. Use a
+relative output path such as `report.pdf`, then deliver it with
+`send_file("workspace/report.pdf")`. The absolute `/workspace` mount exists
+only inside `bashkit`.
+
 ## Skills
 
 codrik discovers skills from these sources, in precedence order:
