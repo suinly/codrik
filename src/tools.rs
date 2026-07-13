@@ -155,6 +155,11 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "skills_read"));
         assert!(tools.iter().any(|tool| tool.name == "skills_create"));
         assert!(tools.iter().any(|tool| tool.name == "skills_update"));
+        let send_file = tools
+            .iter()
+            .find(|tool| tool.name == "send_file")
+            .expect("wildcard should allow send_file");
+        assert!(send_file.description.contains("existing file"));
         assert!(!tools.iter().any(|tool| tool.name == bash_name));
     }
 

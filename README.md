@@ -160,9 +160,33 @@ dependency. The first build can take longer than usual because Obscura builds
 its browser runtime dependencies from source.
 
 Telegram sessions are stored under `~/.codrik/sessions/<telegram-chat-id>/`,
-with chat-local metadata in `index.json`. Send `/new` to create and switch to a
-fresh session. Send `/sessions` to list recent sessions in the current chat,
-then `/sessions <id>` to switch back to one of them.
+with chat-local metadata in `index.json`. Each session has its own directory
+containing `messages.json`, attachments, and the provider file cache. Send
+`/new` to create and switch to a fresh session. Send `/sessions` to list recent
+sessions, `/sessions <id>` to switch, or `/sessions delete <id>` to delete an
+inactive session and its local/provider files.
+
+Telegram accepts text, photos, and documents. Captions and files are preserved
+in their original order as one user turn. Supported images and documents are
+uploaded lazily for model input; unsupported binary formats are still stored
+and can be returned with `send_file`, but the model receives metadata only.
+
+Configure attachment limits and image detail in `config.yml`:
+
+```yaml
+api_key: "..."
+base_url: "https://api.openai.com/v1"
+model: "gpt-5"
+attachments:
+  max_file_size_mb: 20
+  image_detail: auto # auto, low, or high
+telegram:
+  token: "..."
+```
+
+The configured `base_url` must implement both the OpenAI Responses API and
+Files API. Uploaded provider files are cached per session and cleaned up when
+that inactive session is deleted.
 
 Update to the latest release:
 
