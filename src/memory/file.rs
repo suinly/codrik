@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex};
 
 use crate::{
-    agent::message::{Message, Role},
+    agent::message::{Attachment, Message, MessagePart, Role},
     llm::client::LlmToolCall,
     memory::store::MemoryStore,
 };
@@ -97,7 +97,7 @@ fn is_safe_session_id(session_id: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionMessage {
     role: SessionRole,
-    content: String,
+    content: SessionContent,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<LlmToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +108,9 @@ impl From<Message> for SessionMessage {
     fn from(message: Message) -> Self {
         Self {
             role: SessionRole::from(message.role),
-            content: message.content,
+            content: SessionContent::Parts(
+                message.content.into_iter().map(SessionPart::from).collect(),
+            ),
             tool_calls: message.tool_calls,
             tool_call_id: message.tool_call_id,
         }
@@ -119,9 +121,90 @@ impl From<SessionMessage> for Message {
     fn from(message: SessionMessage) -> Self {
         Self {
             role: Role::from(message.role),
-            content: message.content,
+            content: match message.content {
+                SessionContent::LegacyText(text) => {
+                    if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![MessagePart::Text(text)]
+                    }
+                }
+                SessionContent::Parts(parts) => parts.into_iter().map(MessagePart::from).collect(),
+            },
             tool_calls: message.tool_calls,
             tool_call_id: message.tool_call_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SessionContent {
+    LegacyText(String),
+    Parts(Vec<SessionPart>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SessionPart {
+    Text { text: String },
+    Attachment { attachment: SessionAttachment },
+}
+
+impl From<MessagePart> for SessionPart {
+    fn from(part: MessagePart) -> Self {
+        match part {
+            MessagePart::Text(text) => Self::Text { text },
+            MessagePart::Attachment(attachment) => Self::Attachment {
+                attachment: SessionAttachment::from(attachment),
+            },
+        }
+    }
+}
+
+impl From<SessionPart> for MessagePart {
+    fn from(part: SessionPart) -> Self {
+        match part {
+            SessionPart::Text { text } => Self::Text(text),
+            SessionPart::Attachment { attachment } => {
+                Self::Attachment(Attachment::from(attachment))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionAttachment {
+    id: String,
+    relative_path: PathBuf,
+    display_name: String,
+    media_type: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+impl From<Attachment> for SessionAttachment {
+    fn from(attachment: Attachment) -> Self {
+        Self {
+            id: attachment.id,
+            relative_path: attachment.relative_path,
+            display_name: attachment.display_name,
+            media_type: attachment.media_type,
+            size_bytes: attachment.size_bytes,
+            sha256: attachment.sha256,
+        }
+    }
+}
+
+impl From<SessionAttachment> for Attachment {
+    fn from(attachment: SessionAttachment) -> Self {
+        Self {
+            id: attachment.id,
+            relative_path: attachment.relative_path,
+            display_name: attachment.display_name,
+            media_type: attachment.media_type,
+            size_bytes: attachment.size_bytes,
+            sha256: attachment.sha256,
         }
     }
 }

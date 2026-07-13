@@ -2,7 +2,7 @@ pub mod message;
 pub mod tool;
 mod tool_observation;
 
-use crate::agent::message::Message;
+use crate::agent::message::{Message, UserInput};
 use crate::agent::tool::ToolExecutor;
 use crate::llm::client::{
     AgentActivityEvent, AgentActivitySink, LlmClient, LlmRequest, LlmResponse, LlmStreamClient,
@@ -39,16 +39,16 @@ where
         self
     }
 
-    pub async fn execute(&self, content: impl Into<String>) -> Result<String> {
-        self.execute_with_context(content, &RunContext::new()).await
+    pub async fn execute(&self, input: impl Into<UserInput>) -> Result<String> {
+        self.execute_with_context(input, &RunContext::new()).await
     }
 
     pub async fn execute_with_context(
         &self,
-        content: impl Into<String>,
+        input: impl Into<UserInput>,
         context: &RunContext,
     ) -> Result<String> {
-        self.memory.append(Message::user(content.into())).await?;
+        self.memory.append(Message::user(input)).await?;
         let mut activity = NoopAgentActivitySink;
 
         loop {
@@ -74,33 +74,33 @@ where
 {
     pub async fn execute_streaming(
         &self,
-        content: impl Into<String>,
+        input: impl Into<UserInput>,
         sink: &mut dyn LlmStreamSink,
     ) -> Result<String> {
-        self.execute_streaming_with_context(content, sink, &RunContext::new())
+        self.execute_streaming_with_context(input, sink, &RunContext::new())
             .await
     }
 
     pub async fn execute_streaming_with_context(
         &self,
-        content: impl Into<String>,
+        input: impl Into<UserInput>,
         sink: &mut dyn LlmStreamSink,
         context: &RunContext,
     ) -> Result<String> {
         let mut activity = NoopAgentActivitySink;
-        self.execute_streaming_with_context_and_activity(content, sink, &mut activity, context)
+        self.execute_streaming_with_context_and_activity(input, sink, &mut activity, context)
             .await
     }
 
     pub async fn execute_streaming_with_context_and_activity(
         &self,
-        content: impl Into<String>,
+        input: impl Into<UserInput>,
         sink: &mut dyn LlmStreamSink,
         activity: &mut dyn AgentActivitySink,
         context: &RunContext,
     ) -> Result<String> {
         let result = self
-            .execute_streaming_with_context_and_activity_inner(content, sink, activity, context)
+            .execute_streaming_with_context_and_activity_inner(input, sink, activity, context)
             .await;
         let terminal = match &result {
             Ok(_) => AgentActivityEvent::Completed,
@@ -115,12 +115,12 @@ where
 
     async fn execute_streaming_with_context_and_activity_inner(
         &self,
-        content: impl Into<String>,
+        input: impl Into<UserInput>,
         sink: &mut dyn LlmStreamSink,
         activity: &mut dyn AgentActivitySink,
         context: &RunContext,
     ) -> Result<String> {
-        self.memory.append(Message::user(content.into())).await?;
+        self.memory.append(Message::user(input)).await?;
 
         loop {
             context.ensure_not_cancelled()?;

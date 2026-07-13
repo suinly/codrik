@@ -54,15 +54,14 @@ impl OpenAiClient {
             .messages
             .into_iter()
             .map(|message| -> Result<ChatCompletionRequestMessage> {
+                let content = message.text();
                 Ok(match message.role {
-                    Role::User => ChatCompletionRequestUserMessage::from(message.content).into(),
+                    Role::User => ChatCompletionRequestUserMessage::from(content).into(),
                     Role::Assistant => ChatCompletionRequestAssistantMessage {
-                        content: if message.content.is_empty() && !message.tool_calls.is_empty() {
+                        content: if content.is_empty() && !message.tool_calls.is_empty() {
                             None
                         } else {
-                            Some(ChatCompletionRequestAssistantMessageContent::Text(
-                                message.content,
-                            ))
+                            Some(ChatCompletionRequestAssistantMessageContent::Text(content))
                         },
                         tool_calls: if message.tool_calls.is_empty() {
                             None
@@ -78,16 +77,14 @@ impl OpenAiClient {
                         ..Default::default()
                     }
                     .into(),
-                    Role::System => {
-                        ChatCompletionRequestSystemMessage::from(message.content).into()
-                    }
+                    Role::System => ChatCompletionRequestSystemMessage::from(content).into(),
                     Role::Tool => {
                         let tool_call_id = message
                             .tool_call_id
                             .context("tool message is missing tool_call_id")?;
 
                         ChatCompletionRequestToolMessage {
-                            content: message.content.into(),
+                            content: content.into(),
                             tool_call_id,
                         }
                         .into()
