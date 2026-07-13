@@ -356,41 +356,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_client_fetches_from_local_test_server() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn http_client_fetches_from_in_memory_handler() {
+        use bashkit::{HttpHandler, HttpResponse};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test server should bind");
-        let address = listener.local_addr().expect("server address");
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("request should connect");
-            let mut request = [0_u8; 1024];
-            let _ = socket
-                .read(&mut request)
-                .await
-                .expect("request should read");
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncodrik",
-                )
-                .await
-                .expect("response should write");
-        });
-        let url = format!("http://{address}/value");
+        struct StaticHandler;
+
+        #[async_trait::async_trait]
+        impl HttpHandler for StaticHandler {
+            async fn request(
+                &self,
+                _method: &str,
+                _url: &str,
+                _body: Option<&[u8]>,
+                _headers: &[(String, String)],
+            ) -> std::result::Result<HttpResponse, String> {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                    body: b"codrik".to_vec(),
+                })
+            }
+        }
+
         let mut bash = bashkit::Bash::builder()
-            .network(
-                NetworkAllowlist::new()
-                    .allow(format!("http://{address}"))
-                    .block_private_ips(false),
-            )
+            .network(NetworkAllowlist::allow_all().block_private_ips(false))
+            .http_handler(Box::new(StaticHandler))
             .build();
 
         let result = bash
-            .exec(&format!("curl -s {url}"))
+            .exec("curl -s https://example.test/value")
             .await
             .expect("curl should execute");
-        server.await.expect("test server should finish");
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "codrik");
