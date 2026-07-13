@@ -189,7 +189,7 @@ async fn answer_authorized_message(
     }
 
     if let Some(answer) =
-        answer_session_command(session_store, msg.chat.id, text, bot_username).await
+        answer_session_command(session_store, msg.chat.id, text, bot_username, &run.config).await
     {
         return Some(answer);
     }

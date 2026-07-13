@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 const MAX_SKILL_INDEX_CHARS: usize = 8_000;
 
 pub type AppAgent = Agent<OpenAiClient, InMemoryStore, ToolRegistry>;
+pub use session_deletion::{SessionDeletionOutcome, delete_inactive_session};
 
 pub struct AgentRunSinks<'a> {
     pub output: &'a mut dyn LlmStreamSink,
@@ -400,3 +401,4 @@ mod tests {
         Ok(path)
     }
 }
+mod session_deletion;

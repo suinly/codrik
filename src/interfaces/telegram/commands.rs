@@ -1,12 +1,17 @@
 use teloxide::types::ChatId;
 
-use crate::memory::telegram_sessions::{TelegramSession, TelegramSessionStore};
+use crate::{
+    app::{self, SessionDeletionOutcome},
+    config::AppConfig,
+    memory::telegram_sessions::{TelegramSession, TelegramSessionStore},
+};
 
 pub(super) async fn answer_session_command(
     session_store: &TelegramSessionStore,
     chat_id: ChatId,
     text: &str,
     bot_username: Option<&str>,
+    config: &AppConfig,
 ) -> Option<String> {
     let command = TelegramCommand::parse(text, bot_username)?;
     let result = match command {
@@ -24,6 +29,22 @@ pub(super) async fn answer_session_command(
                 Ok(false) => Ok(format!("Сессия не найдена: {session_id}")),
                 Err(error) => Err(error),
             }
+        }
+        TelegramCommand::DeleteSession(session_id) => {
+            app::delete_inactive_session(config.clone(), session_store, chat_id.0, &session_id)
+                .await
+                .map(|outcome| match outcome {
+                    SessionDeletionOutcome::NotFound => format!("Сессия не найдена: {session_id}"),
+                    SessionDeletionOutcome::Active => {
+                        "Нельзя удалить активную сессию. Сначала переключись на другую.".to_string()
+                    }
+                    SessionDeletionOutcome::Deleted { failed_remote_deletions: 0 } => {
+                        format!("Удалил сессию: {session_id}")
+                    }
+                    SessionDeletionOutcome::Deleted { failed_remote_deletions } => format!(
+                        "Удалил сессию локально; не удалось удалить provider-файлы: {failed_remote_deletions}"
+                    ),
+                })
         }
         TelegramCommand::Start | TelegramCommand::Stop => return None,
     };
@@ -82,6 +103,7 @@ enum TelegramCommand {
     New,
     Sessions,
     SwitchSession(String),
+    DeleteSession(String),
 }
 
 impl TelegramCommand {
@@ -94,6 +116,7 @@ impl TelegramCommand {
             "/stop" => Some(Self::Stop),
             "/new" => Some(Self::New),
             "/sessions" => match parts.next() {
+                Some("delete") => parts.next().map(|id| Self::DeleteSession(id.to_string())),
                 Some(session_id) => Some(Self::SwitchSession(session_id.to_string())),
                 None => Some(Self::Sessions),
             },
@@ -161,6 +184,10 @@ mod tests {
             Some(TelegramCommand::SwitchSession(
                 "telegram-chat-123".to_string()
             ))
+        );
+        assert_eq!(
+            TelegramCommand::parse("/sessions delete old", Some("CodrikBot")),
+            Some(TelegramCommand::DeleteSession("old".to_string()))
         );
         assert_eq!(
             TelegramCommand::parse("/newsletter", Some("CodrikBot")),

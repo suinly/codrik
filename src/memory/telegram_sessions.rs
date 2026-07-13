@@ -72,7 +72,11 @@ impl TelegramSessionStore {
         let _guard = self.write_lock.lock().await;
         let mut chat = self.read_chat(chat_id).await?;
 
-        if !chat.sessions.iter().any(|session| session.id == session_id) {
+        if !chat
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id && !session.deleting)
+        {
             return Ok(false);
         }
 
@@ -90,6 +94,7 @@ impl TelegramSessionStore {
         let sessions = chat
             .sessions
             .iter()
+            .filter(|session| !session.deleting)
             .map(|session| TelegramSession {
                 id: session.id.clone(),
                 is_active: session.id == chat.active_session_id,
@@ -101,6 +106,46 @@ impl TelegramSessionStore {
         self.write_chat(chat_id, &chat).await?;
 
         Ok(sessions)
+    }
+
+    pub async fn begin_delete(&self, chat_id: i64, session_id: &str) -> Result<BeginDeleteResult> {
+        if !is_safe_session_id(session_id) {
+            bail!("unsafe telegram session id: {session_id}");
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut chat = self.read_chat(chat_id).await?;
+        if chat.active_session_id == session_id {
+            return Ok(BeginDeleteResult::Active);
+        }
+        let Some(record) = chat
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id && !session.deleting)
+        else {
+            return Ok(BeginDeleteResult::NotFound);
+        };
+        record.deleting = true;
+        self.write_chat(chat_id, &chat).await?;
+        Ok(BeginDeleteResult::Ready {
+            session_dir: self.chat_root(chat_id).join(session_id),
+        })
+    }
+
+    pub async fn finish_delete(&self, chat_id: i64, session_id: &str) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let mut chat = self.read_chat(chat_id).await?;
+        let session_dir = self.chat_root(chat_id).join(session_id);
+        if fs::try_exists(&session_dir).await? {
+            fs::remove_dir_all(&session_dir).await.with_context(|| {
+                format!(
+                    "failed to remove session directory: {}",
+                    session_dir.display()
+                )
+            })?;
+        }
+        chat.sessions
+            .retain(|session| !(session.id == session_id && session.deleting));
+        self.write_chat(chat_id, &chat).await
     }
 
     async fn read_chat(&self, chat_id: i64) -> Result<ChatSessionIndex> {
@@ -149,9 +194,16 @@ impl TelegramSessionStore {
         let index_path = chat_root.join("index.json");
         let content =
             serde_json::to_string_pretty(chat).context("failed to serialize telegram sessions")?;
-        fs::write(&index_path, content).await.with_context(|| {
+        let temp_path = index_path.with_extension("json.tmp");
+        fs::write(&temp_path, content).await.with_context(|| {
             format!(
                 "failed to write telegram sessions index: {}",
+                temp_path.display()
+            )
+        })?;
+        fs::rename(&temp_path, &index_path).await.with_context(|| {
+            format!(
+                "failed to replace telegram sessions index: {}",
                 index_path.display()
             )
         })
@@ -253,6 +305,13 @@ pub struct TelegramSession {
     pub last_used_at: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BeginDeleteResult {
+    NotFound,
+    Active,
+    Ready { session_dir: PathBuf },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LegacyTelegramSessions {
     version: u32,
@@ -279,6 +338,8 @@ struct ChatSessionRecord {
     id: String,
     created_at: u64,
     last_used_at: u64,
+    #[serde(default)]
+    deleting: bool,
 }
 
 impl ChatSessionRecord {
@@ -287,6 +348,7 @@ impl ChatSessionRecord {
             id,
             created_at,
             last_used_at: created_at,
+            deleting: false,
         }
     }
 }
@@ -338,7 +400,7 @@ mod tests {
     use anyhow::Result;
     use tokio::fs;
 
-    use super::TelegramSessionStore;
+    use super::{BeginDeleteResult, TelegramSessionStore};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -371,6 +433,21 @@ mod tests {
 
         fs::remove_dir_all(root).await.ok();
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_active_session() -> Result<()> {
+        let root = temp_store_root();
+        let store = TelegramSessionStore::new(&root);
+        let active = store.active_session_id(123).await?;
+
+        assert_eq!(
+            store.begin_delete(123, &active).await?,
+            BeginDeleteResult::Active
+        );
+
+        fs::remove_dir_all(root).await.ok();
         Ok(())
     }
 
