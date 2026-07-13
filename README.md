@@ -112,6 +112,11 @@ relative output path such as `report.pdf`, then deliver it with
 `send_file("workspace/report.pdf")`. The absolute `/workspace` mount exists
 only inside `bashkit`.
 
+Codrik builds Bashkit with its embedded HTTP client, `jq`, and local Git
+support. Bashkit `curl` and `wget` may access public HTTP(S) destinations;
+private and reserved IP ranges remain blocked to reduce SSRF risk. Git remote
+operations are not supported by Bashkit's virtual Git implementation.
+
 ## Skills
 
 codrik discovers skills from these sources, in precedence order:

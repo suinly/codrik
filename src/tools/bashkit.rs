@@ -2,7 +2,10 @@ use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bashkit::{BashTool as BashkitRuntimeTool, ExecutionLimits, Tool as BashkitToolContract};
+use bashkit::{
+    BashBuilder, BashTool as BashkitRuntimeTool, ExecutionLimits, GitConfig, NetworkAllowlist,
+    Tool as BashkitToolContract,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::tool::{Tool, ToolHandler, ToolParameter, ToolParameters};
@@ -58,7 +61,7 @@ impl ToolHandler for BashkitTool {
     fn definition(&self) -> Tool {
         Tool::new(
             self.name(),
-            "Execute bash-compatible commands in a Bashkit in-process sandbox. For authorized actors, the host workspace is mounted read-write at /workspace and is limited to that actor's configured host workspace directory. This is not the real server shell. Other host filesystem and network access are not available unless Bashkit is configured with explicit opt-in capabilities.",
+            "Execute bash-compatible commands in a Bashkit in-process sandbox. For authorized actors, the host workspace is mounted read-write at /workspace and is limited to that actor's configured host workspace directory. Network access to public HTTP(S) destinations is enabled for curl and wget, while private and reserved IP ranges remain blocked. Embedded jq and local Git operations are available; remote Git operations are not supported. This is not the real server shell, and other host filesystem access is unavailable.",
             ToolParameters::new()
                 .required(
                     "command",
@@ -134,7 +137,8 @@ fn bashkit_tool(
     let mut builder = BashkitRuntimeTool::builder()
         .username("agent")
         .hostname("sandbox")
-        .limits(limits);
+        .limits(limits)
+        .configure(configure_agent_capabilities);
 
     if let Some(cwd) = cwd {
         builder = builder.cwd(cwd);
@@ -155,6 +159,12 @@ fn bashkit_tool(
     }
 
     Ok(builder.build())
+}
+
+fn configure_agent_capabilities(builder: BashBuilder) -> BashBuilder {
+    builder
+        .network(NetworkAllowlist::allow_all())
+        .git(GitConfig::new().author("Codrik Agent", "agent@codrik.local"))
 }
 
 fn timeout_ms(arguments: &BashkitArguments) -> u64 {
@@ -209,6 +219,16 @@ mod tests {
                 .required
                 .contains(&"command".to_string())
         );
+    }
+
+    #[test]
+    fn definition_describes_enabled_agent_capabilities() {
+        let definition = BashkitTool::new(BashkitToolConfig::default()).definition();
+
+        assert!(definition.description.contains("public HTTP(S)"));
+        assert!(definition.description.contains("private and reserved IP"));
+        assert!(definition.description.contains("jq"));
+        assert!(definition.description.contains("local Git"));
     }
 
     #[tokio::test]
@@ -304,6 +324,76 @@ mod tests {
 
         assert_eq!(result["exit_code"], 0);
         assert_eq!(result["stdout"], "hello");
+    }
+
+    #[tokio::test]
+    async fn processes_json_with_embedded_jq() {
+        let result = BashkitTool::new(BashkitToolConfig::default())
+            .execute(r#"{"command":"printf '{\"name\":\"codrik\"}' | jq -r '.name'"}"#)
+            .await
+            .expect("jq command should execute");
+        let result: Value = serde_json::from_str(&result).expect("result should be valid json");
+
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["stdout"], "codrik\n");
+    }
+
+    #[tokio::test]
+    async fn initializes_repository_with_embedded_git() {
+        let result = BashkitTool::new(BashkitToolConfig::default())
+            .execute(r#"{"command":"git init /repo"}"#)
+            .await
+            .expect("git command should execute");
+        let result: Value = serde_json::from_str(&result).expect("result should be valid json");
+
+        assert_eq!(result["exit_code"], 0);
+        assert!(
+            result["stdout"]
+                .as_str()
+                .expect("stdout should be a string")
+                .contains("Initialized empty Git repository")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_client_fetches_from_local_test_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener.local_addr().expect("server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            let mut request = [0_u8; 1024];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("request should read");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncodrik",
+                )
+                .await
+                .expect("response should write");
+        });
+        let url = format!("http://{address}/value");
+        let mut bash = bashkit::Bash::builder()
+            .network(
+                NetworkAllowlist::new()
+                    .allow(format!("http://{address}"))
+                    .block_private_ips(false),
+            )
+            .build();
+
+        let result = bash
+            .exec(&format!("curl -s {url}"))
+            .await
+            .expect("curl should execute");
+        server.await.expect("test server should finish");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "codrik");
     }
 
     #[tokio::test]

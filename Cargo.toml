@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.102"
 async-openai = { version = "0.41.1", features = ["responses", "file"] }
 async-trait = "0.1.89"
-bashkit = { version = "0.12.0", features = ["realfs"] }
+bashkit = { version = "0.12.0", features = ["realfs", "http_client", "jq", "git"] }
 base64 = "0.22"
 bytes = "1.11"
 futures-util = "0.3.31"
