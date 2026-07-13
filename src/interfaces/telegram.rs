@@ -4,9 +4,10 @@ use serde::Deserialize;
 use teloxide::{
     Bot,
     dispatching::{Dispatcher, UpdateFilterExt},
-    payloads::SendMessageSetters,
+    net::Download,
+    payloads::{SendDocumentSetters, SendMessageSetters, SendPhotoSetters},
     prelude::Requester,
-    types::{ChatAction, ChatId, Message, MessageId, ParseMode, Update},
+    types::{ChatAction, ChatId, InputFile, Message, MessageId, ParseMode, Update},
 };
 use tokio::{
     task::JoinHandle,
@@ -15,6 +16,7 @@ use tokio::{
 
 mod activity_status;
 mod commands;
+mod files;
 mod format;
 mod run_coordinator;
 
@@ -22,17 +24,19 @@ use activity_status::{TelegramActivityStatus, TerminalStatus};
 use commands::{
     answer_session_command, is_command_addressed_to_other_bot, is_start_command, is_stop_command,
 };
+use files::TelegramIncomingFile;
 use format::markdown_to_telegram_markdown_v2;
 use run_coordinator::TelegramRunCoordinator;
 
 use crate::{
+    agent::message::UserInput,
     app,
     auth::{AuthDecision, AuthorizationStore, AuthorizedActor, GatewayIdentity},
     config::AppConfig,
     llm::client::{
         LlmStreamEvent, LlmStreamSink, RUN_CANCELLED, RunContext, is_run_cancelled_error,
     },
-    memory::telegram_sessions::TelegramSessionStore,
+    memory::{attachments::AttachmentStore, telegram_sessions::TelegramSessionStore},
 };
 
 const DRAFT_UPDATE_INTERVAL: Duration = Duration::from_millis(350);
@@ -70,9 +74,10 @@ pub async fn run(config: AppConfig) -> Result<()> {
         let run_coordinator = run_coordinator.clone();
 
         async move {
-            let Some(text) = msg.text() else {
+            let text = msg.text();
+            if text.is_none() && TelegramIncomingFile::from_message(&msg).is_none() {
                 return Ok(());
-            };
+            }
 
             eprintln!("Telegram text received from chat {}", msg.chat.id);
 
@@ -84,11 +89,14 @@ pub async fn run(config: AppConfig) -> Result<()> {
                 return Ok(());
             };
 
-            if is_command_addressed_to_other_bot(text, bot_username.as_deref()) {
+            if text.is_some_and(|text| {
+                is_command_addressed_to_other_bot(text, bot_username.as_deref())
+            }) {
                 return Ok(());
             }
 
-            let answer = if is_start_command(text, bot_username.as_deref()) {
+            let answer = if text.is_some_and(|text| is_start_command(text, bot_username.as_deref()))
+            {
                 Some(answer_start_command(&auth_store, identity).await)
             } else {
                 match auth_store.authorize(&identity).await {
@@ -97,7 +105,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
                             bot.clone(),
                             &session_store,
                             &msg,
-                            text,
+                            text.unwrap_or_default(),
                             bot_username.as_deref(),
                             draft_api,
                             TelegramAgentRun {
@@ -187,9 +195,9 @@ async fn answer_authorized_message(
     }
 
     if msg.chat.is_private() {
-        answer_private_chat(bot, session_store, msg, text, draft_api, run).await
+        answer_private_chat(bot, session_store, msg, draft_api, run).await
     } else {
-        answer_regular_chat(bot, session_store, msg.chat.id, text, run).await
+        answer_regular_chat(bot, session_store, msg, run).await
     }
 }
 
@@ -197,12 +205,22 @@ async fn answer_private_chat(
     bot: Bot,
     session_store: &TelegramSessionStore,
     msg: &Message,
-    text: &str,
     draft_api: TelegramDraftApi,
     run: TelegramAgentRun<'_>,
 ) -> Option<String> {
     let session_id = match active_session_id_or_error(session_store, msg.chat.id).await {
         Ok(session_id) => session_id,
+        Err(error) => return Some(format!("Gateway error: {error:#}")),
+    };
+    let input = match telegram_user_input(
+        &bot,
+        msg,
+        session_store.session_root(msg.chat.id.0).join(&session_id),
+        run.config.attachments.max_file_size_mb,
+    )
+    .await
+    {
+        Ok(input) => input,
         Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
     let permit = run
@@ -213,7 +231,7 @@ async fn answer_private_chat(
     let execution = permit.enter().await;
     if permit.context().is_cancelled() {
         let _ = app::run_once_with_actor_session_in_root_and_context(
-            text.to_string(),
+            input.clone(),
             run.config,
             run.actor,
             session_store.session_root(msg.chat.id.0),
@@ -229,6 +247,7 @@ async fn answer_private_chat(
     let typing = keep_typing(bot.clone(), msg.chat.id);
     let mut activity = TelegramActivityStatus::start(bot.clone(), msg.chat.id);
     let mut stream = TelegramDraftStream::new(
+        bot.clone(),
         draft_api,
         msg.chat.id,
         msg.id,
@@ -236,7 +255,7 @@ async fn answer_private_chat(
         permit.context().clone(),
     );
     let result = app::run_once_with_actor_session_streaming_and_activity_in_root_and_context(
-        text.to_string(),
+        input,
         run.config,
         run.actor,
         session_store.session_root(msg.chat.id.0),
@@ -274,12 +293,23 @@ async fn answer_private_chat(
 async fn answer_regular_chat(
     bot: Bot,
     session_store: &TelegramSessionStore,
-    chat_id: ChatId,
-    text: &str,
+    msg: &Message,
     run: TelegramAgentRun<'_>,
 ) -> Option<String> {
+    let chat_id = msg.chat.id;
     let session_id = match active_session_id_or_error(session_store, chat_id).await {
         Ok(session_id) => session_id,
+        Err(error) => return Some(format!("Gateway error: {error:#}")),
+    };
+    let input = match telegram_user_input(
+        &bot,
+        msg,
+        session_store.session_root(chat_id.0).join(&session_id),
+        run.config.attachments.max_file_size_mb,
+    )
+    .await
+    {
+        Ok(input) => input,
         Err(error) => return Some(format!("Gateway error: {error:#}")),
     };
     let permit = run.coordinator.register(chat_id, session_id.clone()).await;
@@ -287,7 +317,7 @@ async fn answer_regular_chat(
     let execution = permit.enter().await;
     if permit.context().is_cancelled() {
         let _ = app::run_once_with_actor_session_in_root_and_context(
-            text.to_string(),
+            input.clone(),
             run.config,
             run.actor,
             session_store.session_root(chat_id.0),
@@ -300,10 +330,13 @@ async fn answer_regular_chat(
         return None;
     }
 
-    let mut stream = DiscardingStreamSink;
+    let mut stream = TelegramFileSink {
+        bot: bot.clone(),
+        chat_id,
+    };
     let mut activity = TelegramActivityStatus::start(bot.clone(), chat_id);
     let result = app::run_once_with_actor_session_streaming_and_activity_in_root_and_context(
-        text.to_string(),
+        input,
         run.config,
         run.actor,
         session_store.session_root(chat_id.0),
@@ -332,6 +365,38 @@ async fn answer_regular_chat(
         })
         .await;
     None
+}
+
+async fn telegram_user_input(
+    bot: &Bot,
+    message: &Message,
+    session_dir: std::path::PathBuf,
+    max_file_size_mb: u64,
+) -> Result<UserInput> {
+    let mut input = UserInput::new();
+    if let Some(text) = message.text().or_else(|| message.caption())
+        && !text.is_empty()
+    {
+        input = input.push_text(text);
+    }
+
+    if let Some(incoming) = TelegramIncomingFile::from_message(message) {
+        let remote = bot
+            .get_file(incoming.file_id)
+            .await
+            .context("failed to resolve Telegram file")?;
+        let store = AttachmentStore::new(session_dir, max_file_size_mb.saturating_mul(1024 * 1024));
+        let attachment = store
+            .store_stream(
+                incoming.display_name,
+                bot.download_file_stream(&remote.path),
+            )
+            .await
+            .context("failed to download Telegram file")?;
+        input = input.push_attachment(attachment);
+    }
+
+    Ok(input)
 }
 
 async fn active_session_id_or_error(
@@ -546,6 +611,7 @@ impl TelegramDraftApi {
 }
 
 struct TelegramDraftStream {
+    bot: Bot,
     api: TelegramDraftApi,
     chat_id: ChatId,
     draft_id: i32,
@@ -558,6 +624,7 @@ struct TelegramDraftStream {
 
 impl TelegramDraftStream {
     fn new(
+        bot: Bot,
         api: TelegramDraftApi,
         chat_id: ChatId,
         message_id: MessageId,
@@ -565,6 +632,7 @@ impl TelegramDraftStream {
         context: RunContext,
     ) -> Self {
         Self {
+            bot,
             api,
             chat_id,
             draft_id: message_id.0.max(1),
@@ -627,8 +695,8 @@ impl TelegramDraftStream {
 #[async_trait::async_trait]
 impl LlmStreamSink for TelegramDraftStream {
     async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
-        if matches!(event, LlmStreamEvent::FileReady(_)) {
-            bail!("file output is not configured");
+        if let LlmStreamEvent::FileReady(file) = event {
+            return send_file_artifact(&self.bot, self.chat_id, file).await;
         }
         if let LlmStreamEvent::TextDelta(delta) = event {
             if delta.is_empty() {
@@ -643,16 +711,46 @@ impl LlmStreamSink for TelegramDraftStream {
     }
 }
 
-struct DiscardingStreamSink;
+struct TelegramFileSink {
+    bot: Bot,
+    chat_id: ChatId,
+}
 
 #[async_trait::async_trait]
-impl LlmStreamSink for DiscardingStreamSink {
+impl LlmStreamSink for TelegramFileSink {
     async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
-        if matches!(event, LlmStreamEvent::FileReady(_)) {
-            bail!("file output is not configured");
+        if let LlmStreamEvent::FileReady(file) = event {
+            send_file_artifact(&self.bot, self.chat_id, file).await?;
         }
         Ok(())
     }
+}
+
+async fn send_file_artifact(
+    bot: &Bot,
+    chat_id: ChatId,
+    file: crate::agent::tool::FileArtifact,
+) -> Result<()> {
+    let is_photo = matches!(
+        file.media_type.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    );
+    if is_photo {
+        let request = bot.send_photo(chat_id, InputFile::file(file.path));
+        if let Some(caption) = file.caption {
+            request.caption(caption).await?;
+        } else {
+            request.await?;
+        }
+    } else {
+        let request = bot.send_document(chat_id, InputFile::file(file.path));
+        if let Some(caption) = file.caption {
+            request.caption(caption).await?;
+        } else {
+            request.await?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]

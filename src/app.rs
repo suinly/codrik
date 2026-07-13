@@ -1,5 +1,5 @@
 use crate::{
-    agent::Agent,
+    agent::{Agent, message::UserInput},
     auth::AuthorizedActor,
     config::{AppConfig, codrik_dir},
     llm::{
@@ -104,7 +104,7 @@ pub async fn run_once_with_session_streaming(
 }
 
 pub async fn run_once_with_actor_session_in_root_and_context(
-    query: String,
+    query: impl Into<UserInput>,
     config: AppConfig,
     actor: AuthorizedActor,
     session_root: PathBuf,
@@ -118,7 +118,7 @@ pub async fn run_once_with_actor_session_in_root_and_context(
 }
 
 pub async fn run_once_with_actor_session_streaming_and_activity_in_root_and_context(
-    query: String,
+    query: impl Into<UserInput>,
     config: AppConfig,
     actor: AuthorizedActor,
     session_root: PathBuf,
