@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-async-openai = { version = "0.41.1", features = ["chat-completion", "responses", "file"] }
+async-openai = { version = "0.41.1", features = ["responses", "file"] }
 async-trait = "0.1.89"
 bashkit = { version = "0.12.0", features = ["realfs"] }
 bytes = "1.11"

@@ -1,7 +1,7 @@
 use crate::{
     agent::{
-        message::Role,
-        tool::{Tool, ToolParameter, ToolParameterKind, ToolParameters},
+        message::{Message, Role},
+        tool::{Tool as AgentTool, ToolParameter, ToolParameterKind, ToolParameters},
     },
     llm::client::{
         LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
@@ -12,19 +12,15 @@ use anyhow::{Context, Result, bail};
 use async_openai::{
     Client,
     config::OpenAIConfig,
-    types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage, ChatCompletionTool,
-        ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
-        FunctionCallStream, FunctionObject,
+    types::responses::{
+        CreateResponse, CreateResponseArgs, EasyInputContent, EasyInputMessage, FunctionCallOutput,
+        FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, InputParam, Item,
+        OutputItem, OutputMessageContent, Response, ResponseStreamEvent, Role as ResponseRole,
+        Status, Tool as ResponseTool,
     },
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 
 pub struct OpenAiClient {
     model: String,
@@ -49,91 +45,118 @@ impl OpenAiClient {
         }
     }
 
-    fn to_openai_request(&self, llm_request: LlmRequest) -> Result<CreateChatCompletionRequest> {
-        let messages = llm_request
+    fn to_openai_request(&self, llm_request: LlmRequest) -> Result<CreateResponse> {
+        let instructions = llm_request
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .map(Message::text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let items = llm_request
             .messages
             .into_iter()
-            .map(|message| -> Result<ChatCompletionRequestMessage> {
-                let content = message.text();
-                Ok(match message.role {
-                    Role::User => ChatCompletionRequestUserMessage::from(content).into(),
-                    Role::Assistant => ChatCompletionRequestAssistantMessage {
-                        content: if content.is_empty() && !message.tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(ChatCompletionRequestAssistantMessageContent::Text(content))
-                        },
-                        tool_calls: if message.tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                message
-                                    .tool_calls
-                                    .into_iter()
-                                    .map(Self::to_openai_tool_call)
-                                    .collect(),
-                            )
-                        },
-                        ..Default::default()
-                    }
-                    .into(),
-                    Role::System => ChatCompletionRequestSystemMessage::from(content).into(),
-                    Role::Tool => {
-                        let tool_call_id = message
-                            .tool_call_id
-                            .context("tool message is missing tool_call_id")?;
-
-                        ChatCompletionRequestToolMessage {
-                            content: content.into(),
-                            tool_call_id,
-                        }
-                        .into()
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
+            .map(Self::to_response_items)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let tools = llm_request
             .tools
             .into_iter()
             .map(Self::to_openai_tool)
             .collect::<Vec<_>>();
 
-        let mut request = CreateChatCompletionRequestArgs::default();
-        request.model(self.model.clone()).messages(messages);
-
+        let mut request = CreateResponseArgs::default();
+        request
+            .model(self.model.clone())
+            .input(InputParam::Items(items))
+            .store(false);
+        if !instructions.is_empty() {
+            request.instructions(instructions);
+        }
         if !tools.is_empty() {
             request.tools(tools);
         }
 
-        let request = request.build()?;
-
-        Ok(request)
+        Ok(request.build()?)
     }
 
-    fn to_llm_response(response: CreateChatCompletionResponse) -> Result<LlmResponse> {
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .context("chat completion response has no choices")?;
+    fn to_response_items(message: Message) -> Result<Vec<InputItem>> {
+        let content = message.text();
+        let mut items = Vec::new();
 
-        let content = choice.message.content.unwrap_or_default();
+        match message.role {
+            Role::System => {}
+            Role::User | Role::Assistant => {
+                if !content.is_empty() {
+                    items.push(InputItem::EasyMessage(EasyInputMessage {
+                        role: match message.role {
+                            Role::User => ResponseRole::User,
+                            Role::Assistant => ResponseRole::Assistant,
+                            _ => unreachable!(),
+                        },
+                        content: EasyInputContent::Text(content),
+                        ..Default::default()
+                    }));
+                }
 
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tool_call| match tool_call {
-                ChatCompletionMessageToolCalls::Function(function_call) => Some(LlmToolCall {
-                    id: function_call.id,
-                    name: function_call.function.name,
-                    arguments: function_call.function.arguments,
+                if message.role == Role::Assistant {
+                    items.extend(message.tool_calls.into_iter().map(|tool_call| {
+                        InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                            arguments: tool_call.arguments,
+                            call_id: tool_call.id,
+                            namespace: None,
+                            name: tool_call.name,
+                            id: None,
+                            status: None,
+                        }))
+                    }));
+                }
+            }
+            Role::Tool => {
+                let call_id = message
+                    .tool_call_id
+                    .context("tool message is missing tool_call_id")?;
+                items.push(InputItem::Item(Item::FunctionCallOutput(
+                    FunctionCallOutputItemParam {
+                        call_id,
+                        output: FunctionCallOutput::Text(content),
+                        id: None,
+                        status: None,
+                    },
+                )));
+            }
+        }
+
+        Ok(items)
+    }
+
+    fn to_llm_response(response: Response) -> Result<LlmResponse> {
+        if response.status != Status::Completed {
+            bail!("OpenAI response ended with status {:?}", response.status);
+        }
+
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        for item in response.output {
+            match item {
+                OutputItem::Message(message) => {
+                    for part in message.content {
+                        if let OutputMessageContent::OutputText(text) = part {
+                            content.push_str(&text.text);
+                        }
+                    }
+                }
+                OutputItem::FunctionCall(function_call) => tool_calls.push(LlmToolCall {
+                    id: function_call.call_id,
+                    name: function_call.name,
+                    arguments: function_call.arguments,
                 }),
-                ChatCompletionMessageToolCalls::Custom(_) => None,
-            })
-            .collect();
+                _ => {}
+            }
+        }
 
         Ok(LlmResponse {
             content,
@@ -143,15 +166,13 @@ impl OpenAiClient {
 
     async fn collect_stream_response(
         &self,
-        mut request: CreateChatCompletionRequest,
+        request: CreateResponse,
         sink: &mut dyn LlmStreamSink,
         context: &RunContext,
     ) -> Result<LlmResponse> {
-        request.stream = Some(true);
-
-        let chat = self.client.chat();
+        let responses = self.client.responses();
         let mut stream = tokio::select! {
-            stream = chat.create_stream(request) => stream?,
+            stream = responses.create_stream(request) => stream?,
             _ = context.cancelled() => bail!(RUN_CANCELLED),
         };
         let mut accumulator = StreamAccumulator::default();
@@ -170,24 +191,13 @@ impl OpenAiClient {
         accumulator.into_response()
     }
 
-    fn to_openai_tool(tool: Tool) -> ChatCompletionTools {
-        ChatCompletionTools::Function(ChatCompletionTool {
-            function: FunctionObject {
-                name: tool.name,
-                description: Some(tool.description),
-                parameters: Some(Self::to_openai_parameters(tool.parameters)),
-                strict: None,
-            },
-        })
-    }
-
-    fn to_openai_tool_call(tool_call: LlmToolCall) -> ChatCompletionMessageToolCalls {
-        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-            id: tool_call.id,
-            function: FunctionCall {
-                name: tool_call.name,
-                arguments: tool_call.arguments,
-            },
+    fn to_openai_tool(tool: AgentTool) -> ResponseTool {
+        ResponseTool::Function(FunctionTool {
+            name: tool.name,
+            description: Some(tool.description),
+            parameters: Some(Self::to_openai_parameters(tool.parameters)),
+            strict: None,
+            defer_loading: None,
         })
     }
 
@@ -228,11 +238,10 @@ impl OpenAiClient {
 #[async_trait::async_trait]
 impl LlmClient for OpenAiClient {
     async fn generate(&self, llm_request: LlmRequest, context: &RunContext) -> Result<LlmResponse> {
-        let mut request = self.to_openai_request(llm_request)?;
-        request.stream = Some(false);
-        let chat = self.client.chat();
+        let request = self.to_openai_request(llm_request)?;
+        let responses = self.client.responses();
         let response = tokio::select! {
-            response = chat.create(request) => response?,
+            response = responses.create(request) => response?,
             _ = context.cancelled() => bail!(RUN_CANCELLED),
         };
 
@@ -256,128 +265,78 @@ impl LlmStreamClient for OpenAiClient {
 
 #[derive(Default)]
 struct StreamAccumulator {
-    content: String,
-    tool_calls: BTreeMap<u32, PartialToolCall>,
-}
-
-#[derive(Default)]
-struct PartialToolCall {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
+    completed: Option<Response>,
 }
 
 impl StreamAccumulator {
     async fn push(
         &mut self,
-        chunk: CreateChatCompletionStreamResponse,
+        event: ResponseStreamEvent,
         sink: &mut dyn LlmStreamSink,
     ) -> Result<()> {
-        for choice in chunk.choices {
-            if let Some(content) = choice.delta.content
-                && !content.is_empty()
-            {
-                self.content.push_str(&content);
-                sink.on_event(LlmStreamEvent::TextDelta(content)).await?;
+        match event {
+            ResponseStreamEvent::ResponseOutputTextDelta(event) => {
+                if !event.delta.is_empty() {
+                    sink.on_event(LlmStreamEvent::TextDelta(event.delta))
+                        .await?;
+                }
             }
-
-            for tool_call in choice.delta.tool_calls.unwrap_or_default() {
-                let entry = self.tool_calls.entry(tool_call.index).or_default();
-
-                if let Some(id) = tool_call.id {
-                    sink.on_event(LlmStreamEvent::ToolCallDelta(
-                        entry.record_id(tool_call.index, id),
-                    ))
+            ResponseStreamEvent::ResponseOutputItemAdded(event) => {
+                if let OutputItem::FunctionCall(function_call) = event.item {
+                    sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
+                        index: event.output_index,
+                        id: Some(function_call.call_id),
+                        name: Some(function_call.name),
+                        arguments: None,
+                    }))
                     .await?;
                 }
-
-                if let Some(function) = tool_call.function
-                    && let Some(delta) = entry.record_function_delta(tool_call.index, function)
-                {
-                    sink.on_event(LlmStreamEvent::ToolCallDelta(delta)).await?;
+            }
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event) => {
+                if !event.delta.is_empty() {
+                    sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
+                        index: event.output_index,
+                        id: None,
+                        name: None,
+                        arguments: Some(event.delta),
+                    }))
+                    .await?;
                 }
             }
+            ResponseStreamEvent::ResponseCompleted(event) => {
+                self.completed = Some(event.response);
+            }
+            ResponseStreamEvent::ResponseFailed(event) => {
+                bail!("OpenAI Responses stream failed: {:?}", event.response.error);
+            }
+            ResponseStreamEvent::ResponseIncomplete(event) => {
+                bail!(
+                    "OpenAI Responses stream was incomplete: {:?}",
+                    event.response.incomplete_details
+                );
+            }
+            ResponseStreamEvent::ResponseError(event) => {
+                bail!("OpenAI Responses stream error: {}", event.message);
+            }
+            _ => {}
         }
 
         Ok(())
     }
 
     fn into_response(self) -> Result<LlmResponse> {
-        let tool_calls = self
-            .tool_calls
-            .into_iter()
-            .map(|(index, tool_call)| -> Result<LlmToolCall> {
-                Ok(LlmToolCall {
-                    id: tool_call
-                        .id
-                        .with_context(|| format!("streamed tool call {index} is missing id"))?,
-                    name: tool_call
-                        .name
-                        .with_context(|| format!("streamed tool call {index} is missing name"))?,
-                    arguments: tool_call.arguments,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(LlmResponse {
-            content: self.content,
-            tool_calls,
-        })
-    }
-}
-
-impl PartialToolCall {
-    fn record_id(&mut self, index: u32, id: String) -> LlmToolCallDelta {
-        self.id = Some(id.clone());
-
-        LlmToolCallDelta {
-            index,
-            id: Some(id),
-            name: None,
-            arguments: None,
-        }
-    }
-
-    fn record_function_delta(
-        &mut self,
-        index: u32,
-        function: FunctionCallStream,
-    ) -> Option<LlmToolCallDelta> {
-        let mut name_delta = None;
-        if let Some(name) = function.name {
-            self.name = Some(match self.name.take() {
-                Some(existing) => existing + &name,
-                None => name.clone(),
-            });
-            name_delta = Some(name);
-        }
-
-        let mut arguments_delta = None;
-        if let Some(arguments) = function.arguments {
-            self.arguments.push_str(&arguments);
-            arguments_delta = Some(arguments);
-        }
-
-        if name_delta.is_none() && arguments_delta.is_none() {
-            return None;
-        }
-
-        Some(LlmToolCallDelta {
-            index,
-            id: None,
-            name: name_delta,
-            arguments: arguments_delta,
-        })
+        OpenAiClient::to_llm_response(
+            self.completed
+                .context("OpenAI Responses stream ended before response.completed")?,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use async_openai::types::chat::{
-        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
-        FunctionCallStream, FunctionType,
-    };
+    use async_openai::types::responses::{InputItem, Response, ResponseStreamEvent};
+    use serde_json::json;
 
     use super::*;
 
@@ -395,92 +354,173 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn stream_accumulator_collects_text_deltas() -> Result<()> {
-        let mut accumulator = StreamAccumulator::default();
-        let mut sink = RecordingSink::default();
+    #[test]
+    fn tool_result_maps_to_function_call_output_by_call_id() -> Result<()> {
+        let items = OpenAiClient::to_response_items(Message::tool_result("call_1", "sunny"))?;
 
-        accumulator
-            .push(stream_chunk(delta_with_content("hello "), None), &mut sink)
-            .await?;
-        accumulator
-            .push(stream_chunk(delta_with_content("world"), None), &mut sink)
-            .await?;
-
-        let response = accumulator.into_response()?;
-
-        assert_eq!(response.content, "hello world");
-        assert!(response.tool_calls.is_empty());
+        assert_eq!(items.len(), 1);
         assert_eq!(
-            sink.events,
-            vec![
-                LlmStreamEvent::TextDelta("hello ".to_string()),
-                LlmStreamEvent::TextDelta("world".to_string()),
-            ]
+            serde_json::to_value(&items[0])?,
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "sunny"
+            })
         );
 
         Ok(())
     }
 
+    #[test]
+    fn response_function_call_uses_call_id() -> Result<()> {
+        let response = response_with_output(json!([{
+            "type": "function_call",
+            "id": "item_1",
+            "call_id": "call_1",
+            "name": "weather",
+            "arguments": "{}",
+            "status": "completed"
+        }]))?;
+
+        assert_eq!(
+            OpenAiClient::to_llm_response(response)?.tool_calls,
+            vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "weather".to_string(),
+                arguments: "{}".to_string(),
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn request_keeps_system_text_in_instructions_not_input() -> Result<()> {
+        let client = OpenAiClient::new("test", "key", "http://localhost");
+        let request = client.to_openai_request(LlmRequest {
+            messages: vec![Message::system("be concise"), Message::user("hello")],
+            tools: Vec::new(),
+        })?;
+
+        assert_eq!(request.instructions.as_deref(), Some("be concise"));
+        let InputParam::Items(items) = request.input else {
+            panic!("request input should contain typed items");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], InputItem::EasyMessage(_)));
+        assert_eq!(request.store, Some(false));
+
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn stream_accumulator_collects_chunked_tool_calls_by_index() -> Result<()> {
+    async fn stream_accumulator_emits_deltas_and_uses_completed_response() -> Result<()> {
         let mut accumulator = StreamAccumulator::default();
         let mut sink = RecordingSink::default();
 
         accumulator
             .push(
-                stream_chunk(
-                    empty_delta(),
-                    Some(vec![tool_call_delta(
-                        0,
-                        Some("call_1"),
-                        Some("demo"),
-                        Some("{\"city\""),
-                    )]),
-                ),
+                stream_event(json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "hello "
+                }))?,
                 &mut sink,
             )
             .await?;
         accumulator
             .push(
-                stream_chunk(
-                    empty_delta(),
-                    Some(vec![tool_call_delta(0, None, None, Some(":\"Paris\"}"))]),
-                ),
+                stream_event(json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": 2,
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": "item_1",
+                        "call_id": "call_1",
+                        "name": "weather",
+                        "arguments": "",
+                        "status": "in_progress"
+                    }
+                }))?,
+                &mut sink,
+            )
+            .await?;
+        accumulator
+            .push(
+                stream_event(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 3,
+                    "item_id": "item_1",
+                    "output_index": 1,
+                    "delta": "{\"city\":\"Paris\"}"
+                }))?,
+                &mut sink,
+            )
+            .await?;
+        accumulator
+            .push(
+                stream_event(json!({
+                    "type": "response.completed",
+                    "sequence_number": 4,
+                    "response": {
+                        "id": "resp_1",
+                        "object": "response",
+                        "created_at": 1,
+                        "model": "test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_1",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{"type": "output_text", "text": "hello world", "annotations": []}]
+                            },
+                            {
+                                "type": "function_call",
+                                "id": "item_1",
+                                "call_id": "call_1",
+                                "name": "weather",
+                                "arguments": "{\"city\":\"Paris\"}",
+                                "status": "completed"
+                            }
+                        ]
+                    }
+                }))?,
                 &mut sink,
             )
             .await?;
 
         let response = accumulator.into_response()?;
 
+        assert_eq!(response.content, "hello world");
         assert_eq!(
             response.tool_calls,
             vec![LlmToolCall {
                 id: "call_1".to_string(),
-                name: "demo".to_string(),
+                name: "weather".to_string(),
                 arguments: "{\"city\":\"Paris\"}".to_string(),
             }]
         );
         assert_eq!(
             sink.events,
             vec![
+                LlmStreamEvent::TextDelta("hello ".to_string()),
                 LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
-                    index: 0,
+                    index: 1,
                     id: Some("call_1".to_string()),
-                    name: None,
+                    name: Some("weather".to_string()),
                     arguments: None,
                 }),
                 LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
-                    index: 0,
-                    id: None,
-                    name: Some("demo".to_string()),
-                    arguments: Some("{\"city\"".to_string()),
-                }),
-                LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
-                    index: 0,
+                    index: 1,
                     id: None,
                     name: None,
-                    arguments: Some(":\"Paris\"}".to_string()),
+                    arguments: Some("{\"city\":\"Paris\"}".to_string()),
                 }),
             ]
         );
@@ -488,67 +528,18 @@ mod tests {
         Ok(())
     }
 
-    fn stream_chunk(
-        delta: ChatCompletionStreamResponseDelta,
-        tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
-    ) -> CreateChatCompletionStreamResponse {
-        let mut delta = delta;
-        delta.tool_calls = tool_calls;
-
-        #[allow(deprecated)]
-        CreateChatCompletionStreamResponse {
-            id: "chatcmpl_test".to_string(),
-            choices: vec![ChatChoiceStream {
-                index: 0,
-                delta,
-                finish_reason: None,
-                logprobs: None,
-            }],
-            created: 0,
-            model: "test-model".to_string(),
-            service_tier: None,
-            system_fingerprint: None,
-            object: "chat.completion.chunk".to_string(),
-            usage: None,
-        }
+    fn response_with_output(output: serde_json::Value) -> Result<Response> {
+        Ok(serde_json::from_value(json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1,
+            "model": "test",
+            "status": "completed",
+            "output": output
+        }))?)
     }
 
-    fn delta_with_content(content: impl Into<String>) -> ChatCompletionStreamResponseDelta {
-        #[allow(deprecated)]
-        ChatCompletionStreamResponseDelta {
-            content: Some(content.into()),
-            function_call: None,
-            tool_calls: None,
-            role: None,
-            refusal: None,
-        }
-    }
-
-    fn empty_delta() -> ChatCompletionStreamResponseDelta {
-        #[allow(deprecated)]
-        ChatCompletionStreamResponseDelta {
-            content: None,
-            function_call: None,
-            tool_calls: None,
-            role: None,
-            refusal: None,
-        }
-    }
-
-    fn tool_call_delta(
-        index: u32,
-        id: Option<&str>,
-        name: Option<&str>,
-        arguments: Option<&str>,
-    ) -> ChatCompletionMessageToolCallChunk {
-        ChatCompletionMessageToolCallChunk {
-            index,
-            id: id.map(ToString::to_string),
-            r#type: Some(FunctionType::Function),
-            function: Some(FunctionCallStream {
-                name: name.map(ToString::to_string),
-                arguments: arguments.map(ToString::to_string),
-            }),
-        }
+    fn stream_event(value: serde_json::Value) -> Result<ResponseStreamEvent> {
+        Ok(serde_json::from_value(value)?)
     }
 }
