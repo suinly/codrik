@@ -50,6 +50,7 @@ impl AgentActivitySink for NoopAgentActivitySink {
     async fn on_activity(&mut self, _event: AgentActivityEvent) {}
 }
 
+#[derive(Clone)]
 pub struct LlmRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,

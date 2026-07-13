@@ -1,6 +1,10 @@
+mod attachments;
+
+pub use attachments::OpenAiAttachmentContext;
+
 use crate::{
     agent::{
-        message::{Message, Role},
+        message::{Message, MessagePart, Role},
         tool::{Tool as AgentTool, ToolParameter, ToolParameterKind, ToolParameters},
     },
     llm::client::{
@@ -14,9 +18,9 @@ use async_openai::{
     config::OpenAIConfig,
     types::responses::{
         CreateResponse, CreateResponseArgs, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-        FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, InputParam, Item,
-        OutputItem, OutputMessageContent, Response, ResponseStreamEvent, Role as ResponseRole,
-        Status, Tool as ResponseTool,
+        FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputContent, InputItem,
+        InputParam, InputTextContent, Item, OutputItem, OutputMessageContent, Response,
+        ResponseStreamEvent, Role as ResponseRole, Status, Tool as ResponseTool,
     },
 };
 use futures_util::StreamExt;
@@ -25,6 +29,7 @@ use serde_json::{Value, json};
 pub struct OpenAiClient {
     model: String,
     client: Client<OpenAIConfig>,
+    attachment_context: Option<OpenAiAttachmentContext>,
 }
 
 impl OpenAiClient {
@@ -42,10 +47,17 @@ impl OpenAiClient {
         Self {
             model: model.into(),
             client,
+            attachment_context: None,
         }
     }
 
-    fn to_openai_request(&self, llm_request: LlmRequest) -> Result<CreateResponse> {
+    async fn to_openai_request(
+        &self,
+        llm_request: LlmRequest,
+    ) -> Result<(
+        CreateResponse,
+        Vec<crate::memory::provider_files::ProviderFileKey>,
+    )> {
         let instructions = llm_request
             .messages
             .iter()
@@ -54,14 +66,20 @@ impl OpenAiClient {
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-        let items = llm_request
+        let parts = llm_request
             .messages
-            .into_iter()
-            .map(Self::to_response_items)
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
+            .iter()
+            .flat_map(|message| message.content.iter())
             .collect::<Vec<_>>();
+        let selected_documents = attachments::selected_document_ids(parts.into_iter());
+        let mut items = Vec::new();
+        let mut reused_keys = Vec::new();
+        for message in llm_request.messages {
+            let (message_items, message_reused_keys) =
+                self.to_response_items(message, &selected_documents).await?;
+            items.extend(message_items);
+            reused_keys.extend(message_reused_keys);
+        }
         let tools = llm_request
             .tools
             .into_iter()
@@ -80,16 +98,43 @@ impl OpenAiClient {
             request.tools(tools);
         }
 
-        Ok(request.build()?)
+        Ok((request.build()?, reused_keys))
     }
 
-    fn to_response_items(message: Message) -> Result<Vec<InputItem>> {
-        let content = message.text();
+    async fn to_response_items(
+        &self,
+        message: Message,
+        selected_documents: &std::collections::HashSet<String>,
+    ) -> Result<(
+        Vec<InputItem>,
+        Vec<crate::memory::provider_files::ProviderFileKey>,
+    )> {
         let mut items = Vec::new();
+        let mut reused_keys = Vec::new();
+        let role = message.role.clone();
 
-        match message.role {
+        match role {
             Role::System => {}
             Role::User | Role::Assistant => {
+                let mut content = Vec::new();
+                for part in message.content {
+                    match part {
+                        MessagePart::Text(text) if !text.is_empty() => {
+                            content.push(InputContent::InputText(InputTextContent { text }));
+                        }
+                        MessagePart::Text(_) => {}
+                        MessagePart::Attachment(file) => {
+                            let resolved =
+                                self.resolve_attachment(&file, selected_documents).await?;
+                            if resolved.reused_cache
+                                && let Some(key) = resolved.cache_key
+                            {
+                                reused_keys.push(key);
+                            }
+                            content.push(resolved.content);
+                        }
+                    }
+                }
                 if !content.is_empty() {
                     items.push(InputItem::EasyMessage(EasyInputMessage {
                         role: match message.role {
@@ -97,7 +142,7 @@ impl OpenAiClient {
                             Role::Assistant => ResponseRole::Assistant,
                             _ => unreachable!(),
                         },
-                        content: EasyInputContent::Text(content),
+                        content: EasyInputContent::ContentList(content),
                         ..Default::default()
                     }));
                 }
@@ -116,6 +161,7 @@ impl OpenAiClient {
                 }
             }
             Role::Tool => {
+                let content = message.text();
                 let call_id = message
                     .tool_call_id
                     .context("tool message is missing tool_call_id")?;
@@ -130,7 +176,7 @@ impl OpenAiClient {
             }
         }
 
-        Ok(items)
+        Ok((items, reused_keys))
     }
 
     fn to_llm_response(response: Response) -> Result<LlmResponse> {
@@ -238,11 +284,27 @@ impl OpenAiClient {
 #[async_trait::async_trait]
 impl LlmClient for OpenAiClient {
     async fn generate(&self, llm_request: LlmRequest, context: &RunContext) -> Result<LlmResponse> {
-        let request = self.to_openai_request(llm_request)?;
+        let original_request = llm_request.clone();
+        let (request, reused_keys) = self.to_openai_request(llm_request).await?;
         let responses = self.client.responses();
         let response = tokio::select! {
-            response = responses.create(request) => response?,
+            response = responses.create(request) => response,
             _ = context.cancelled() => bail!(RUN_CANCELLED),
+        };
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error)
+                if !reused_keys.is_empty() && is_stale_provider_file_error(&error.to_string()) =>
+            {
+                self.evict_provider_files(&reused_keys).await?;
+                let (request, _) = self.to_openai_request(original_request).await?;
+                tokio::select! {
+                    response = responses.create(request) => response?,
+                    _ = context.cancelled() => bail!(RUN_CANCELLED),
+                }
+            }
+            Err(error) => return Err(error.into()),
         };
 
         Self::to_llm_response(response)
@@ -257,10 +319,29 @@ impl LlmStreamClient for OpenAiClient {
         sink: &mut dyn LlmStreamSink,
         context: &RunContext,
     ) -> Result<LlmResponse> {
-        let request = self.to_openai_request(llm_request)?;
+        let original_request = llm_request.clone();
+        let (request, reused_keys) = self.to_openai_request(llm_request).await?;
 
-        self.collect_stream_response(request, sink, context).await
+        match self.collect_stream_response(request, sink, context).await {
+            Ok(response) => Ok(response),
+            Err(error)
+                if !reused_keys.is_empty() && is_stale_provider_file_error(&error.to_string()) =>
+            {
+                self.evict_provider_files(&reused_keys).await?;
+                let (request, _) = self.to_openai_request(original_request).await?;
+                self.collect_stream_response(request, sink, context).await
+            }
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn is_stale_provider_file_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("file")
+        && (message.contains("not found")
+            || message.contains("inaccessible")
+            || message.contains("does not exist"))
 }
 
 #[derive(Default)]
@@ -354,9 +435,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_result_maps_to_function_call_output_by_call_id() -> Result<()> {
-        let items = OpenAiClient::to_response_items(Message::tool_result("call_1", "sunny"))?;
+    #[tokio::test]
+    async fn tool_result_maps_to_function_call_output_by_call_id() -> Result<()> {
+        let client = OpenAiClient::new("test", "key", "http://localhost");
+        let (items, _) = client
+            .to_response_items(Message::tool_result("call_1", "sunny"), &Default::default())
+            .await?;
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -394,13 +478,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn request_keeps_system_text_in_instructions_not_input() -> Result<()> {
+    #[tokio::test]
+    async fn request_keeps_system_text_in_instructions_not_input() -> Result<()> {
         let client = OpenAiClient::new("test", "key", "http://localhost");
-        let request = client.to_openai_request(LlmRequest {
-            messages: vec![Message::system("be concise"), Message::user("hello")],
-            tools: Vec::new(),
-        })?;
+        let (request, _) = client
+            .to_openai_request(LlmRequest {
+                messages: vec![Message::system("be concise"), Message::user("hello")],
+                tools: Vec::new(),
+            })
+            .await?;
 
         assert_eq!(request.instructions.as_deref(), Some("be concise"));
         let InputParam::Items(items) = request.input else {

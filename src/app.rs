@@ -4,9 +4,12 @@ use crate::{
     config::{AppConfig, codrik_dir},
     llm::{
         client::{AgentActivitySink, LlmStreamSink, RunContext},
-        openai::OpenAiClient,
+        openai::{OpenAiAttachmentContext, OpenAiClient},
     },
-    memory::{file::FileMemoryStore, in_memory::InMemoryStore, store::MemoryStore},
+    memory::{
+        file::FileMemoryStore, in_memory::InMemoryStore, provider_files::ProviderFileStore,
+        store::MemoryStore,
+    },
     skills::{Skill, SkillRegistry, SkillRoot, builtin_skill_root},
     tools::{ToolRegistry, ToolRegistryConfig},
 };
@@ -33,6 +36,18 @@ where
     M: MemoryStore,
 {
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
+    let tool_config = default_tool_config().expect("failed to build default tool config");
+    let instructions = agent_instructions_for_tool_config(&tool_config);
+    let tools = ToolRegistry::with_config(tool_config);
+
+    Agent::new(llm, memory, tools).set_instructions(instructions)
+}
+
+fn build_agent_with_file_memory(
+    config: AppConfig,
+    memory: FileMemoryStore,
+) -> Agent<OpenAiClient, FileMemoryStore, ToolRegistry> {
+    let llm = openai_client_with_attachments(&config, &memory);
     let tool_config = default_tool_config().expect("failed to build default tool config");
     let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_config(tool_config);
@@ -68,7 +83,7 @@ pub async fn run_once_with_session(
     session_id: impl AsRef<str>,
 ) -> Result<String> {
     let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
-    let agent = build_agent_with_memory(config, memory);
+    let agent = build_agent_with_file_memory(config, memory);
 
     agent.execute(query).await
 }
@@ -80,7 +95,7 @@ pub async fn run_once_with_session_streaming(
     sink: &mut dyn LlmStreamSink,
 ) -> Result<String> {
     let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
-    let agent = build_agent_with_memory(config, memory);
+    let agent = build_agent_with_file_memory(config, memory);
 
     agent.execute_streaming(query, sink).await
 }
@@ -116,20 +131,30 @@ pub async fn run_once_with_actor_session_streaming_and_activity_in_root_and_cont
         .await
 }
 
-fn build_agent_for_actor<M>(
+fn build_agent_for_actor(
     config: AppConfig,
-    memory: M,
+    memory: FileMemoryStore,
     actor: AuthorizedActor,
-) -> Result<Agent<OpenAiClient, M, ToolRegistry>>
-where
-    M: MemoryStore,
-{
-    let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
+) -> Result<Agent<OpenAiClient, FileMemoryStore, ToolRegistry>> {
+    let llm = openai_client_with_attachments(&config, &memory);
     let tool_config = actor_tool_config(&actor)?;
     let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
 
     Ok(Agent::new(llm, memory, tools).set_instructions(instructions))
+}
+
+fn openai_client_with_attachments(config: &AppConfig, memory: &FileMemoryStore) -> OpenAiClient {
+    OpenAiClient::new(
+        config.model.clone(),
+        config.api_key.clone(),
+        config.base_url.clone(),
+    )
+    .with_attachment_context(OpenAiAttachmentContext {
+        session_dir: memory.session_dir().to_path_buf(),
+        provider_files: ProviderFileStore::new(memory.session_dir()),
+        image_detail: config.attachments.image_detail,
+    })
 }
 
 fn default_tool_config() -> Result<ToolRegistryConfig> {
