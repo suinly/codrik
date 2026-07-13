@@ -16,7 +16,21 @@ const MAX_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
 const MAX_OUTPUT_CHARS: usize = 100_000;
 
-pub struct BashTool;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BashToolConfig {
+    pub default_cwd: Option<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct BashTool {
+    config: BashToolConfig,
+}
+
+impl BashTool {
+    pub fn new(config: BashToolConfig) -> Self {
+        Self { config }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct BashArguments {
@@ -51,7 +65,7 @@ impl ToolHandler for BashTool {
     fn definition(&self) -> Tool {
         Tool::new(
             self.name(),
-            "Execute real bash commands on the server using the codrik process permissions. This is not sandboxed and can read or change server files, spawn processes, and use the server network according to host permissions. Use bashkit for normal sandboxed commands.",
+            "Execute real bash commands on the server using the codrik process permissions. This is not sandboxed and can read or change server files, spawn processes, and use the server network according to host permissions. Actor-scoped calls start in the actor workspace, so use relative paths for output files. /workspace exists only inside Bashkit. A relative file can be delivered with send_file as workspace/<path>. Use bashkit for normal sandboxed commands.",
             ToolParameters::new()
                 .required(
                     "command",
@@ -59,7 +73,7 @@ impl ToolHandler for BashTool {
                 )
                 .optional(
                     "cwd",
-                    ToolParameter::string("Server working directory for the command. Defaults to the codrik process working directory."),
+                    ToolParameter::string("Server working directory for the command. Overrides the configured default. Without cwd, actor-scoped calls use the actor workspace and unscoped calls use the codrik process working directory."),
                 )
                 .optional(
                     "timeout_seconds",
@@ -75,13 +89,13 @@ impl ToolHandler for BashTool {
     async fn execute(&self, arguments: &str) -> Result<String> {
         let arguments: BashArguments =
             serde_json::from_str(arguments).context("failed to parse bash tool arguments")?;
-        let result = run_bash(arguments).await?;
+        let result = run_bash(arguments, self.config.default_cwd.clone()).await?;
 
         serde_json::to_string(&result).context("failed to serialize bash command result")
     }
 }
 
-async fn run_bash(arguments: BashArguments) -> Result<BashResult> {
+async fn run_bash(arguments: BashArguments, default_cwd: Option<PathBuf>) -> Result<BashResult> {
     let timeout = Duration::from_secs(
         arguments
             .timeout_seconds
@@ -102,7 +116,7 @@ async fn run_bash(arguments: BashArguments) -> Result<BashResult> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    if let Some(cwd) = arguments.cwd {
+    if let Some(cwd) = arguments.cwd.or(default_cwd) {
         command.current_dir(cwd);
     }
 
@@ -228,7 +242,7 @@ mod tests {
 
     #[test]
     fn definition_requires_command() {
-        let definition = BashTool.definition();
+        let definition = BashTool::default().definition();
 
         assert_eq!(definition.name, "bash");
         assert!(
@@ -240,13 +254,26 @@ mod tests {
     }
 
     #[test]
+    fn definition_explains_workspace_path_contract() {
+        let definition = BashTool::default().definition();
+
+        assert!(definition.description.contains("relative paths"));
+        assert!(
+            definition
+                .description
+                .contains("/workspace exists only inside Bashkit")
+        );
+        assert!(definition.description.contains("workspace/<path>"));
+    }
+
+    #[test]
     fn is_privileged() {
-        assert_eq!(BashTool.exposure(), ToolExposure::Privileged);
+        assert_eq!(BashTool::default().exposure(), ToolExposure::Privileged);
     }
 
     #[tokio::test]
     async fn returns_successful_command_output() {
-        let result = BashTool
+        let result = BashTool::default()
             .execute(r#"{"command":"printf hello"}"#)
             .await
             .expect("server bash command should execute");
@@ -260,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_nonzero_exit_as_tool_output() {
-        let result = BashTool
+        let result = BashTool::default()
             .execute(r#"{"command":"printf nope >&2; exit 7"}"#)
             .await
             .expect("nonzero exit should still be tool output");
@@ -273,7 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_timeout() {
-        let result = BashTool
+        let result = BashTool::default()
             .execute(r#"{"command":"sleep 2","timeout_seconds":1}"#)
             .await
             .expect("timeout should still be tool output");
@@ -286,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncates_large_output() {
-        let result = BashTool
+        let result = BashTool::default()
             .execute(r#"{"command":"printf abcdef","max_output_chars":3}"#)
             .await
             .expect("server bash command should execute");
@@ -301,7 +328,7 @@ mod tests {
         let cwd = std::env::current_dir()
             .expect("current dir should exist")
             .join("src");
-        let result = BashTool
+        let result = BashTool::default()
             .execute(&format!(
                 r#"{{"command":"pwd","cwd":{}}}"#,
                 serde_json::to_string(&cwd).expect("cwd should serialize")
@@ -317,6 +344,52 @@ mod tests {
                 .expect("stdout should be a string")
                 .trim(),
             cwd.to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_in_default_cwd() {
+        let default_cwd = std::env::current_dir()
+            .expect("current dir should exist")
+            .join("src");
+        let result = BashTool::new(BashToolConfig {
+            default_cwd: Some(default_cwd.clone()),
+        })
+        .execute(r#"{"command":"pwd"}"#)
+        .await
+        .expect("server bash command should execute");
+        let result: Value = serde_json::from_str(&result).expect("result should be valid json");
+
+        assert_eq!(
+            result["stdout"]
+                .as_str()
+                .expect("stdout should be a string")
+                .trim(),
+            default_cwd.to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_cwd_overrides_default_cwd() {
+        let root = std::env::current_dir().expect("current dir should exist");
+        let explicit_cwd = root.join("src");
+        let result = BashTool::new(BashToolConfig {
+            default_cwd: Some(root),
+        })
+        .execute(&format!(
+            r#"{{"command":"pwd","cwd":{}}}"#,
+            serde_json::to_string(&explicit_cwd).expect("cwd should serialize")
+        ))
+        .await
+        .expect("server bash command should execute");
+        let result: Value = serde_json::from_str(&result).expect("result should be valid json");
+
+        assert_eq!(
+            result["stdout"]
+                .as_str()
+                .expect("stdout should be a string")
+                .trim(),
+            explicit_cwd.to_string_lossy()
         );
     }
 }

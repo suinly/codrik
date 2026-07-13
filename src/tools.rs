@@ -50,7 +50,7 @@ impl ToolRegistry {
                 Box::new(web_browser::WebBrowserTool::new(
                     web_browser::WebBrowserToolConfig::default(),
                 )),
-                Box::new(bash::BashTool),
+                Box::new(bash::BashTool::default()),
             ],
         }
     }
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn definitions_include_privileged_bash() {
         let tools = ToolRegistry::new().definitions();
-        let bash_name = bash::BashTool.definition().name;
+        let bash_name = bash::BashTool::default().definition().name;
 
         assert!(tools.iter().any(|tool| tool.name == bash_name));
     }
@@ -146,7 +146,7 @@ mod tests {
         let bashkit_name = bashkit::BashkitTool::new(bashkit::BashkitToolConfig::default())
             .definition()
             .name;
-        let bash_name = bash::BashTool.definition().name;
+        let bash_name = bash::BashTool::default().definition().name;
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
         assert!(tools.iter().any(|tool| tool.name == bashkit_name));
