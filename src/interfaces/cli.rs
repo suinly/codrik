@@ -186,6 +186,9 @@ impl StdoutStreamRenderer {
 #[async_trait::async_trait]
 impl LlmStreamSink for StdoutStreamRenderer {
     async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
+        if matches!(event, LlmStreamEvent::FileReady(_)) {
+            bail!("file output is unsupported by the CLI");
+        }
         if let LlmStreamEvent::TextDelta(delta) = event {
             let mut state = self
                 .state

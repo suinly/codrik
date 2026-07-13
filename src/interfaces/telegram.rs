@@ -627,6 +627,9 @@ impl TelegramDraftStream {
 #[async_trait::async_trait]
 impl LlmStreamSink for TelegramDraftStream {
     async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
+        if matches!(event, LlmStreamEvent::FileReady(_)) {
+            bail!("file output is not configured");
+        }
         if let LlmStreamEvent::TextDelta(delta) = event {
             if delta.is_empty() {
                 return Ok(());
@@ -644,7 +647,10 @@ struct DiscardingStreamSink;
 
 #[async_trait::async_trait]
 impl LlmStreamSink for DiscardingStreamSink {
-    async fn on_event(&mut self, _event: LlmStreamEvent) -> Result<()> {
+    async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
+        if matches!(event, LlmStreamEvent::FileReady(_)) {
+            bail!("file output is not configured");
+        }
         Ok(())
     }
 }

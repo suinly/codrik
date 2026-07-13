@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -97,11 +97,39 @@ pub enum ToolParameterKind {
     Boolean,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExecution {
+    pub observation: String,
+    pub artifacts: Vec<ToolArtifact>,
+}
+
+impl ToolExecution {
+    pub fn text(observation: impl Into<String>) -> Self {
+        Self {
+            observation: observation.into(),
+            artifacts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolArtifact {
+    File(FileArtifact),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileArtifact {
+    pub path: PathBuf,
+    pub display_name: String,
+    pub media_type: String,
+    pub caption: Option<String>,
+}
+
 #[async_trait]
 pub trait ToolExecutor {
     fn definitions(&self) -> Vec<Tool>;
 
-    async fn execute(&self, name: &str, arguments: &str) -> Result<String>;
+    async fn execute(&self, name: &str, arguments: &str) -> Result<ToolExecution>;
 }
 
 #[async_trait]
@@ -115,6 +143,10 @@ pub trait ToolHandler: Send + Sync {
     fn definition(&self) -> Tool;
 
     async fn execute(&self, arguments: &str) -> Result<String>;
+
+    async fn execute_typed(&self, arguments: &str) -> Result<ToolExecution> {
+        Ok(ToolExecution::text(self.execute(arguments).await?))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

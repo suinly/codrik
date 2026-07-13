@@ -10,7 +10,7 @@ use crate::llm::client::{
     is_run_cancelled_error,
 };
 use crate::memory::store::MemoryStore;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 pub struct Agent<L, M, T> {
     instructions: String,
@@ -59,7 +59,7 @@ where
                 _ = context.cancelled() => bail!(RUN_CANCELLED),
             };
 
-            if let Some(answer) = self.record_response(response, &mut activity).await? {
+            if let Some(answer) = self.record_response(response, &mut activity, None).await? {
                 return Ok(answer);
             }
         }
@@ -133,7 +133,7 @@ where
 
             if response.tool_calls.is_empty() {
                 let answer = response.content.clone();
-                self.record_response(response, activity).await?;
+                self.record_response(response, activity, Some(sink)).await?;
                 context.ensure_not_cancelled()?;
                 stream_events.commit_to(sink).await?;
                 return Ok(answer);
@@ -144,7 +144,7 @@ where
                     .on_activity(AgentActivityEvent::Description(response.content.clone()))
                     .await;
             }
-            self.record_response(response, activity).await?;
+            self.record_response(response, activity, Some(sink)).await?;
         }
     }
 
@@ -184,6 +184,7 @@ where
         &self,
         response: LlmResponse,
         activity: &mut dyn AgentActivitySink,
+        mut output: Option<&mut dyn LlmStreamSink>,
     ) -> Result<Option<String>> {
         if response.tool_calls.is_empty() {
             self.memory
@@ -206,30 +207,39 @@ where
                     name: tool_call.name.clone(),
                 })
                 .await;
-            let observation = match self
+            let (observation, succeeded) = match self
                 .tools
                 .execute(&tool_call.name, &tool_call.arguments)
                 .await
             {
-                Ok(result) => {
-                    activity
-                        .on_activity(AgentActivityEvent::ToolFinished {
-                            name: tool_call.name.clone(),
-                            succeeded: true,
-                        })
-                        .await;
-                    tool_observation::success(result)
+                Ok(execution) => {
+                    let delivery = async {
+                        for artifact in execution.artifacts {
+                            let sink = output.as_deref_mut().context(
+                                "file output is not configured for this agent execution",
+                            )?;
+                            match artifact {
+                                crate::agent::tool::ToolArtifact::File(file) => {
+                                    sink.on_event(LlmStreamEvent::FileReady(file)).await?;
+                                }
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    match delivery {
+                        Ok(()) => (tool_observation::success(execution.observation), true),
+                        Err(error) => (tool_observation::failure(&error), false),
+                    }
                 }
-                Err(error) => {
-                    activity
-                        .on_activity(AgentActivityEvent::ToolFinished {
-                            name: tool_call.name.clone(),
-                            succeeded: false,
-                        })
-                        .await;
-                    tool_observation::failure(&error)
-                }
+                Err(error) => (tool_observation::failure(&error), false),
             };
+            activity
+                .on_activity(AgentActivityEvent::ToolFinished {
+                    name: tool_call.name.clone(),
+                    succeeded,
+                })
+                .await;
 
             self.memory
                 .append(Message::tool_result(tool_call.id, observation))
@@ -295,7 +305,7 @@ mod tests {
         agent::{
             Agent,
             message::{Message, Role},
-            tool::{Tool, ToolExecutor},
+            tool::{Tool, ToolExecution, ToolExecutor},
         },
         llm::client::{
             AgentActivityEvent, AgentActivitySink, LlmClient, LlmRequest, LlmResponse,
@@ -468,7 +478,7 @@ mod tests {
             Vec::new()
         }
 
-        async fn execute(&self, _name: &str, _arguments: &str) -> Result<String> {
+        async fn execute(&self, _name: &str, _arguments: &str) -> Result<ToolExecution> {
             unreachable!("no tools are defined")
         }
     }
@@ -488,11 +498,11 @@ mod tests {
             vec![Tool::new("demo", "Demo tool", Default::default())]
         }
 
-        async fn execute(&self, name: &str, _arguments: &str) -> Result<String> {
+        async fn execute(&self, name: &str, _arguments: &str) -> Result<ToolExecution> {
             assert_eq!(name, "demo");
 
             match self.behavior {
-                ToolBehavior::Succeed(result) => Ok(result.to_string()),
+                ToolBehavior::Succeed(result) => Ok(ToolExecution::text(result)),
                 ToolBehavior::Fail(error) => bail!(error),
             }
         }

@@ -3,14 +3,16 @@ use std::{collections::HashSet, path::PathBuf};
 mod bash;
 mod bashkit;
 mod datetime;
+mod send_file;
 mod skills;
 mod web_browser;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use crate::agent::tool::{Tool, ToolExecutor, ToolExposure, ToolHandler};
+use crate::agent::tool::{Tool, ToolExecution, ToolExecutor, ToolExposure, ToolHandler};
 use crate::skills::SkillRegistry;
+pub use send_file::FileRoot;
 
 pub struct ToolRegistry {
     handlers: Vec<Box<dyn ToolHandler>>,
@@ -20,6 +22,7 @@ pub struct ToolRegistry {
 pub struct ToolRegistryConfig {
     pub bashkit_workspace: Option<PathBuf>,
     pub skill_roots: Vec<crate::skills::SkillRoot>,
+    pub file_roots: Vec<FileRoot>,
 }
 
 impl ToolRegistry {
@@ -32,6 +35,11 @@ impl ToolRegistry {
         Self {
             handlers: vec![
                 Box::new(datetime::DatetimeTool),
+                Box::new(send_file::SendFileTool::new(
+                    send_file::SendFileToolConfig {
+                        roots: config.file_roots,
+                    },
+                )),
                 Box::new(skills::SkillsListTool::new(skill_registry.clone())),
                 Box::new(skills::SkillsReadTool::new(skill_registry.clone())),
                 Box::new(skills::SkillsCreateTool::new(skill_registry.clone())),
@@ -74,12 +82,12 @@ impl ToolExecutor for ToolRegistry {
             .collect()
     }
 
-    async fn execute(&self, name: &str, arguments: &str) -> Result<String> {
+    async fn execute(&self, name: &str, arguments: &str) -> Result<ToolExecution> {
         let Some(handler) = self.handlers.iter().find(|handler| handler.name() == name) else {
             bail!("unknown tool: {name}");
         };
 
-        handler.execute(arguments).await
+        handler.execute_typed(arguments).await
     }
 }
 

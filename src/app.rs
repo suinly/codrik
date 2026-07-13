@@ -11,7 +11,7 @@ use crate::{
         store::MemoryStore,
     },
     skills::{Skill, SkillRegistry, SkillRoot, builtin_skill_root},
-    tools::{ToolRegistry, ToolRegistryConfig},
+    tools::{FileRoot, ToolRegistry, ToolRegistryConfig},
 };
 
 use std::path::PathBuf;
@@ -48,7 +48,10 @@ fn build_agent_with_file_memory(
     memory: FileMemoryStore,
 ) -> Agent<OpenAiClient, FileMemoryStore, ToolRegistry> {
     let llm = openai_client_with_attachments(&config, &memory);
-    let tool_config = default_tool_config().expect("failed to build default tool config");
+    let mut tool_config = default_tool_config().expect("failed to build default tool config");
+    tool_config
+        .file_roots
+        .push(FileRoot::new("session", memory.session_dir()));
     let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_config(tool_config);
 
@@ -137,7 +140,10 @@ fn build_agent_for_actor(
     actor: AuthorizedActor,
 ) -> Result<Agent<OpenAiClient, FileMemoryStore, ToolRegistry>> {
     let llm = openai_client_with_attachments(&config, &memory);
-    let tool_config = actor_tool_config(&actor)?;
+    let mut tool_config = actor_tool_config(&actor)?;
+    tool_config
+        .file_roots
+        .push(FileRoot::new("session", memory.session_dir()));
     let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
 
@@ -161,13 +167,16 @@ fn default_tool_config() -> Result<ToolRegistryConfig> {
     Ok(ToolRegistryConfig {
         bashkit_workspace: None,
         skill_roots: default_skill_roots()?,
+        file_roots: Vec::new(),
     })
 }
 
 fn actor_tool_config(actor: &AuthorizedActor) -> Result<ToolRegistryConfig> {
+    let workspace = actor_workspace_path(&actor.id)?;
     Ok(ToolRegistryConfig {
-        bashkit_workspace: Some(actor_workspace_path(&actor.id)?),
+        bashkit_workspace: Some(workspace.clone()),
         skill_roots: default_skill_roots()?,
+        file_roots: vec![FileRoot::new("workspace", workspace)],
     })
 }
 
@@ -344,6 +353,7 @@ mod tests {
         let tool_config = ToolRegistryConfig {
             bashkit_workspace: None,
             skill_roots: vec![SkillRoot::read_only(&root, "test")],
+            file_roots: Vec::new(),
         };
 
         let instructions = agent_instructions_for_tool_config(&tool_config);
@@ -361,6 +371,7 @@ mod tests {
         let tool_config = ToolRegistryConfig {
             bashkit_workspace: None,
             skill_roots: vec![SkillRoot::read_only(temp_root("empty")?, "test")],
+            file_roots: Vec::new(),
         };
 
         let instructions = agent_instructions_for_tool_config(&tool_config);

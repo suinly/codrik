@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::tool::FileArtifact;
 use crate::agent::{message::Message, tool::Tool};
 
 pub const RUN_CANCELLED: &str = "run cancelled";
@@ -103,6 +104,7 @@ pub struct LlmResponse {
 pub enum LlmStreamEvent {
     TextDelta(String),
     ToolCallDelta(LlmToolCallDelta),
+    FileReady(FileArtifact),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
