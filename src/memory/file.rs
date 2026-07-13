@@ -16,6 +16,8 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct FileMemoryStore {
+    legacy_path: PathBuf,
+    session_dir: PathBuf,
     path: PathBuf,
     write_lock: Arc<Mutex<()>>,
 }
@@ -28,26 +30,44 @@ impl FileMemoryStore {
             bail!("unsafe session id: {session_id}");
         }
 
+        let legacy_path = root.as_ref().join(format!("{session_id}.json"));
+        let session_dir = root.as_ref().join(session_id);
+
         Ok(Self {
-            path: root.as_ref().join(format!("{session_id}.json")),
+            path: session_dir.join("messages.json"),
+            legacy_path,
+            session_dir,
             write_lock: Arc::new(Mutex::new(())),
         })
     }
 
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
     async fn read_messages(&self) -> Result<Vec<Message>> {
-        if !fs::try_exists(&self.path)
+        let path = if fs::try_exists(&self.path)
             .await
             .with_context(|| format!("failed to inspect session file: {}", self.path.display()))?
         {
+            &self.path
+        } else if fs::try_exists(&self.legacy_path).await.with_context(|| {
+            format!(
+                "failed to inspect legacy session file: {}",
+                self.legacy_path.display()
+            )
+        })? {
+            &self.legacy_path
+        } else {
             return Ok(Vec::new());
-        }
+        };
 
-        let content = fs::read_to_string(&self.path)
+        let content = fs::read_to_string(path)
             .await
-            .with_context(|| format!("failed to read session file: {}", self.path.display()))?;
+            .with_context(|| format!("failed to read session file: {}", path.display()))?;
 
         let messages = serde_json::from_str::<Vec<SessionMessage>>(&content)
-            .with_context(|| format!("failed to parse session file: {}", self.path.display()))?;
+            .with_context(|| format!("failed to parse session file: {}", path.display()))?;
 
         Ok(messages.into_iter().map(Message::from).collect())
     }
@@ -67,9 +87,24 @@ impl FileMemoryStore {
         let content =
             serde_json::to_string_pretty(&messages).context("failed to serialize session")?;
 
-        fs::write(&self.path, content)
+        let temp_path = self.path.with_extension("json.tmp");
+        fs::write(&temp_path, content)
             .await
-            .with_context(|| format!("failed to write session file: {}", self.path.display()))
+            .with_context(|| format!("failed to write session file: {}", temp_path.display()))?;
+        fs::rename(&temp_path, &self.path)
+            .await
+            .with_context(|| format!("failed to replace session file: {}", self.path.display()))?;
+
+        if fs::try_exists(&self.legacy_path).await? {
+            fs::remove_file(&self.legacy_path).await.with_context(|| {
+                format!(
+                    "failed to remove legacy session file: {}",
+                    self.legacy_path.display()
+                )
+            })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -288,10 +323,12 @@ mod tests {
 
         assert_eq!(restored, vec![message]);
 
-        let content = fs::read_to_string(root.join("work.json")).await?;
+        let content = fs::read_to_string(root.join("work/messages.json")).await?;
         assert!(content.contains("\"role\": \"user\""));
         assert!(!content.contains("tool_calls"));
         assert!(!content.contains("tool_call_id"));
+        assert_eq!(memory.session_dir(), root.join("work"));
+        assert!(!fs::try_exists(root.join("work.json")).await?);
 
         fs::remove_dir_all(root).await.ok();
 
@@ -343,6 +380,40 @@ mod tests {
         let context = memory.load_context().await?;
 
         assert_eq!(context, vec![Message::user("legacy hello")]);
+
+        fs::remove_dir_all(root).await.ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_session_file_on_append() -> Result<()> {
+        let root = temp_session_root();
+        fs::create_dir_all(&root).await?;
+        let legacy_path = root.join("legacy.json");
+        fs::write(
+            &legacy_path,
+            r#"[
+  {
+    "role": "User",
+    "content": "legacy hello"
+  }
+]"#,
+        )
+        .await?;
+
+        let memory = FileMemoryStore::new(&root, "legacy")?;
+        memory.append(Message::assistant("new reply")).await?;
+
+        assert_eq!(
+            memory.load_context().await?,
+            vec![
+                Message::user("legacy hello"),
+                Message::assistant("new reply")
+            ]
+        );
+        assert!(fs::try_exists(root.join("legacy/messages.json")).await?);
+        assert!(!fs::try_exists(legacy_path).await?);
 
         fs::remove_dir_all(root).await.ok();
 
