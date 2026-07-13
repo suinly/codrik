@@ -8,6 +8,7 @@ anyhow = "1.0.102"
 async-openai = { version = "0.41.1", features = ["responses", "file"] }
 async-trait = "0.1.89"
 bashkit = { version = "0.12.0", features = ["realfs"] }
+base64 = "0.22"
 bytes = "1.11"
 futures-util = "0.3.31"
 infer = "0.19"

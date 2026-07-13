@@ -184,9 +184,11 @@ telegram:
   token: "..."
 ```
 
-The configured `base_url` must implement both the OpenAI Responses API and
-Files API. Uploaded provider files are cached per session and cleaned up when
-that inactive session is deleted.
+The configured `base_url` must implement the OpenAI Responses API. When the
+provider also implements the Files API, uploaded files are cached per session
+and cleaned up when the session is deleted. Providers without the Files API,
+such as Ollama, receive images as inline `data:` URLs; other file types fall
+back to metadata-only context.
 
 Update to the latest release:
 

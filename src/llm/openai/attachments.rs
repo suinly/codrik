@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, sync::atomic::Ordering};
 
 use anyhow::{Context, Result, bail};
 use async_openai::types::{
@@ -6,6 +6,7 @@ use async_openai::types::{
     files::{CreateFileRequest, FileInput, FilePurpose},
     responses::{ImageDetail, InputContent, InputFileContent, InputImageContent, InputTextContent},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use tokio::fs;
 
 use crate::{
@@ -19,6 +20,9 @@ use crate::{
 use super::OpenAiClient;
 
 const MAX_DOCUMENT_INPUT_BYTES: u64 = 50 * 1024 * 1024;
+pub(super) const FILES_API_UNKNOWN: u8 = 0;
+const FILES_API_SUPPORTED: u8 = 1;
+const FILES_API_UNAVAILABLE: u8 = 2;
 
 #[derive(Clone, Debug)]
 pub struct OpenAiAttachmentContext {
@@ -128,6 +132,9 @@ impl OpenAiClient {
             .attachment_context
             .as_ref()
             .context("file attachment requires a session attachment context")?;
+        if self.files_api_capability.load(Ordering::Relaxed) == FILES_API_UNAVAILABLE {
+            return self.resolve_without_files_api(file, kind, context).await;
+        }
         let purpose = match kind {
             ProviderAttachmentKind::Image => ProviderUploadPurpose::Vision,
             ProviderAttachmentKind::Document => ProviderUploadPurpose::UserData,
@@ -143,7 +150,7 @@ impl OpenAiClient {
             (record.file_id, true)
         } else {
             let path = safe_attachment_path(&context.session_dir, &file.relative_path).await?;
-            let uploaded = self
+            let uploaded = match self
                 .client
                 .files()
                 .create(CreateFileRequest {
@@ -156,7 +163,20 @@ impl OpenAiClient {
                     },
                     expires_after: None,
                 })
-                .await?;
+                .await
+            {
+                Ok(uploaded) => {
+                    self.files_api_capability
+                        .store(FILES_API_SUPPORTED, Ordering::Relaxed);
+                    uploaded
+                }
+                Err(error) if provider_has_no_files_api(&error.to_string()) => {
+                    self.files_api_capability
+                        .store(FILES_API_UNAVAILABLE, Ordering::Relaxed);
+                    return self.resolve_without_files_api(file, kind, context).await;
+                }
+                Err(error) => return Err(error.into()),
+            };
             context
                 .provider_files
                 .put(ProviderFileRecord {
@@ -188,6 +208,42 @@ impl OpenAiClient {
         })
     }
 
+    async fn resolve_without_files_api(
+        &self,
+        file: &Attachment,
+        kind: ProviderAttachmentKind,
+        context: &OpenAiAttachmentContext,
+    ) -> Result<ResolvedAttachment> {
+        let content = match kind {
+            ProviderAttachmentKind::Image => {
+                let path = safe_attachment_path(&context.session_dir, &file.relative_path).await?;
+                let bytes = fs::read(&path).await.with_context(|| {
+                    format!("failed to read image attachment: {}", path.display())
+                })?;
+                InputContent::InputImage(InputImageContent {
+                    detail: image_detail(context.image_detail),
+                    file_id: None,
+                    image_url: Some(format!(
+                        "data:{};base64,{}",
+                        file.media_type,
+                        STANDARD.encode(bytes)
+                    )),
+                })
+            }
+            ProviderAttachmentKind::Document | ProviderAttachmentKind::MetadataOnly => {
+                InputContent::InputText(InputTextContent {
+                    text: metadata_text(file),
+                })
+            }
+        };
+
+        Ok(ResolvedAttachment {
+            content,
+            cache_key: None,
+            reused_cache: false,
+        })
+    }
+
     pub(super) async fn evict_provider_files(&self, keys: &[ProviderFileKey]) -> Result<()> {
         let Some(context) = &self.attachment_context else {
             return Ok(());
@@ -197,6 +253,11 @@ impl OpenAiClient {
         }
         Ok(())
     }
+}
+
+pub(super) fn provider_has_no_files_api(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("404") && message.contains("not found")
 }
 
 fn image_detail(detail: ImageDetailConfig) -> ImageDetail {
@@ -232,9 +293,10 @@ async fn safe_attachment_path(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         collections::VecDeque,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::Ordering},
     };
 
     use anyhow::{Context, Result};
@@ -252,8 +314,8 @@ mod tests {
     };
 
     use super::{
-        OpenAiAttachmentContext, OpenAiClient, ProviderAttachmentKind, classify, metadata_text,
-        selected_document_ids,
+        FILES_API_UNAVAILABLE, OpenAiAttachmentContext, OpenAiClient, ProviderAttachmentKind,
+        classify, metadata_text, provider_has_no_files_api, selected_document_ids,
     };
 
     fn attachment(id: &str, media_type: &str, size_bytes: u64) -> Attachment {
@@ -303,6 +365,55 @@ mod tests {
         assert!(metadata.contains("application/x-tar"));
         assert!(metadata.contains("42 bytes"));
         assert!(metadata.contains("attachments/archive.bin"));
+    }
+
+    #[test]
+    fn recognizes_plain_text_files_api_404() {
+        assert!(provider_has_no_files_api(
+            "failed to deserialize api response: content:404 page not found"
+        ));
+        assert!(!provider_has_no_files_api("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_files_api_inlines_image_as_data_url() -> Result<()> {
+        let session_dir = std::env::temp_dir().join(format!(
+            "codrik-openai-inline-image-test-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&session_dir).await.ok();
+        fs::create_dir_all(session_dir.join("attachments")).await?;
+        fs::write(session_dir.join("attachments/screen.png"), b"png!").await?;
+        let file = Attachment::new(
+            "image",
+            "attachments/screen.png",
+            "screen.png",
+            "image/png",
+            4,
+            "image-sha",
+        );
+        let client = OpenAiClient::new("test", "key", "http://127.0.0.1:1")
+            .with_attachment_context(OpenAiAttachmentContext {
+                provider_files: ProviderFileStore::new(&session_dir),
+                session_dir: session_dir.clone(),
+                image_detail: ImageDetailConfig::Auto,
+            });
+        client
+            .files_api_capability
+            .store(FILES_API_UNAVAILABLE, Ordering::Relaxed);
+
+        let resolved = client.resolve_attachment(&file, &HashSet::new()).await?;
+
+        assert_eq!(
+            serde_json::to_value(resolved.content)?,
+            serde_json::json!({
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": "data:image/png;base64,cG5nIQ=="
+            })
+        );
+        fs::remove_dir_all(session_dir).await.ok();
+        Ok(())
     }
 
     #[tokio::test]

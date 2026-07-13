@@ -25,11 +25,13 @@ use async_openai::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::sync::atomic::AtomicU8;
 
 pub struct OpenAiClient {
     model: String,
     client: Client<OpenAIConfig>,
     attachment_context: Option<OpenAiAttachmentContext>,
+    files_api_capability: AtomicU8,
 }
 
 impl OpenAiClient {
@@ -48,6 +50,7 @@ impl OpenAiClient {
             model: model.into(),
             client,
             attachment_context: None,
+            files_api_capability: AtomicU8::new(attachments::FILES_API_UNKNOWN),
         }
     }
 

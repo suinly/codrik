@@ -633,6 +633,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "async-trait",
+ "base64",
  "bashkit",
  "bytes",
  "futures-util",
