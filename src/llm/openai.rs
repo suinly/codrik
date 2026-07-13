@@ -356,11 +356,9 @@ impl StreamAccumulator {
         sink: &mut dyn LlmStreamSink,
     ) -> Result<()> {
         match event {
-            ResponseStreamEvent::ResponseOutputTextDelta(event) => {
-                if !event.delta.is_empty() {
-                    sink.on_event(LlmStreamEvent::TextDelta(event.delta))
-                        .await?;
-                }
+            ResponseStreamEvent::ResponseOutputTextDelta(event) if !event.delta.is_empty() => {
+                sink.on_event(LlmStreamEvent::TextDelta(event.delta))
+                    .await?;
             }
             ResponseStreamEvent::ResponseOutputItemAdded(event) => {
                 if let OutputItem::FunctionCall(function_call) = event.item {
@@ -373,16 +371,16 @@ impl StreamAccumulator {
                     .await?;
                 }
             }
-            ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event) => {
-                if !event.delta.is_empty() {
-                    sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
-                        index: event.output_index,
-                        id: None,
-                        name: None,
-                        arguments: Some(event.delta),
-                    }))
-                    .await?;
-                }
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event)
+                if !event.delta.is_empty() =>
+            {
+                sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
+                    index: event.output_index,
+                    id: None,
+                    name: None,
+                    arguments: Some(event.delta),
+                }))
+                .await?;
             }
             ResponseStreamEvent::ResponseCompleted(event) => {
                 self.completed = Some(event.response);

@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn selects_newest_documents_within_fifty_megabytes() {
-        let parts = vec![
+        let parts = [
             MessagePart::Attachment(attachment("old", "application/pdf", 30 * 1024 * 1024)),
             MessagePart::Attachment(attachment("new", "application/pdf", 30 * 1024 * 1024)),
         ];

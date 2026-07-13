@@ -52,8 +52,10 @@ async fn delete_with(
         BeginDeleteResult::Active => return Ok(SessionDeletionOutcome::Active),
         BeginDeleteResult::Ready { session_dir } => session_dir,
     };
-    let records = ProviderFileStore::new(&session_dir).entries().await?;
-    let mut failed = 0;
+    let (records, mut failed) = match ProviderFileStore::new(&session_dir).entries().await {
+        Ok(records) => (records, 0),
+        Err(_) => (Vec::new(), 1),
+    };
     let mut seen = HashSet::new();
     for file_id in records.into_iter().map(|record| record.file_id) {
         if seen.insert(file_id.clone()) && deleter.delete_file(&file_id).await.is_err() {
