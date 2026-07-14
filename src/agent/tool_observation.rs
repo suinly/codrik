@@ -13,7 +13,7 @@ struct FailureObservation {
     error: String,
 }
 
-pub(super) fn success(result: impl Into<String>) -> String {
+pub(crate) fn success(result: impl Into<String>) -> String {
     serde_json::to_string(&SuccessObservation {
         ok: true,
         result: result.into(),
@@ -21,7 +21,7 @@ pub(super) fn success(result: impl Into<String>) -> String {
     .expect("tool success observation should serialize")
 }
 
-pub(super) fn failure(error: &Error) -> String {
+pub(crate) fn failure(error: &Error) -> String {
     serde_json::to_string(&FailureObservation {
         ok: false,
         error: error.to_string(),

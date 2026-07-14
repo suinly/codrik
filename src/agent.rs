@@ -1,6 +1,6 @@
 pub mod message;
 pub mod tool;
-mod tool_observation;
+pub(crate) mod tool_observation;
 
 use crate::agent::message::{Message, UserInput};
 use crate::agent::tool::{ToolCallContext, ToolExecutor};

@@ -11,8 +11,8 @@ use crate::{
         sqlite::{SqliteRuntimeStore, dispatch::ensure_current_lease, map_call_error},
         store::{
             AttachedRun, AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore,
-            FinalizeOutcome, FinalizeRun, NewOutboxIntent, NewToolAttempt, ToolAttempt,
-            ToolAttemptStore,
+            ContextStore, FinalizeOutcome, FinalizeRun, NewOutboxIntent, NewToolAttempt,
+            ToolAttempt, ToolAttemptStore,
         },
     },
 };
@@ -85,6 +85,103 @@ impl CheckpointStore for SqliteRuntimeStore {
                 )?;
                 transaction.commit()?;
                 Ok(FinalizeOutcome::Completed)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn cancel_run(
+        &self,
+        run: &AttachedRun,
+        control: &crate::runtime::store::ControlEvent,
+        now: Timestamp,
+    ) -> Result<()> {
+        let run = run.clone();
+        let control = control.clone();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                validate_run(&transaction, &run, now)?;
+                let changed = transaction.execute(
+                    "UPDATE events SET state = 'cancelled', updated_at = ?3
+                     WHERE id = ?1 AND actor_id = ?2 AND state = 'pending'
+                       AND kind = 'cancel_requested'",
+                    params![
+                        control.event_id.as_str(),
+                        run.lease.actor_id.as_str(),
+                        now.0
+                    ],
+                )?;
+                if changed != 1 {
+                    bail!("cancellation event is no longer pending");
+                }
+                transaction.execute(
+                    "UPDATE events SET state = 'cancelled', updated_at = ?2
+                     WHERE id IN (SELECT event_id FROM run_events WHERE run_id = ?1)
+                       AND state = 'processing'",
+                    params![run.run_id.as_str(), now.0],
+                )?;
+                transaction.execute(
+                    "UPDATE runs SET state = 'cancelled', updated_at = ?2 WHERE id = ?1",
+                    params![run.run_id.as_str(), now.0],
+                )?;
+                transaction.execute(
+                    "UPDATE work_items SET state = 'cancelled', updated_at = ?2 WHERE id = ?1",
+                    params![run.work_item_id.as_str(), now.0],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+}
+
+#[async_trait]
+impl ContextStore for SqliteRuntimeStore {
+    async fn load_recent_context(
+        &self,
+        actor: &crate::runtime::model::ActorId,
+        audience: &Audience,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let actor = actor.to_string();
+        let (audience_kind, audience_address) = encode_audience(audience)?;
+        self.connection
+            .call(move |connection| -> Result<Vec<Message>> {
+                let predicate = match audience_kind.as_str() {
+                    "actor_private" => "audience_kind IN ('actor_private', 'shareable')",
+                    "shareable" => "audience_kind = 'shareable'",
+                    "conversation_scoped" => {
+                        "(audience_kind = 'shareable' OR (audience_kind = 'conversation_scoped' AND audience_address = ?3))"
+                    }
+                    _ => unreachable!(),
+                };
+                let sql = format!(
+                    "SELECT message_json FROM recent_messages
+                     WHERE actor_id = ?1 AND {predicate}
+                     ORDER BY id DESC LIMIT ?2"
+                );
+                let mut statement = connection.prepare(&sql)?;
+                let rows = if audience_kind == "conversation_scoped" {
+                    statement
+                        .query_map(params![actor, limit as i64, audience_address], |row| {
+                            row.get::<_, String>(0)
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                } else {
+                    statement
+                        .query_map(params![actor, limit as i64], |row| {
+                            row.get::<_, String>(0)
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                rows.into_iter()
+                    .rev()
+                    .map(|json| Ok(serde_json::from_str(&json)?))
+                    .collect()
             })
             .await
             .map_err(map_call_error)
@@ -640,6 +737,41 @@ impl SqliteRuntimeStore {
             .await
             .map_err(|error| anyhow!("failed to inspect work item: {error}"))
     }
+
+    async fn seed_context_message(
+        &self,
+        run: &AttachedRun,
+        audience_kind: &str,
+        audience_address: Option<&str>,
+        text: &str,
+    ) -> Result<()> {
+        let actor_id = run.lease.actor_id.to_string();
+        let work_item_id = run.work_item_id.to_string();
+        let run_id = run.run_id.to_string();
+        let audience_kind = audience_kind.to_string();
+        let audience_address = audience_address.map(str::to_string);
+        let message_json = serde_json::to_string(&Message::assistant(text))?;
+        self.connection
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute(
+                    "INSERT INTO recent_messages(
+                        actor_id, work_item_id, run_id, audience_kind, audience_address,
+                        message_json, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                    params![
+                        actor_id,
+                        work_item_id,
+                        run_id,
+                        audience_kind,
+                        audience_address,
+                        message_json,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| anyhow!("failed to seed context: {error}"))
+    }
 }
 
 #[cfg(test)]
@@ -652,10 +784,10 @@ mod tests {
             model::{Audience, OutboxId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore, DispatchStore,
-                FinalizeOutcome, FinalizeRun, IngressStore, NewInboundEvent, NewOutboxIntent,
-                NewToolAttempt, OutboxPayload, OutboxStore, RuntimeAuthorizationStore, StaleLease,
-                ToolAttemptStore,
+                AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore, ContextStore,
+                DispatchStore, FinalizeOutcome, FinalizeRun, IngressStore, NewInboundEvent,
+                NewOutboxIntent, NewToolAttempt, OutboxPayload, OutboxStore,
+                RuntimeAuthorizationStore, StaleLease, ToolAttemptStore,
             },
         },
     };
@@ -826,6 +958,51 @@ mod tests {
         assert!(store.pending_outbox().await.unwrap().is_empty());
         assert!(!store.source_events_completed(&run).await.unwrap());
         store.release_lease(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recent_context_respects_audience_visibility() {
+        let (store, run) = store_with_run().await;
+        store
+            .seed_context_message(&run, "actor_private", None, "private")
+            .await
+            .unwrap();
+        store
+            .seed_context_message(&run, "shareable", None, "shared")
+            .await
+            .unwrap();
+        store
+            .seed_context_message(
+                &run,
+                "conversation_scoped",
+                Some("telegram-group:7"),
+                "group",
+            )
+            .await
+            .unwrap();
+
+        let private = store
+            .load_recent_context(&run.lease.actor_id, &Audience::ActorPrivate, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            private.iter().map(Message::text).collect::<Vec<_>>(),
+            ["private", "shared"]
+        );
+        let group = store
+            .load_recent_context(
+                &run.lease.actor_id,
+                &Audience::ConversationScoped {
+                    address: "telegram-group:7".into(),
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            group.iter().map(Message::text).collect::<Vec<_>>(),
+            ["shared", "group"]
+        );
     }
 
     #[tokio::test]

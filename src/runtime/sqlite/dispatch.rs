@@ -233,6 +233,13 @@ impl DispatchStore for SqliteRuntimeStore {
                         let mut statement = transaction.prepare(
                             "SELECT id FROM events
                              WHERE actor_id = ?1 AND work_item_id = ?2 AND state = 'pending'
+                               AND kind != 'cancel_requested'
+                               AND mailbox_sequence < COALESCE((
+                                  SELECT MIN(control.mailbox_sequence) FROM events AS control
+                                  WHERE control.actor_id = events.actor_id
+                                    AND control.state = 'pending'
+                                    AND control.kind = 'cancel_requested'
+                               ), 9223372036854775807)
                              ORDER BY CASE kind
                                 WHEN 'cancel_requested' THEN 0
                                 WHEN 'user_message' THEN 1
@@ -283,6 +290,7 @@ impl DispatchStore for SqliteRuntimeStore {
                     audience: decode_audience(&audience_kind, audience_address)?,
                     messages: event_rows
                         .into_iter()
+                        .filter(|event| !event.incorporated)
                         .map(|event| event_message(&event.payload_json))
                         .collect::<Result<Vec<_>>>()?,
                 }))
@@ -368,6 +376,7 @@ struct StoredEvent {
     id: String,
     sequence: i64,
     payload_json: String,
+    incorporated: bool,
 }
 
 pub(super) fn ensure_current_lease(
@@ -410,7 +419,7 @@ fn load_run_events(
     run_id: &str,
 ) -> tokio_rusqlite::rusqlite::Result<Vec<StoredEvent>> {
     let mut statement = transaction.prepare(
-        "SELECT events.id, events.mailbox_sequence, events.payload_json
+        "SELECT events.id, events.mailbox_sequence, events.payload_json, run_events.incorporated
          FROM events
          JOIN run_events ON run_events.event_id = events.id
          WHERE run_events.run_id = ?1
@@ -422,6 +431,7 @@ fn load_run_events(
                 id: row.get(0)?,
                 sequence: row.get(1)?,
                 payload_json: row.get(2)?,
+                incorporated: row.get(3)?,
             })
         })?
         .collect()

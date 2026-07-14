@@ -45,6 +45,47 @@ impl Timestamp {
     }
 }
 
+pub trait Clock: Clone + Send + Sync + 'static {
+    fn now(&self) -> Timestamp;
+}
+
+#[derive(Clone, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_millis() as i64,
+        )
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicI64>);
+
+#[cfg(test)]
+impl ManualClock {
+    pub fn new(now: i64) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(now)))
+    }
+
+    pub fn advance(&self, millis: i64) {
+        self.0
+            .fetch_add(millis, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Clock for ManualClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Audience {
     ActorPrivate,

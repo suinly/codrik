@@ -222,6 +222,12 @@ pub enum FinalizeOutcome {
 pub trait CheckpointStore: Send + Sync {
     async fn checkpoint_run(&self, command: CheckpointRun, now: Timestamp) -> Result<()>;
     async fn finalize_run(&self, command: FinalizeRun, now: Timestamp) -> Result<FinalizeOutcome>;
+    async fn cancel_run(
+        &self,
+        run: &AttachedRun,
+        control: &ControlEvent,
+        now: Timestamp,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -316,4 +322,29 @@ pub trait ToolAttemptStore: Send + Sync {
         now: Timestamp,
     ) -> Result<()>;
     async fn unresolved_attempts(&self, run: &AttachedRun) -> Result<Vec<ToolAttempt>>;
+}
+
+#[async_trait]
+pub trait ContextStore: Send + Sync {
+    async fn load_recent_context(
+        &self,
+        actor: &ActorId,
+        audience: &Audience,
+        limit: usize,
+    ) -> Result<Vec<Message>>;
+}
+
+pub trait RuntimeStore:
+    DispatchStore + CheckpointStore + OutboxStore + ControlStore + ToolAttemptStore + ContextStore
+{
+}
+
+impl<T> RuntimeStore for T where
+    T: DispatchStore
+        + CheckpointStore
+        + OutboxStore
+        + ControlStore
+        + ToolAttemptStore
+        + ContextStore
+{
 }
