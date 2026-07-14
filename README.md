@@ -3,6 +3,14 @@
 codrik is a small Rust agent runtime that runs user turns through an LLM,
 optional tools, and session memory.
 
+## Development status
+
+The persistent runtime is being delivered in vertical slices. The durable
+local kernel stores actor events, fenced checkpoints, tool attempts, recent
+context, and outbox intents in SQLite. It is internal until `codrik serve`
+and a webhook gateway are available; existing CLI and Telegram commands keep
+their legacy behavior in the meantime.
+
 ## Installation
 
 Install the latest release on Linux or macOS:
