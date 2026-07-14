@@ -191,6 +191,10 @@ impl DispatchStore for SqliteRuntimeStore {
                                  FROM events
                                  JOIN work_items ON work_items.id = events.work_item_id
                                  WHERE events.actor_id = ?1 AND events.state = 'pending'
+                                   AND (
+                                      work_items.cancellation_requested_at IS NULL
+                                      OR events.kind = 'cancel_requested'
+                                   )
                                  ORDER BY CASE events.kind
                                     WHEN 'cancel_requested' THEN 0
                                     WHEN 'user_message' THEN 1
@@ -234,6 +238,11 @@ impl DispatchStore for SqliteRuntimeStore {
                             "SELECT id FROM events
                              WHERE actor_id = ?1 AND work_item_id = ?2 AND state = 'pending'
                                AND kind != 'cancel_requested'
+                               AND EXISTS (
+                                  SELECT 1 FROM work_items
+                                  WHERE work_items.id = events.work_item_id
+                                    AND work_items.cancellation_requested_at IS NULL
+                               )
                                AND mailbox_sequence < COALESCE((
                                   SELECT MIN(control.mailbox_sequence) FROM events AS control
                                   WHERE control.actor_id = events.actor_id
@@ -507,10 +516,11 @@ mod tests {
     use crate::{
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         runtime::{
-            model::{Audience, Timestamp},
+            model::{ActorId, Audience, CancelId, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                DispatchStore, IngressStore, NewInboundEvent, RuntimeAuthorizationStore, StaleLease,
+                DispatchStore, IngressStore, LocalCancel, LocalIngressStore, LocalSubmission,
+                NewInboundEvent, RuntimeAuthorizationStore, StaleLease,
             },
         },
     };
@@ -712,5 +722,75 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_marker_blocks_ordinary_attachment_but_control_wakes_run() {
+        use crate::runtime::store::{ControlStore, LocalSubmitOutcome};
+
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: "actor:local:owner".into(),
+                        enabled: true,
+                        tools: vec!["*".into()],
+                        identities: vec![],
+                    }],
+                },
+                Timestamp(0),
+            )
+            .await
+            .unwrap();
+        let actor = ActorId::from_string("actor:local:owner");
+        let request = RequestId::parse("0190f2ef-0000-7000-8000-000000000051").unwrap();
+        assert!(matches!(
+            store
+                .submit_for_actor(
+                    &actor,
+                    LocalSubmission {
+                        request_id: request.clone(),
+                        text: "must not attach".into(),
+                        prompt_sha256: "a".repeat(64),
+                    },
+                    Timestamp(1),
+                )
+                .await
+                .unwrap(),
+            LocalSubmitOutcome::Accepted { .. }
+        ));
+        store
+            .cancel_for_actor(
+                &actor,
+                LocalCancel {
+                    cancel_id: CancelId::parse("0190f2ef-0000-7000-8000-000000000052").unwrap(),
+                    request_id: request,
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(20))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(run.source_event_ids.is_empty());
+        assert!(run.messages.is_empty());
+        assert!(
+            store
+                .newer_control_event(&lease, run.observed_sequence, Timestamp(12))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

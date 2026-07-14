@@ -108,6 +108,72 @@ pub trait IngressStore: Send + Sync {
     async fn ingest(&self, event: NewInboundEvent, now: Timestamp) -> Result<IngressOutcome>;
 }
 
+#[derive(Clone, Debug)]
+pub struct LocalSubmission {
+    pub request_id: RequestId,
+    pub text: String,
+    pub prompt_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCancel {
+    pub cancel_id: CancelId,
+    pub request_id: RequestId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalSubmitOutcome {
+    Accepted {
+        event_id: EventId,
+        work_item_id: WorkItemId,
+        sequence: i64,
+    },
+    Duplicate {
+        event_id: EventId,
+        work_item_id: WorkItemId,
+        sequence: i64,
+    },
+    Conflict,
+    ActorUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelOutcome {
+    pub cancel_id: CancelId,
+    pub affected_request_ids: Vec<RequestId>,
+    pub already_terminal: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRequestRecord {
+    pub request_id: RequestId,
+    pub actor_id: ActorId,
+    pub work_item_id: WorkItemId,
+    pub state: LocalRequestState,
+    pub result_bundle_id: Option<BundleId>,
+}
+
+#[async_trait]
+pub trait LocalIngressStore: Send + Sync {
+    async fn submit_for_actor(
+        &self,
+        actor: &ActorId,
+        command: LocalSubmission,
+        now: Timestamp,
+    ) -> Result<LocalSubmitOutcome>;
+
+    async fn cancel_for_actor(
+        &self,
+        actor: &ActorId,
+        command: LocalCancel,
+        now: Timestamp,
+    ) -> Result<CancelOutcome>;
+
+    async fn resolve_local_request(&self, id: &RequestId) -> Result<Option<LocalRequestRecord>>;
+
+    async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorLease {
     pub actor_id: ActorId,

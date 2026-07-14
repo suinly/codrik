@@ -9,6 +9,7 @@ use tokio_rusqlite::rusqlite::TransactionBehavior;
 mod checkpoint;
 mod dispatch;
 mod ingress;
+mod local_ingress;
 mod outbox;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");

@@ -163,12 +163,7 @@ impl IngressStore for SqliteRuntimeStore {
                            AND audience_kind = ?2
                            AND audience_address IS ?3
                            AND state IN ('ready', 'waiting')
-                           AND NOT EXISTS (
-                              SELECT 1 FROM events
-                              WHERE events.work_item_id = work_items.id
-                                AND events.state = 'pending'
-                                AND events.kind = 'cancel_requested'
-                           )
+                           AND cancellation_requested_at IS NULL
                          ORDER BY updated_at DESC, id ASC
                          LIMIT 1",
                         params![actor_id, audience_kind, audience_address],
