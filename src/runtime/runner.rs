@@ -72,28 +72,14 @@ where
     C: Clock,
 {
     pub fn new(
-        store: S,
         llm: L,
         tools: T,
-        clock: C,
         signals: ActorSignals,
         limits: RunnerLimits,
+        artifacts: ArtifactManager<S, C>,
     ) -> Self {
-        let artifact_root =
-            std::env::temp_dir().join(format!("codrik-runtime-artifacts-{}", uuid::Uuid::new_v4()));
-        Self::with_artifact_root(store, llm, tools, clock, signals, limits, artifact_root)
-    }
-
-    pub fn with_artifact_root(
-        store: S,
-        llm: L,
-        tools: T,
-        clock: C,
-        signals: ActorSignals,
-        limits: RunnerLimits,
-        artifact_root: impl Into<std::path::PathBuf>,
-    ) -> Self {
-        let artifacts = ArtifactManager::new(artifact_root, store.clone(), clock.clone());
+        let store = artifacts.store();
+        let clock = artifacts.clock();
         Self {
             store,
             llm,
@@ -476,6 +462,7 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
+    use sha2::Digest;
     use tokio::sync::{Mutex, Notify};
 
     use crate::{
@@ -486,6 +473,7 @@ mod tests {
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::{LlmClient, LlmRequest, LlmResponse, LlmToolCall, RunContext},
         runtime::{
+            artifacts::{ArtifactManager, TestPause},
             model::{ActorId, AttemptId, Audience, EventKind, ManualClock, Timestamp},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
             signals::ActorSignals,
@@ -496,6 +484,17 @@ mod tests {
             },
         },
     };
+
+    fn test_artifacts(
+        store: &SqliteRuntimeStore,
+        clock: ManualClock,
+    ) -> ArtifactManager<SqliteRuntimeStore, ManualClock> {
+        ArtifactManager::new(
+            std::env::temp_dir().join(format!("codrik-runner-test-{}", uuid::Uuid::new_v4())),
+            store.clone(),
+            clock,
+        )
+    }
 
     #[derive(Clone)]
     struct FinalLlm;
@@ -706,12 +705,11 @@ mod tests {
             .await
             .unwrap();
         let runner = ActorRunner::new(
-            store.clone(),
             FinalLlm,
             NoTools,
-            ManualClock::new(1_000),
             ActorSignals::default(),
             RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
         );
 
         assert_eq!(
@@ -750,12 +748,11 @@ mod tests {
         let tools = RecordingTools::default();
         let attempts = tools.attempts.clone();
         let runner = ActorRunner::new(
-            store.clone(),
             llm,
             tools,
-            ManualClock::new(1_000),
             ActorSignals::default(),
             RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
         );
 
         assert_eq!(
@@ -767,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_file_tool_recovers_only_managed_path_and_hash() {
+    async fn composed_runner_and_gc_share_canonical_path_exclusion() {
         let store = store_with_text().await;
         let root =
             std::env::temp_dir().join(format!("codrik-runner-artifact-{}", uuid::Uuid::new_v4()));
@@ -776,6 +773,14 @@ mod tests {
         tokio::fs::create_dir_all(&managed).await.unwrap();
         let managed = tokio::fs::canonicalize(managed).await.unwrap();
         tokio::fs::write(&source, b"runner artifact").await.unwrap();
+        let content_hash = format!("{:x}", sha2::Sha256::digest(b"runner artifact"));
+        let actor_hash = format!("{:x}", sha2::Sha256::digest(b"actor:local:1"));
+        let actor_dir = managed.join(actor_hash);
+        tokio::fs::create_dir_all(&actor_dir).await.unwrap();
+        let canonical = actor_dir.join(&content_hash);
+        tokio::fs::write(&canonical, b"runner artifact")
+            .await
+            .unwrap();
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let llm = ScriptedLlm {
             responses: Arc::new(Mutex::new(VecDeque::from([
@@ -793,23 +798,30 @@ mod tests {
                 },
             ]))),
         };
-        let runner = ActorRunner::with_artifact_root(
-            store.clone(),
+        let pause = Arc::new(TestPause::new());
+        let artifacts = ArtifactManager::new(&managed, store.clone(), ManualClock::new(1_000))
+            .with_test_gc_pause(pause.clone());
+        let gc_artifacts = artifacts.clone();
+        let gc =
+            tokio::spawn(async move { gc_artifacts.collect_garbage(Timestamp(i64::MAX)).await });
+        pause.wait_until_entered().await;
+        let runner = ActorRunner::new(
             llm,
             ArtifactTools {
                 source: source.clone(),
                 attempts: attempts.clone(),
             },
-            ManualClock::new(1_000),
             ActorSignals::default(),
             RunnerLimits::default(),
-            &managed,
+            artifacts,
         );
 
         assert_eq!(
             runner.run_once("worker").await.unwrap(),
             RunOnceOutcome::Completed
         );
+        pause.resume();
+        gc.await.unwrap().unwrap();
         let id = AttemptId::from_string(attempts.lock().await[0].clone());
         let AttemptRecovery::Terminal(AttemptOutcome::Succeeded { execution }) =
             store.recover_attempt(&id).await.unwrap()
@@ -820,6 +832,7 @@ mod tests {
         assert!(execution.artifacts[0].managed_path.starts_with(&managed));
         assert_ne!(execution.artifacts[0].managed_path, source);
         assert_eq!(execution.artifacts[0].sha256.len(), 64);
+        assert_eq!(execution.artifacts[0].sha256, content_hash);
         assert_eq!(
             tokio::fs::read(&execution.artifacts[0].managed_path)
                 .await
@@ -834,15 +847,14 @@ mod tests {
         let store = store_with_text().await;
         let calls = Arc::new(AtomicUsize::new(0));
         let runner = ActorRunner::new(
-            store.clone(),
             InjectingLlm {
                 store: store.clone(),
                 calls: calls.clone(),
             },
             NoTools,
-            ManualClock::new(1_000),
             ActorSignals::default(),
             RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
         );
 
         assert_eq!(
@@ -864,14 +876,13 @@ mod tests {
         let signals = ActorSignals::default();
         let started = Arc::new(Notify::new());
         let runner = ActorRunner::new(
-            store.clone(),
             BlockingLlm {
                 started: started.clone(),
             },
             NoTools,
-            ManualClock::new(1_000),
             signals.clone(),
             RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
         );
         let task = tokio::spawn(async move { runner.run_once("worker").await });
         started.notified().await;
@@ -900,12 +911,11 @@ mod tests {
         assert_eq!(task.await.unwrap().unwrap(), RunOnceOutcome::Cancelled);
         assert!(store.outbox_intents().await.unwrap().is_empty());
         let recovery = ActorRunner::new(
-            store,
             FinalLlm,
             NoTools,
-            ManualClock::new(1_001),
             signals,
             RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_001)),
         );
         assert_eq!(
             recovery.run_once("worker-2").await.unwrap(),
@@ -931,14 +941,13 @@ mod tests {
             ..RunnerLimits::default()
         };
         let runner = ActorRunner::new(
-            store.clone(),
             ScriptedLlm {
                 responses: Arc::new(Mutex::new(responses)),
             },
             RecordingTools::default(),
-            ManualClock::new(1_000),
             ActorSignals::default(),
             limits,
+            test_artifacts(&store, ManualClock::new(1_000)),
         );
 
         assert_eq!(

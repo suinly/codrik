@@ -220,6 +220,26 @@ impl ArtifactStore for SqliteRuntimeStore {
             .map_err(map_call_error)
     }
 
+    async fn renew_gc_claim(
+        &self,
+        artifact: &ExpiredArtifact,
+        now: Timestamp,
+        until: Timestamp,
+    ) -> Result<bool> {
+        let artifact = artifact.clone();
+        self.connection
+            .call(move |connection| -> Result<bool> {
+                Ok(connection.execute(
+                    "UPDATE artifacts SET staging_expires_at = ?3, updated_at = ?2
+                     WHERE id = ?1 AND state = 'staging' AND staging_owner = ?4
+                       AND staging_expires_at >= ?2",
+                    params![artifact.id.as_str(), now.0, until.0, artifact.owner],
+                )? == 1)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
     async fn artifact_path_exists(&self, path: &std::path::Path) -> Result<bool> {
         let path = path.to_string_lossy().into_owned();
         self.connection

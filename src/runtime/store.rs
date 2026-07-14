@@ -83,6 +83,12 @@ pub trait ArtifactStore: Send + Sync {
         now: Timestamp,
         limit: usize,
     ) -> Result<Vec<ExpiredArtifact>>;
+    async fn renew_gc_claim(
+        &self,
+        artifact: &ExpiredArtifact,
+        now: Timestamp,
+        until: Timestamp,
+    ) -> Result<bool>;
     async fn complete_claimed_staging(&self, artifact: &ExpiredArtifact) -> Result<bool>;
     async fn artifact_path_exists(&self, path: &std::path::Path) -> Result<bool>;
     async fn referenced_artifact(

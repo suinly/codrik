@@ -111,6 +111,7 @@ mod tests {
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::{LlmClient, LlmRequest, LlmResponse, RunContext},
         runtime::{
+            artifacts::ArtifactManager,
             model::{ActorId, AttemptId, ManualClock, Timestamp},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
             service::LocalKernel,
@@ -122,6 +123,17 @@ mod tests {
             },
         },
     };
+
+    fn test_artifacts(
+        store: &SqliteRuntimeStore,
+        clock: ManualClock,
+    ) -> ArtifactManager<SqliteRuntimeStore, ManualClock> {
+        ArtifactManager::new(
+            std::env::temp_dir().join(format!("codrik-service-test-{}", uuid::Uuid::new_v4())),
+            store.clone(),
+            clock,
+        )
+    }
 
     #[derive(Clone)]
     struct FinalLlm;
@@ -192,12 +204,11 @@ mod tests {
             .unwrap();
         let signals = ActorSignals::default();
         let runner = ActorRunner::new(
-            store.clone(),
             FinalLlm,
             NoTools,
-            ManualClock::new(1_000),
             signals.clone(),
             RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
         );
         let kernel = LocalKernel::new(
             store,
@@ -271,12 +282,11 @@ mod tests {
 
         let reopened = SqliteRuntimeStore::open(&path).await.unwrap();
         let runner = ActorRunner::new(
-            reopened.clone(),
             FinalLlm,
             NoTools,
-            ManualClock::new(1_000),
             ActorSignals::default(),
             RunnerLimits::default(),
+            test_artifacts(&reopened, ManualClock::new(1_000)),
         );
         assert_eq!(
             runner.run_once("recovery-worker").await.unwrap(),
@@ -290,12 +300,11 @@ mod tests {
         drop(reopened);
         let after_commit = SqliteRuntimeStore::open(&path).await.unwrap();
         let after_commit_runner = ActorRunner::new(
-            after_commit.clone(),
             FinalLlm,
             NoTools,
-            ManualClock::new(2_000),
             ActorSignals::default(),
             RunnerLimits::default(),
+            test_artifacts(&after_commit, ManualClock::new(2_000)),
         );
         assert_eq!(
             after_commit_runner
@@ -365,12 +374,11 @@ mod tests {
 
         let reopened = SqliteRuntimeStore::open(&path).await.unwrap();
         let runner = ActorRunner::new(
-            reopened.clone(),
             FinalLlm,
             NoTools,
-            ManualClock::new(1_000),
             ActorSignals::default(),
             RunnerLimits::default(),
+            test_artifacts(&reopened, ManualClock::new(1_000)),
         );
         assert_eq!(
             runner.run_once("recovery-worker").await.unwrap(),

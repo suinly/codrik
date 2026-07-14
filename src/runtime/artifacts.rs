@@ -49,12 +49,34 @@ pub struct ArtifactManager<S, C> {
     test_copy_failure: bool,
     #[cfg(test)]
     test_gc_pause: Option<Arc<TestPause>>,
+    #[cfg(test)]
+    test_claim_pause: Option<Arc<TestPause>>,
+    #[cfg(test)]
+    test_after_claim_sync_pause: Option<Arc<TestPause>>,
 }
 
 #[cfg(test)]
-struct TestPause {
+pub(crate) struct TestPause {
     entered: tokio::sync::Notify,
     resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl TestPause {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn resume(&self) {
+        self.resume.notify_one();
+    }
 }
 
 struct PreparedArtifact {
@@ -80,7 +102,19 @@ where
             test_copy_failure: false,
             #[cfg(test)]
             test_gc_pause: None,
+            #[cfg(test)]
+            test_claim_pause: None,
+            #[cfg(test)]
+            test_after_claim_sync_pause: None,
         }
+    }
+
+    pub(crate) fn store(&self) -> S {
+        self.store.clone()
+    }
+
+    pub(crate) fn clock(&self) -> C {
+        self.clock.clone()
     }
 
     pub async fn stage_execution(
@@ -286,12 +320,33 @@ where
         for expired in self.store.claim_expired_staging(now, 256).await? {
             validate_confined_path(&root, &expired.managed_path, true).await?;
             let _guard = self.lock_path(expired.managed_path.clone()).await;
+            #[cfg(test)]
+            if let Some(pause) = &self.test_claim_pause {
+                pause.entered.notify_one();
+                pause.resume.notified().await;
+            }
+            let claim_now = self.clock.now();
+            if !self
+                .store
+                .renew_gc_claim(&expired, claim_now, claim_now.plus_millis(30_000))
+                .await?
+            {
+                continue;
+            }
             match tokio::fs::remove_file(&expired.managed_path).await {
-                Ok(()) => sync_directory(expired.managed_path.parent().unwrap()).await?,
+                Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            self.store.complete_claimed_staging(&expired).await?;
+            sync_directory(expired.managed_path.parent().unwrap()).await?;
+            #[cfg(test)]
+            if let Some(pause) = &self.test_after_claim_sync_pause {
+                pause.entered.notify_one();
+                pause.resume.notified().await;
+            }
+            if !self.store.complete_claimed_staging(&expired).await? {
+                bail!("lost artifact GC claim before completion");
+            }
         }
         let scan_root = root.clone();
         let files = tokio::task::spawn_blocking(move || orphan_candidates(&scan_root)).await??;
@@ -302,7 +357,7 @@ where
                 continue;
             }
             let metadata = tokio::fs::symlink_metadata(&path).await?;
-            if !metadata.file_type().is_file() || modified_millis(&metadata)? > cutoff {
+            if !metadata.file_type().is_file() || modified_millis(&metadata)? >= cutoff {
                 continue;
             }
             #[cfg(test)]
@@ -358,8 +413,20 @@ where
     }
 
     #[cfg(test)]
-    fn with_test_gc_pause(mut self, pause: Arc<TestPause>) -> Self {
+    pub(crate) fn with_test_gc_pause(mut self, pause: Arc<TestPause>) -> Self {
         self.test_gc_pause = Some(pause);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_claim_pause(mut self, pause: Arc<TestPause>) -> Self {
+        self.test_claim_pause = Some(pause);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_after_claim_sync_pause(mut self, pause: Arc<TestPause>) -> Self {
+        self.test_after_claim_sync_pause = Some(pause);
         self
     }
 }
@@ -528,7 +595,7 @@ mod tests {
         agent::tool::{FileArtifact, ToolArtifact, ToolCapabilities, ToolExecution},
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         runtime::{
-            model::{AttemptId, Audience, ManualClock, Timestamp},
+            model::{AttemptId, Audience, Clock, ManualClock, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
                 ArtifactStore, AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore,
@@ -1062,6 +1129,113 @@ mod tests {
 
         assert!(!fixture.store.artifact_path_exists(&partial).await?);
         assert_eq!(claimed.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_does_not_unlink_after_its_claim_expires_and_is_reclaimed() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let attempt = fixture.running_attempt("call-claim-reclaimed").await?;
+        let partial = fixture.managed.join("claim-reclaimed.partial");
+        tokio::fs::write(&partial, b"still owned by the new claimant").await?;
+        fixture
+            .store
+            .begin_staging(
+                crate::runtime::store::BeginArtifact {
+                    id: crate::runtime::model::ArtifactId::new(),
+                    actor_id: fixture.run.lease.actor_id.clone(),
+                    attempt_id: attempt,
+                    managed_path: partial.clone(),
+                    display_name: "partial".into(),
+                    media_type: "x".into(),
+                    size: 30,
+                    caption: None,
+                    owner: "stage".into(),
+                    lease_until: Timestamp(10),
+                },
+                Timestamp(1),
+            )
+            .await?;
+        let pause = Arc::new(TestPause::new());
+        let manager = fixture.manager.clone().with_test_claim_pause(pause.clone());
+        let gc = tokio::spawn(async move { manager.collect_garbage(Timestamp(11)).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pause.wait_until_entered(),
+        )
+        .await?;
+
+        fixture.clock.advance(40_000);
+        let reclaimed = fixture
+            .store
+            .claim_expired_staging(fixture.clock.now(), 1)
+            .await?;
+        assert_eq!(reclaimed.len(), 1);
+        pause.resume();
+        gc.await??;
+
+        assert!(partial.exists());
+        assert!(fixture.store.artifact_path_exists(&partial).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_claimed_file_syncs_parent_before_database_completion() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let attempt = fixture.running_attempt("call-missing-claimed").await?;
+        let partial = fixture.managed.join("already-missing.partial");
+        fixture
+            .store
+            .begin_staging(
+                crate::runtime::store::BeginArtifact {
+                    id: crate::runtime::model::ArtifactId::new(),
+                    actor_id: fixture.run.lease.actor_id.clone(),
+                    attempt_id: attempt,
+                    managed_path: partial.clone(),
+                    display_name: "partial".into(),
+                    media_type: "x".into(),
+                    size: 1,
+                    caption: None,
+                    owner: "stage".into(),
+                    lease_until: Timestamp(10),
+                },
+                Timestamp(1),
+            )
+            .await?;
+        let pause = Arc::new(TestPause::new());
+        let manager = fixture
+            .manager
+            .clone()
+            .with_test_after_claim_sync_pause(pause.clone());
+        let gc = tokio::spawn(async move { manager.collect_garbage(Timestamp(11)).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pause.wait_until_entered(),
+        )
+        .await?;
+
+        assert!(fixture.store.artifact_path_exists(&partial).await?);
+        pause.resume();
+        gc.await??;
+        assert!(!fixture.store.artifact_path_exists(&partial).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_modified_exactly_at_cutoff_is_retained() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let actor = fixture.managed.join("cutoff-actor");
+        tokio::fs::create_dir_all(&actor).await?;
+        let orphan = actor.join("cutoff.bin");
+        tokio::fs::write(&orphan, b"boundary").await?;
+        let modified = super::modified_millis(&std::fs::metadata(&orphan)?)?;
+
+        fixture
+            .manager
+            .collect_garbage(Timestamp(modified.saturating_add(3_600_000)))
+            .await?;
+
+        assert!(orphan.exists());
         Ok(())
     }
 
