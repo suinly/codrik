@@ -332,11 +332,104 @@ pub enum OutboxPayload {
         text: String,
     },
     File {
-        path: PathBuf,
+        artifact_id: ArtifactId,
+        managed_path: PathBuf,
         display_name: String,
         media_type: String,
+        size: u64,
+        sha256: String,
         caption: Option<String>,
     },
+    TerminalError {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FinalPayload {
+    Text { text: String },
+    File { artifact: ManagedArtifact },
+    TerminalError { code: String, message: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleManifestEntry {
+    pub delivery_id: DeliveryId,
+    pub payload_kind: String,
+    pub decoded_bytes: usize,
+    pub sha256: String,
+    pub chunk_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleManifest {
+    pub entries: Vec<BundleManifestEntry>,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResultBundle {
+    pub id: BundleId,
+    pub request_id: RequestId,
+    pub state: BundleState,
+    pub manifest: BundleManifest,
+    pub deliveries: Vec<(DeliveryId, FinalPayload)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleClaim {
+    pub bundle_id: BundleId,
+    pub owner: String,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedBundle {
+    pub claim: BundleClaim,
+    pub bundle: ResultBundle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleAck {
+    pub request_id: RequestId,
+    pub bundle_id: BundleId,
+    pub delivery_ids: Vec<DeliveryId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckOutcome {
+    Delivered,
+    AlreadyDelivered,
+}
+
+#[async_trait]
+pub trait BundleStore: Send + Sync {
+    async fn claim_ready_bundles(
+        &self,
+        owner: &str,
+        request_ids: &[RequestId],
+        now: Timestamp,
+        until: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<ClaimedBundle>>;
+    async fn renew_bundle(
+        &self,
+        claim: &BundleClaim,
+        now: Timestamp,
+        until: Timestamp,
+    ) -> Result<BundleClaim>;
+    async fn load_bundle(&self, id: &BundleId) -> Result<ResultBundle>;
+    async fn acknowledge_bundle(&self, ack: BundleAck, now: Timestamp) -> Result<AckOutcome>;
+    async fn fail_bundle_retryable(
+        &self,
+        claim: &BundleClaim,
+        error: &str,
+        next_attempt: Timestamp,
+        now: Timestamp,
+    ) -> Result<()>;
+    async fn replay_bundle(&self, request: &RequestId) -> Result<Option<ResultBundle>>;
 }
 
 #[derive(Clone, Debug)]
@@ -467,7 +560,13 @@ pub trait ContextStore: Send + Sync {
 }
 
 pub trait RuntimeStore:
-    DispatchStore + CheckpointStore + ControlStore + ToolAttemptStore + ContextStore + ArtifactStore
+    DispatchStore
+    + CheckpointStore
+    + ControlStore
+    + ToolAttemptStore
+    + ContextStore
+    + ArtifactStore
+    + BundleStore
 {
 }
 
@@ -478,5 +577,6 @@ impl<T> RuntimeStore for T where
         + ToolAttemptStore
         + ContextStore
         + ArtifactStore
+        + BundleStore
 {
 }

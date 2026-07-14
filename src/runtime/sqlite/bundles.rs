@@ -1,0 +1,786 @@
+use std::collections::HashSet;
+
+use anyhow::{Result, anyhow, bail};
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use tokio_rusqlite::{params, rusqlite::OptionalExtension};
+
+use crate::runtime::{
+    model::{
+        BundleId, BundleState, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES,
+        MAX_FINAL_CHUNK_BYTES, MAX_MANIFEST_BYTES, RequestId, Timestamp,
+    },
+    sqlite::{SqliteRuntimeStore, map_call_error},
+    store::{
+        AckOutcome, BundleAck, BundleClaim, BundleManifest, BundleManifestEntry, BundleStore,
+        ClaimedBundle, FinalPayload, ManagedArtifact, OutboxPayload, ResultBundle,
+    },
+};
+
+#[async_trait]
+impl BundleStore for SqliteRuntimeStore {
+    async fn claim_ready_bundles(
+        &self,
+        owner: &str,
+        request_ids: &[RequestId],
+        now: Timestamp,
+        until: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<ClaimedBundle>> {
+        if owner.trim().is_empty() || until <= now {
+            bail!("bundle claim requires an owner and a future expiry");
+        }
+        let owner = owner.to_owned();
+        let requested = request_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
+        let limit = limit.min(32);
+        self.connection
+            .call(move |connection| -> Result<Vec<ClaimedBundle>> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let candidates = {
+                    let mut statement = transaction.prepare(
+                        "SELECT id, request_id FROM result_bundles
+                         WHERE state = 'pending'
+                            OR (state = 'failed_retryable' AND
+                                (next_attempt_at IS NULL OR next_attempt_at <= ?1))
+                         ORDER BY created_at, id",
+                    )?;
+                    statement
+                        .query_map([now.0], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                let mut claimed = Vec::new();
+                for (bundle_id, request_id) in candidates {
+                    if claimed.len() >= limit || !requested.contains(&request_id) {
+                        continue;
+                    }
+                    let changed = transaction.execute(
+                        "UPDATE result_bundles
+                         SET state = 'delivering', attempt_count = attempt_count + 1,
+                             claim_owner = ?2, claim_expires_at = ?3,
+                             next_attempt_at = NULL, last_error = NULL, updated_at = ?4
+                         WHERE id = ?1 AND (state = 'pending' OR
+                            (state = 'failed_retryable' AND
+                             (next_attempt_at IS NULL OR next_attempt_at <= ?4)))",
+                        params![bundle_id, owner, until.0, now.0],
+                    )?;
+                    if changed != 1 {
+                        continue;
+                    }
+                    match load_bundle_row(&transaction, &bundle_id) {
+                        Ok(bundle) => claimed.push(ClaimedBundle {
+                            claim: BundleClaim {
+                                bundle_id: bundle.id.clone(),
+                                owner: owner.clone(),
+                                expires_at: until,
+                            },
+                            bundle,
+                        }),
+                        Err(error) => {
+                            transaction.execute(
+                                "UPDATE result_bundles
+                                 SET state = 'failed_terminal', claim_owner = NULL,
+                                     claim_expires_at = NULL, last_error = ?2, updated_at = ?3
+                                 WHERE id = ?1",
+                                params![bundle_id, error.to_string(), now.0],
+                            )?;
+                        }
+                    }
+                }
+                transaction.commit()?;
+                Ok(claimed)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn renew_bundle(
+        &self,
+        claim: &BundleClaim,
+        now: Timestamp,
+        until: Timestamp,
+    ) -> Result<BundleClaim> {
+        if until <= now {
+            bail!("renewed bundle expiry must be in the future");
+        }
+        let claim = claim.clone();
+        self.connection
+            .call(move |connection| -> Result<BundleClaim> {
+                let changed = connection.execute(
+                    "UPDATE result_bundles SET claim_expires_at = ?4, updated_at = ?3
+                     WHERE id = ?1 AND state = 'delivering' AND claim_owner = ?2
+                       AND claim_expires_at = ?5 AND claim_expires_at > ?3",
+                    params![
+                        claim.bundle_id.as_str(),
+                        claim.owner,
+                        now.0,
+                        until.0,
+                        claim.expires_at.0
+                    ],
+                )?;
+                if changed != 1 {
+                    bail!("bundle claim is stale");
+                }
+                Ok(BundleClaim {
+                    expires_at: until,
+                    ..claim
+                })
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn load_bundle(&self, id: &BundleId) -> Result<ResultBundle> {
+        let id = id.to_string();
+        self.connection
+            .call(move |connection| load_bundle_row(connection, &id))
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn acknowledge_bundle(&self, ack: BundleAck, now: Timestamp) -> Result<AckOutcome> {
+        self.connection
+            .call(move |connection| -> Result<AckOutcome> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let (request_id, state) = transaction
+                    .query_row(
+                        "SELECT request_id, state FROM result_bundles WHERE id = ?1",
+                        [ack.bundle_id.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| anyhow!("bundle was not found"))?;
+                if request_id != ack.request_id.as_str() {
+                    bail!("bundle does not belong to request");
+                }
+                let canonical_bundle = load_bundle_row(&transaction, ack.bundle_id.as_str())?;
+                let durable = {
+                    let mut statement = transaction.prepare(
+                        "SELECT id, transport, address FROM outbox_deliveries
+                         WHERE bundle_id = ?1 ORDER BY ordinal",
+                    )?;
+                    statement
+                        .query_map([ack.bundle_id.as_str()], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                if durable.iter().any(|(_, transport, address)| {
+                    transport != "local_ipc" || address != ack.request_id.as_str()
+                }) {
+                    bail!("bundle route does not belong to request");
+                }
+                let expected = canonical_bundle
+                    .manifest
+                    .entries
+                    .iter()
+                    .map(|entry| entry.delivery_id.as_str())
+                    .collect::<HashSet<_>>();
+                let supplied = ack
+                    .delivery_ids
+                    .iter()
+                    .map(DeliveryId::as_str)
+                    .collect::<HashSet<_>>();
+                if expected.len() != durable.len()
+                    || supplied.len() != ack.delivery_ids.len()
+                    || expected != supplied
+                {
+                    bail!("ACK delivery IDs do not exactly match the bundle manifest");
+                }
+                let outcome = match state.as_str() {
+                    "delivered" => AckOutcome::AlreadyDelivered,
+                    "delivering" | "failed_retryable" => {
+                        let changed = transaction.execute(
+                            "UPDATE result_bundles
+                             SET state = 'delivered', claim_owner = NULL,
+                                 claim_expires_at = NULL, next_attempt_at = NULL,
+                                 last_error = NULL, updated_at = ?2
+                             WHERE id = ?1 AND state IN ('delivering','failed_retryable')",
+                            params![ack.bundle_id.as_str(), now.0],
+                        )?;
+                        if changed != 1 {
+                            bail!("bundle changed during ACK");
+                        }
+                        AckOutcome::Delivered
+                    }
+                    "pending" => bail!("pending bundle cannot be acknowledged"),
+                    "failed_terminal" => bail!("terminally failed bundle cannot be acknowledged"),
+                    other => bail!("invalid bundle state: {other}"),
+                };
+                transaction.commit()?;
+                Ok(outcome)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn fail_bundle_retryable(
+        &self,
+        claim: &BundleClaim,
+        error: &str,
+        next_attempt: Timestamp,
+        now: Timestamp,
+    ) -> Result<()> {
+        let claim = claim.clone();
+        let error = error.to_owned();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                let changed = connection.execute(
+                    "UPDATE result_bundles
+                     SET state = 'failed_retryable', claim_owner = NULL,
+                         claim_expires_at = NULL, next_attempt_at = ?4,
+                         last_error = ?5, updated_at = ?3
+                     WHERE id = ?1 AND state = 'delivering' AND claim_owner = ?2
+                       AND claim_expires_at = ?6 AND claim_expires_at > ?3",
+                    params![
+                        claim.bundle_id.as_str(),
+                        claim.owner,
+                        now.0,
+                        next_attempt.0,
+                        error,
+                        claim.expires_at.0
+                    ],
+                )?;
+                if changed != 1 {
+                    bail!("bundle claim is stale");
+                }
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn replay_bundle(&self, request: &RequestId) -> Result<Option<ResultBundle>> {
+        let request = request.to_string();
+        self.connection
+            .call(move |connection| -> Result<Option<ResultBundle>> {
+                let bundle_id = connection
+                    .query_row(
+                        "SELECT id FROM result_bundles
+                         WHERE request_id = ?1 AND state = 'delivered'",
+                        [request],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                bundle_id
+                    .map(|id| load_bundle_row(connection, &id))
+                    .transpose()
+            })
+            .await
+            .map_err(map_call_error)
+    }
+}
+
+pub(super) fn payload_from_outbox(payload: OutboxPayload) -> FinalPayload {
+    match payload {
+        OutboxPayload::Text { text } => FinalPayload::Text { text },
+        OutboxPayload::File {
+            artifact_id,
+            managed_path,
+            display_name,
+            media_type,
+            size,
+            sha256,
+            caption,
+        } => FinalPayload::File {
+            artifact: ManagedArtifact {
+                id: artifact_id,
+                managed_path,
+                display_name,
+                media_type,
+                size,
+                sha256,
+                caption,
+            },
+        },
+        OutboxPayload::TerminalError { code, message } => {
+            FinalPayload::TerminalError { code, message }
+        }
+    }
+}
+
+pub(super) fn manifest_for(deliveries: &[(DeliveryId, FinalPayload)]) -> Result<BundleManifest> {
+    if deliveries.is_empty() || deliveries.len() > MAX_BUNDLE_DELIVERIES {
+        bail!("bundle delivery count is outside 1..={MAX_BUNDLE_DELIVERIES}");
+    }
+    let mut total = 0usize;
+    let mut entries = Vec::with_capacity(deliveries.len());
+    for (delivery_id, payload) in deliveries {
+        let encoded = serde_json::to_vec(payload)?;
+        total = total
+            .checked_add(encoded.len())
+            .ok_or_else(|| anyhow!("bundle decoded byte count overflow"))?;
+        let payload_kind = match payload {
+            FinalPayload::Text { .. } => "text",
+            FinalPayload::File { .. } => "file",
+            FinalPayload::TerminalError { .. } => "terminal_error",
+        };
+        entries.push(BundleManifestEntry {
+            delivery_id: delivery_id.clone(),
+            payload_kind: payload_kind.into(),
+            decoded_bytes: encoded.len(),
+            sha256: hex_sha256(&encoded),
+            chunk_count: encoded.len().div_ceil(MAX_FINAL_CHUNK_BYTES),
+        });
+    }
+    validate_bundle_bytes(total)?;
+    let canonical = serde_json::to_vec(&entries)?;
+    validate_manifest_bytes(canonical.len())?;
+    Ok(BundleManifest {
+        sha256: hex_sha256(&canonical),
+        entries,
+    })
+}
+
+fn load_bundle_row(
+    connection: &tokio_rusqlite::rusqlite::Connection,
+    id: &str,
+) -> Result<ResultBundle> {
+    let (request_id, state, delivery_count, manifest_sha256) = connection
+        .query_row(
+            "SELECT request_id, state, delivery_count, manifest_sha256
+             FROM result_bundles WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("bundle was not found"))?;
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT deliveries.id, deliveries.ordinal, deliveries.transport,
+                    deliveries.address, outbox.payload_json
+             FROM outbox_deliveries deliveries
+             JOIN outbox ON outbox.id = deliveries.outbox_id
+             WHERE deliveries.bundle_id = ?1 ORDER BY deliveries.ordinal",
+        )?;
+        statement
+            .query_map([id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, usize>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if rows.len() != delivery_count || rows.len() > MAX_BUNDLE_DELIVERIES {
+        bail!("bundle delivery count does not match its immutable memberships");
+    }
+    let mut deliveries = Vec::with_capacity(rows.len());
+    for (expected, (delivery_id, ordinal, transport, address, payload_json)) in
+        rows.into_iter().enumerate()
+    {
+        if ordinal != expected {
+            bail!("bundle membership ordinals are not contiguous");
+        }
+        if transport != "local_ipc" || address != request_id {
+            bail!("bundle membership route does not belong to its request");
+        }
+        let payload: OutboxPayload = serde_json::from_str(&payload_json)?;
+        deliveries.push((
+            DeliveryId::parse(&delivery_id)?,
+            payload_from_outbox(payload),
+        ));
+    }
+    let manifest = manifest_for(&deliveries)?;
+    if manifest.sha256 != manifest_sha256 {
+        bail!("bundle manifest hash does not match immutable memberships");
+    }
+    Ok(ResultBundle {
+        id: BundleId::parse(id)?,
+        request_id: RequestId::parse(&request_id)?,
+        state: decode_state(&state)?,
+        manifest,
+        deliveries,
+    })
+}
+
+fn decode_state(state: &str) -> Result<BundleState> {
+    match state {
+        "pending" => Ok(BundleState::Pending),
+        "delivering" => Ok(BundleState::Delivering),
+        "delivered" => Ok(BundleState::Delivered),
+        "failed_retryable" => Ok(BundleState::FailedRetryable),
+        "failed_terminal" => Ok(BundleState::FailedTerminal),
+        other => bail!("invalid bundle state: {other}"),
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn validate_bundle_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_BUNDLE_BYTES {
+        bail!("bundle exceeds {MAX_BUNDLE_BYTES} decoded bytes");
+    }
+    Ok(())
+}
+
+fn validate_manifest_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_MANIFEST_BYTES {
+        bail!("bundle manifest exceeds {MAX_MANIFEST_BYTES} bytes");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::{
+        model::MAX_BUNDLE_DELIVERIES,
+        store::{AckOutcome, BundleAck, BundleStore, FinalPayload},
+    };
+
+    use super::*;
+
+    #[test]
+    fn manifest_rejects_more_than_one_thousand_twenty_four_memberships() {
+        let deliveries = (0..=MAX_BUNDLE_DELIVERIES)
+            .map(|_| (DeliveryId::new(), FinalPayload::Text { text: "x".into() }))
+            .collect::<Vec<_>>();
+        assert!(manifest_for(&deliveries).is_err());
+    }
+
+    #[test]
+    fn manifest_records_chunking_and_canonical_hash() {
+        let deliveries = vec![(
+            DeliveryId::new(),
+            FinalPayload::Text {
+                text: "x".repeat(MAX_FINAL_CHUNK_BYTES),
+            },
+        )];
+        let manifest = manifest_for(&deliveries).unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].chunk_count, 2);
+        assert_eq!(manifest.entries[0].sha256.len(), 64);
+        assert_eq!(manifest.sha256.len(), 64);
+    }
+
+    #[test]
+    fn manifest_rejects_more_than_sixteen_mibibytes() {
+        let deliveries = vec![(
+            DeliveryId::new(),
+            FinalPayload::Text {
+                text: "x".repeat(MAX_BUNDLE_BYTES + 1),
+            },
+        )];
+        assert!(manifest_for(&deliveries).is_err());
+    }
+
+    #[test]
+    fn decoded_bundle_and_manifest_limits_are_inclusive() {
+        assert!(validate_bundle_bytes(MAX_BUNDLE_BYTES).is_ok());
+        assert!(validate_bundle_bytes(MAX_BUNDLE_BYTES + 1).is_err());
+        assert!(validate_manifest_bytes(MAX_MANIFEST_BYTES).is_ok());
+        assert!(validate_manifest_bytes(MAX_MANIFEST_BYTES + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn ack_requires_exact_manifest_and_accepts_retryable_stale_ack() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "pending", 2, false).await.unwrap();
+        assert!(
+            store
+                .acknowledge_bundle(seeded.ack(), Timestamp(2))
+                .await
+                .is_err()
+        );
+        let claimed = store
+            .claim_ready_bundles(
+                "worker",
+                std::slice::from_ref(&seeded.request_id),
+                Timestamp(2),
+                Timestamp(30),
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut partial = seeded.ack();
+        partial.delivery_ids.pop();
+        assert!(
+            store
+                .acknowledge_bundle(partial, Timestamp(3))
+                .await
+                .is_err()
+        );
+        store
+            .fail_bundle_retryable(
+                &claimed.claim,
+                "connection closed",
+                Timestamp(20),
+                Timestamp(4),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .acknowledge_bundle(seeded.ack(), Timestamp(5))
+                .await
+                .unwrap(),
+            AckOutcome::Delivered
+        );
+        assert_eq!(
+            store
+                .acknowledge_bundle(seeded.ack(), Timestamp(6))
+                .await
+                .unwrap(),
+            AckOutcome::AlreadyDelivered
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_and_retry_failure_reject_stale_bundle_claims() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "pending", 1, false).await.unwrap();
+        let claim = store
+            .claim_ready_bundles(
+                "worker",
+                std::slice::from_ref(&seeded.request_id),
+                Timestamp(2),
+                Timestamp(30),
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .claim;
+        let mut wrong_owner = claim.clone();
+        wrong_owner.owner = "other-worker".into();
+        assert!(
+            store
+                .renew_bundle(&wrong_owner, Timestamp(3), Timestamp(40))
+                .await
+                .is_err()
+        );
+        let mut wrong_expiry = claim.clone();
+        wrong_expiry.expires_at = Timestamp(29);
+        assert!(
+            store
+                .fail_bundle_retryable(&wrong_expiry, "stale", Timestamp(10), Timestamp(3))
+                .await
+                .is_err()
+        );
+        let renewed = store
+            .renew_bundle(&claim, Timestamp(3), Timestamp(40))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .fail_bundle_retryable(&claim, "old fence", Timestamp(10), Timestamp(4))
+                .await
+                .is_err()
+        );
+        store
+            .fail_bundle_retryable(&renewed, "disconnect", Timestamp(10), Timestamp(4))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ack_validates_request_route_without_partial_state_change() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "delivering", 1, true).await.unwrap();
+        assert!(
+            store
+                .acknowledge_bundle(seeded.ack(), Timestamp(2))
+                .await
+                .is_err()
+        );
+        let bundle_id = seeded.bundle_id.to_string();
+        assert_eq!(
+            store
+                .connection
+                .call(move |connection| {
+                    connection.query_row(
+                        "SELECT state FROM result_bundles WHERE id = ?1",
+                        [bundle_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                })
+                .await
+                .unwrap(),
+            "delivering"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_load_supports_more_than_worker_claim_batch_and_checks_ordinals() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "pending", 33, false).await.unwrap();
+        assert_eq!(
+            store
+                .load_bundle(&seeded.bundle_id)
+                .await
+                .unwrap()
+                .deliveries
+                .len(),
+            33
+        );
+
+        let malformed = seed_bundle(&store, "pending", 2, false).await.unwrap();
+        let bundle_id = malformed.bundle_id.to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection
+                    .execute_batch("DROP TRIGGER outbox_deliveries_are_immutable_on_update;")?;
+                connection.execute(
+                    "UPDATE outbox_deliveries SET ordinal = 3
+                     WHERE bundle_id = ?1 AND ordinal = 1",
+                    [bundle_id],
+                )
+            })
+            .await
+            .unwrap();
+        assert!(store.load_bundle(&malformed.bundle_id).await.is_err());
+    }
+
+    struct SeededBundle {
+        request_id: RequestId,
+        bundle_id: BundleId,
+        delivery_ids: Vec<DeliveryId>,
+    }
+
+    impl SeededBundle {
+        fn ack(&self) -> BundleAck {
+            BundleAck {
+                request_id: self.request_id.clone(),
+                bundle_id: self.bundle_id.clone(),
+                delivery_ids: self.delivery_ids.clone(),
+            }
+        }
+    }
+
+    async fn seed_bundle(
+        store: &SqliteRuntimeStore,
+        state: &str,
+        count: usize,
+        wrong_route: bool,
+    ) -> Result<SeededBundle> {
+        let request_id = RequestId::new();
+        let bundle_id = BundleId::new();
+        let delivery_ids = (0..count).map(|_| DeliveryId::new()).collect::<Vec<_>>();
+        let payloads = delivery_ids
+            .iter()
+            .map(|id| (id.clone(), FinalPayload::Text { text: "ok".into() }))
+            .collect::<Vec<_>>();
+        let manifest = manifest_for(&payloads)?;
+        let request = request_id.to_string();
+        let bundle = bundle_id.to_string();
+        let deliveries = delivery_ids.clone();
+        let state = state.to_owned();
+        store
+            .connection
+            .call(move |connection| -> Result<()> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                transaction.execute_batch(
+                    "INSERT OR IGNORE INTO actors(id, enabled, tools_json, created_at)
+                     VALUES ('bundle-actor', 1, '[]', 1);",
+                )?;
+                let work = format!("work-{request}");
+                let run = format!("run-{request}");
+                let event = format!("event-{request}");
+                let sequence = transaction.query_row(
+                    "SELECT COALESCE(MAX(mailbox_sequence), 0) + 1 FROM events
+                     WHERE actor_id = 'bundle-actor'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                transaction.execute(
+                    "INSERT INTO work_items(id, actor_id, kind, audience_kind, state, created_at, updated_at)
+                     VALUES (?1, 'bundle-actor', 'interactive', 'actor_private', 'completed', 1, 1)",
+                    [work.as_str()],
+                )?;
+                transaction.execute(
+                    "INSERT INTO runs(id, actor_id, work_item_id, state, lease_generation,
+                        observed_sequence, created_at, updated_at)
+                     VALUES (?1, 'bundle-actor', ?2, 'completed', 1, 1, 1, 1)",
+                    params![run, work],
+                )?;
+                transaction.execute(
+                    "INSERT INTO events(id, actor_id, work_item_id, mailbox_sequence, gateway,
+                        external_id, kind, audience_kind, payload_json, state, created_at, updated_at)
+                     VALUES (?1, 'bundle-actor', ?2, ?4, 'local:submit', ?3,
+                        'user_message', 'actor_private', '{}', 'completed', 1, 1)",
+                    params![event, work, request, sequence],
+                )?;
+                transaction.execute(
+                    "INSERT INTO local_requests(request_id, actor_id, event_id, work_item_id,
+                        prompt_sha256, state, result_bundle_id, created_at, updated_at)
+                     VALUES (?1, 'bundle-actor', ?2, ?3, ?4, 'active', NULL, 1, 1)",
+                    params![request, event, work, "a".repeat(64)],
+                )?;
+                transaction.execute(
+                    "INSERT INTO result_bundles(id, request_id, delivery_count,
+                        manifest_sha256, state, attempt_count, claim_owner, claim_expires_at,
+                        created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0,
+                        CASE WHEN ?5 = 'delivering' THEN 'worker' END,
+                        CASE WHEN ?5 = 'delivering' THEN 30 END, 1, 1)",
+                    params![bundle, request, count, manifest.sha256, state],
+                )?;
+                for (ordinal, delivery_id) in deliveries.iter().enumerate() {
+                    let outbox_id = format!("outbox-{delivery_id}");
+                    transaction.execute(
+                        "INSERT INTO outbox(id, intent_key, actor_id, work_item_id, run_id,
+                            intent_class, audience_kind, payload_json, created_at)
+                         VALUES (?1, ?2, 'bundle-actor', ?3, ?4, 'reply', 'actor_private',
+                            '{\"type\":\"text\",\"text\":\"ok\"}', 1)",
+                        params![outbox_id, format!("intent-{delivery_id}"), work, run],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO outbox_deliveries(id, outbox_id, bundle_id, ordinal,
+                            transport, address, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 'local_ipc', ?5, 1)",
+                        params![
+                            delivery_id.as_str(),
+                            outbox_id,
+                            bundle,
+                            ordinal,
+                            if wrong_route { RequestId::new().to_string() } else { request.clone() },
+                        ],
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE local_requests SET state = 'completed', result_bundle_id = ?2
+                     WHERE request_id = ?1",
+                    params![request, bundle],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)?;
+        Ok(SeededBundle {
+            request_id,
+            bundle_id,
+            delivery_ids,
+        })
+    }
+}

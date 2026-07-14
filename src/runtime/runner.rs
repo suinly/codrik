@@ -833,6 +833,25 @@ mod tests {
         assert_ne!(execution.artifacts[0].managed_path, source);
         assert_eq!(execution.artifacts[0].sha256.len(), 64);
         assert_eq!(execution.artifacts[0].sha256, content_hash);
+        let file_intent = store
+            .outbox_intents()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|intent| matches!(intent.payload, OutboxPayload::File { .. }))
+            .expect("managed artifact should become a typed immutable intent");
+        assert!(matches!(
+            file_intent.payload,
+            OutboxPayload::File {
+                artifact_id,
+                managed_path,
+                size: 15,
+                sha256,
+                ..
+            } if artifact_id == execution.artifacts[0].id
+                && managed_path == execution.artifacts[0].managed_path
+                && sha256 == content_hash
+        ));
         assert_eq!(
             tokio::fs::read(&execution.artifacts[0].managed_path)
                 .await

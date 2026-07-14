@@ -7,6 +7,7 @@ use tokio_rusqlite::rusqlite::OptionalExtension;
 use tokio_rusqlite::rusqlite::TransactionBehavior;
 
 mod artifacts;
+mod bundles;
 mod checkpoint;
 mod dispatch;
 mod ingress;
