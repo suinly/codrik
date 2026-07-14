@@ -779,8 +779,10 @@ mod tests {
                 }],
             })
             .collect();
-        let mut limits = RunnerLimits::default();
-        limits.max_model_steps = 4;
+        let limits = RunnerLimits {
+            max_model_steps: 4,
+            ..RunnerLimits::default()
+        };
         let runner = ActorRunner::new(
             store.clone(),
             ScriptedLlm {
