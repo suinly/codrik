@@ -442,7 +442,7 @@ mod tests {
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
             store::{
-                DispatchStore, IngressStore, NewInboundEvent, OutboxPayload, OutboxStore,
+                DispatchStore, IngressStore, NewInboundEvent, OutboxPayload,
                 RuntimeAuthorizationStore,
             },
         },
@@ -634,7 +634,7 @@ mod tests {
             runner.run_once("worker").await.unwrap(),
             RunOnceOutcome::Completed
         );
-        let outbox = store.pending_outbox().await.unwrap();
+        let outbox = store.outbox_intents().await.unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(
             outbox[0].payload,
@@ -679,7 +679,7 @@ mod tests {
             RunOnceOutcome::Completed
         );
         assert_eq!(attempts.lock().await.len(), 1);
-        assert_eq!(store.pending_outbox().await.unwrap().len(), 1);
+        assert_eq!(store.outbox_intents().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -704,7 +704,7 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
-            store.pending_outbox().await.unwrap()[0].payload,
+            store.outbox_intents().await.unwrap()[0].payload,
             OutboxPayload::Text {
                 text: "fresh".into()
             }
@@ -751,7 +751,7 @@ mod tests {
             .await;
 
         assert_eq!(task.await.unwrap().unwrap(), RunOnceOutcome::Cancelled);
-        assert!(store.pending_outbox().await.unwrap().is_empty());
+        assert!(store.outbox_intents().await.unwrap().is_empty());
         let recovery = ActorRunner::new(
             store,
             FinalLlm,

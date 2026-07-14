@@ -26,11 +26,13 @@ CREATE TABLE legacy_outbox_archive (
 INSERT INTO legacy_outbox_archive (
     id, intent_key, actor_id, work_item_id, run_id, intent_class,
     audience_kind, audience_address, payload_json, state, attempt_count,
-    claim_owner, claim_expires_at, created_at, updated_at
+    claim_owner, claim_expires_at, last_error, created_at, updated_at
 )
 SELECT id, intent_key, actor_id, work_item_id, run_id, intent_class,
        audience_kind, audience_address, payload_json, state, attempt_count,
-       claim_owner, claim_expires_at, created_at, updated_at
+       claim_owner, claim_expires_at,
+       NULL, -- Authoritative v1 has no last_error column.
+       created_at, updated_at
 FROM outbox;
 
 DROP TABLE outbox;
@@ -81,9 +83,6 @@ CREATE TABLE result_bundles (
     updated_at INTEGER NOT NULL
 ) STRICT;
 
--- The compatibility delivery columns are nullable/defaulted only so the v1
--- runtime can keep compiling during the staged rollout. V2 rows are immutable
--- logical intents; bundle delivery state lives exclusively in result_bundles.
 CREATE TABLE outbox (
     id TEXT PRIMARY KEY,
     intent_key TEXT NOT NULL UNIQUE,
@@ -91,16 +90,10 @@ CREATE TABLE outbox (
     work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     intent_class TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    artifact_id TEXT REFERENCES artifacts(id),
-    created_at INTEGER NOT NULL,
-    audience_kind TEXT,
+    audience_kind TEXT NOT NULL,
     audience_address TEXT,
-    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','delivering','delivered','failed_retryable','failed_terminal','outcome_unknown','acknowledged_duplicate')),
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    claim_owner TEXT,
-    claim_expires_at INTEGER,
-    updated_at INTEGER NOT NULL DEFAULT 0
+    payload_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 ) STRICT;
 
 CREATE TABLE outbox_deliveries (
@@ -114,6 +107,18 @@ CREATE TABLE outbox_deliveries (
     UNIQUE(outbox_id, transport, address),
     UNIQUE(bundle_id, ordinal)
 ) STRICT;
+
+CREATE TRIGGER outbox_deliveries_are_immutable_on_update
+BEFORE UPDATE ON outbox_deliveries
+BEGIN
+    SELECT RAISE(ABORT, 'outbox_deliveries are immutable');
+END;
+
+CREATE TRIGGER outbox_deliveries_are_immutable_on_delete
+BEFORE DELETE ON outbox_deliveries
+BEGIN
+    SELECT RAISE(ABORT, 'outbox_deliveries are append-only');
+END;
 
 CREATE TABLE cancel_targets (
     cancel_id TEXT NOT NULL,
@@ -134,34 +139,79 @@ CREATE TABLE legacy_runtime_quarantine (
 
 INSERT INTO legacy_runtime_quarantine (entity_type, entity_id, prior_state, snapshot_json, quarantined_at)
 SELECT 'work_item', id, state,
-       json_object('id', id, 'actor_id', actor_id, 'state', state), updated_at
+       json_object(
+           'id', id,
+           'actor_id', actor_id,
+           'kind', kind,
+           'audience_kind', audience_kind,
+           'audience_address', audience_address,
+           'state', state,
+           'created_at', created_at,
+           'updated_at', updated_at
+       ), updated_at
 FROM work_items
 WHERE state IN ('ready', 'waiting', 'blocked_unknown_outcome', 'waiting_for_decision');
 
 INSERT INTO legacy_runtime_quarantine (entity_type, entity_id, prior_state, snapshot_json, quarantined_at)
 SELECT 'run', id, state,
-       json_object('id', id, 'actor_id', actor_id, 'work_item_id', work_item_id, 'state', state), updated_at
+       json_object(
+           'id', id,
+           'actor_id', actor_id,
+           'work_item_id', work_item_id,
+           'state', state,
+           'lease_generation', lease_generation,
+           'observed_sequence', observed_sequence,
+           'created_at', created_at,
+           'updated_at', updated_at
+       ), updated_at
 FROM runs
 WHERE state = 'active';
 
 INSERT INTO legacy_runtime_quarantine (entity_type, entity_id, prior_state, snapshot_json, quarantined_at)
 SELECT 'event', id, state,
-       json_object('id', id, 'actor_id', actor_id, 'work_item_id', work_item_id, 'state', state), updated_at
+       json_object(
+           'id', id,
+           'actor_id', actor_id,
+           'work_item_id', work_item_id,
+           'mailbox_sequence', mailbox_sequence,
+           'gateway', gateway,
+           'external_id', external_id,
+           'kind', kind,
+           'audience_kind', audience_kind,
+           'audience_address', audience_address,
+           'payload_json', payload_json,
+           'state', state,
+           'run_id', run_id,
+           'created_at', created_at,
+           'updated_at', updated_at
+       ), updated_at
 FROM events
-WHERE state IN ('pending', 'processing');
+WHERE state IN ('pending', 'processing', 'blocked');
 
 INSERT INTO legacy_runtime_quarantine (entity_type, entity_id, prior_state, snapshot_json, quarantined_at)
 SELECT 'tool_attempt', id, state,
-       json_object('id', id, 'run_id', run_id, 'tool_call_id', tool_call_id, 'state', state), updated_at
+       json_object(
+           'id', id,
+           'run_id', run_id,
+           'tool_call_id', tool_call_id,
+           'tool_name', tool_name,
+           'arguments_json', arguments_json,
+           'capabilities_json', capabilities_json,
+           'state', state,
+           'outcome_json', outcome_json,
+           'observation_checkpointed', observation_checkpointed,
+           'created_at', created_at,
+           'updated_at', updated_at
+       ), updated_at
 FROM tool_attempts
-WHERE state IN ('prepared', 'running');
+WHERE state IN ('prepared', 'running', 'outcome_unknown', 'waiting_for_decision');
 
 UPDATE tool_attempts SET state = 'cancelled_known', updated_at = max(updated_at, 1)
 WHERE state = 'prepared';
 UPDATE tool_attempts SET state = 'outcome_unknown', updated_at = max(updated_at, 1)
 WHERE state = 'running';
 UPDATE events SET state = 'failed_terminal', updated_at = max(updated_at, 1)
-WHERE state IN ('pending', 'processing');
+WHERE state IN ('pending', 'processing', 'blocked');
 UPDATE runs SET state = 'failed_terminal', updated_at = max(updated_at, 1)
 WHERE state = 'active';
 UPDATE work_items
@@ -172,7 +222,6 @@ SET state = 'failed_terminal',
 WHERE state IN ('ready', 'waiting', 'blocked_unknown_outcome', 'waiting_for_decision');
 DELETE FROM actor_leases;
 
-CREATE INDEX ready_outbox_v2 ON outbox(state, created_at);
 CREATE INDEX claimable_result_bundles ON result_bundles(state, next_attempt_at, created_at);
 CREATE INDEX local_requests_by_work_item ON local_requests(work_item_id, state);
 CREATE INDEX artifacts_by_actor_state ON artifacts(actor_id, state, staging_expires_at);

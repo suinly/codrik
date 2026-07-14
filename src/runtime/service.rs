@@ -5,9 +5,7 @@ use crate::runtime::{
     model::{ActorId, Audience, EventKind, Timestamp},
     runner::{ActorRunner, RunOnceOutcome},
     signals::ActorSignals,
-    store::{
-        IngressOutcome, IngressStore, NewInboundEvent, OutboxRecord, OutboxStore, RuntimeStore,
-    },
+    store::{IngressOutcome, IngressStore, NewInboundEvent, RuntimeStore},
 };
 
 #[async_trait]
@@ -44,7 +42,7 @@ pub struct LocalKernel<S, R> {
 
 impl<S, R> LocalKernel<S, R>
 where
-    S: IngressStore + OutboxStore + Clone,
+    S: IngressStore + Clone,
     R: ReadyRunner,
 {
     pub fn new(
@@ -94,16 +92,6 @@ where
         self.runner.run_ready_once().await
     }
 
-    pub async fn drain_outbox(&self) -> Result<Vec<OutboxRecord>> {
-        let records = self.store.pending_outbox().await?;
-        for record in &records {
-            self.store
-                .mark_outbox_delivered(&record.id, self.runner.now())
-                .await?;
-        }
-        Ok(records)
-    }
-
     async fn ingest(&self, event: NewInboundEvent) -> Result<IngressOutcome> {
         let outcome = self.store.ingest(event, self.runner.now()).await?;
         if let IngressOutcome::Accepted { sequence, .. } = &outcome {
@@ -130,7 +118,7 @@ mod tests {
             sqlite::SqliteRuntimeStore,
             store::{
                 DispatchStore, IngressOutcome, IngressStore, NewInboundEvent, NewToolAttempt,
-                OutboxPayload, OutboxStore, RuntimeAuthorizationStore, ToolAttemptStore,
+                OutboxPayload, RuntimeAuthorizationStore, ToolAttemptStore,
             },
         },
     };
@@ -226,7 +214,7 @@ mod tests {
             kernel.run_ready_once().await.unwrap(),
             RunOnceOutcome::Completed
         );
-        let outbox = kernel.drain_outbox().await.unwrap();
+        let outbox = kernel.store.outbox_intents().await.unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(
             outbox[0].payload,
@@ -240,7 +228,7 @@ mod tests {
             IngressOutcome::Duplicate { .. }
         ));
         assert_eq!(kernel.run_ready_once().await.unwrap(), RunOnceOutcome::Idle);
-        assert!(kernel.drain_outbox().await.unwrap().is_empty());
+        assert_eq!(kernel.store.outbox_intents().await.unwrap().len(), 1);
 
         drop(kernel);
         tokio::fs::remove_file(path).await.unwrap();
@@ -294,7 +282,7 @@ mod tests {
             runner.run_once("recovery-worker").await.unwrap(),
             RunOnceOutcome::Completed
         );
-        let outbox = reopened.pending_outbox().await.unwrap();
+        let outbox = reopened.outbox_intents().await.unwrap();
         assert_eq!(outbox.len(), 1);
         assert!(outbox[0].intent_key.contains(original.run_id.as_str()));
 
@@ -316,7 +304,7 @@ mod tests {
                 .unwrap(),
             RunOnceOutcome::Idle
         );
-        assert_eq!(after_commit.pending_outbox().await.unwrap().len(), 1);
+        assert_eq!(after_commit.outbox_intents().await.unwrap().len(), 1);
         drop(after_commit_runner);
         drop(after_commit);
         tokio::fs::remove_file(path).await.unwrap();
@@ -388,7 +376,7 @@ mod tests {
             runner.run_once("recovery-worker").await.unwrap(),
             RunOnceOutcome::WaitingForDecision
         );
-        assert!(reopened.pending_outbox().await.unwrap().is_empty());
+        assert!(reopened.outbox_intents().await.unwrap().is_empty());
 
         drop(runner);
         drop(reopened);

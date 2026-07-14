@@ -195,15 +195,6 @@ pub struct NewOutboxIntent {
     pub payload: OutboxPayload,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutboxRecord {
-    pub id: OutboxId,
-    pub intent_key: String,
-    pub payload: OutboxPayload,
-    pub state: OutboxState,
-    pub attempt_count: i64,
-}
-
 #[derive(Clone, Debug)]
 pub struct FinalizeRun {
     pub run: AttachedRun,
@@ -226,18 +217,6 @@ pub trait CheckpointStore: Send + Sync {
         &self,
         run: &AttachedRun,
         control: &ControlEvent,
-        now: Timestamp,
-    ) -> Result<()>;
-}
-
-#[async_trait]
-pub trait OutboxStore: Send + Sync {
-    async fn pending_outbox(&self) -> Result<Vec<OutboxRecord>>;
-    async fn mark_outbox_delivered(&self, id: &OutboxId, now: Timestamp) -> Result<()>;
-    async fn mark_outbox_failed_terminal(
-        &self,
-        id: &OutboxId,
-        error: &str,
         now: Timestamp,
     ) -> Result<()>;
 }
@@ -335,16 +314,11 @@ pub trait ContextStore: Send + Sync {
 }
 
 pub trait RuntimeStore:
-    DispatchStore + CheckpointStore + OutboxStore + ControlStore + ToolAttemptStore + ContextStore
+    DispatchStore + CheckpointStore + ControlStore + ToolAttemptStore + ContextStore
 {
 }
 
 impl<T> RuntimeStore for T where
-    T: DispatchStore
-        + CheckpointStore
-        + OutboxStore
-        + ControlStore
-        + ToolAttemptStore
-        + ContextStore
+    T: DispatchStore + CheckpointStore + ControlStore + ToolAttemptStore + ContextStore
 {
 }

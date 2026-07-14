@@ -111,6 +111,9 @@ impl SqliteRuntimeStore {
                     archived_unmanaged_files: scalar(
                         "SELECT count(*) FROM legacy_outbox_archive WHERE payload_json LIKE '%/tmp/unmanaged.txt%'",
                     )?,
+                    archived_nonnull_errors: scalar(
+                        "SELECT count(*) FROM legacy_outbox_archive WHERE last_error IS NOT NULL",
+                    )?,
                     v2_outbox: scalar("SELECT count(*) FROM outbox")?,
                     active_runs: scalar("SELECT count(*) FROM runs WHERE state = 'active'")?,
                     pending_events: scalar(
@@ -189,6 +192,7 @@ struct V2Probe {
     archived_outbox: i64,
     archived_outbox_states: i64,
     archived_unmanaged_files: i64,
+    archived_nonnull_errors: i64,
     v2_outbox: i64,
     active_runs: i64,
     pending_events: i64,
@@ -203,7 +207,7 @@ struct V2Probe {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, path::PathBuf};
+    use std::{ffi::OsString, path::Path, path::PathBuf};
 
     use anyhow::{Result, anyhow};
     use tokio_rusqlite::{Connection, rusqlite::OptionalExtension};
@@ -211,8 +215,31 @@ mod tests {
 
     use super::{INITIAL_MIGRATION, SqliteRuntimeStore};
 
-    fn temp_db_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("codrik-{label}-{}.sqlite3", Uuid::new_v4()))
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new(label: &str) -> Self {
+            Self {
+                path: std::env::temp_dir()
+                    .join(format!("codrik-{label}-{}.sqlite3", Uuid::new_v4())),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut path: OsString = self.path.as_os_str().to_owned();
+                path.push(suffix);
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     async fn seed_v1_runtime(path: &Path) -> Result<()> {
@@ -230,26 +257,77 @@ mod tests {
                      VALUES ('work-1', 'actor-1', 'interactive', 'actor_private', 'ready', 1, 1)",
                     [],
                 )?;
-                connection.execute(
-                    "INSERT INTO events (id, actor_id, work_item_id, mailbox_sequence, gateway,
-                        external_id, kind, audience_kind, payload_json, state, created_at, updated_at)
-                     VALUES ('event-1', 'actor-1', 'work-1', 0, 'test', 'external-1',
-                        'user_message', 'actor_private', '{}', 'pending', 1, 1)",
-                    [],
-                )?;
+                for (id, state) in [
+                    ("work-waiting", "waiting"),
+                    ("work-unknown", "blocked_unknown_outcome"),
+                    ("work-decision", "waiting_for_decision"),
+                ] {
+                    connection.execute(
+                        "INSERT INTO work_items (id, actor_id, kind, audience_kind, state, created_at, updated_at)
+                         VALUES (?1, 'actor-1', 'interactive', 'actor_private', ?2, 2, 3)",
+                        (id, state),
+                    )?;
+                }
+                for (index, id, state, payload) in [
+                    (0, "event-1", "pending", r#"{"kind":"pending-evidence"}"#),
+                    (1, "event-processing", "processing", r#"{"kind":"processing-evidence"}"#),
+                    (2, "event-blocked", "blocked", r#"{"kind":"blocked-evidence"}"#),
+                ] {
+                    connection.execute(
+                        "INSERT INTO events (id, actor_id, work_item_id, mailbox_sequence, gateway,
+                            external_id, kind, audience_kind, payload_json, state, created_at, updated_at)
+                         VALUES (?1, 'actor-1', 'work-1', ?2, 'test', ?3,
+                            'user_message', 'actor_private', ?4, ?5, 4, 5)",
+                        (id, index, format!("external-{index}"), payload, state),
+                    )?;
+                }
                 connection.execute(
                     "INSERT INTO runs (id, actor_id, work_item_id, state, lease_generation,
                         observed_sequence, created_at, updated_at)
                      VALUES ('run-1', 'actor-1', 'work-1', 'active', 1, 0, 1, 1)",
                     [],
                 )?;
-                connection.execute(
-                    "INSERT INTO tool_attempts (id, run_id, tool_call_id, tool_name,
-                        arguments_json, capabilities_json, state, created_at, updated_at)
-                     VALUES ('attempt-1', 'run-1', 'call-1', 'read_file', '{}', '[]',
-                        'running', 1, 1)",
-                    [],
-                )?;
+                for (id, call, state, arguments, capabilities, outcome) in [
+                    (
+                        "attempt-prepared",
+                        "call-prepared",
+                        "prepared",
+                        r#"{"path":"/prepared"}"#,
+                        r#"["fs_read"]"#,
+                        None,
+                    ),
+                    (
+                        "attempt-1",
+                        "call-running",
+                        "running",
+                        r#"{"path":"/running"}"#,
+                        r#"["fs_read"]"#,
+                        None,
+                    ),
+                    (
+                        "attempt-unknown",
+                        "call-unknown",
+                        "outcome_unknown",
+                        r#"{"path":"/ambiguous"}"#,
+                        r#"["fs_read"]"#,
+                        Some(r#"{"error":"unknown"}"#),
+                    ),
+                    (
+                        "attempt-decision",
+                        "call-decision",
+                        "waiting_for_decision",
+                        r#"{"path":"/decision"}"#,
+                        r#"["fs_read","network"]"#,
+                        Some(r#"{"decision":"required"}"#),
+                    ),
+                ] {
+                    connection.execute(
+                        "INSERT INTO tool_attempts (id, run_id, tool_call_id, tool_name,
+                            arguments_json, capabilities_json, state, outcome_json, created_at, updated_at)
+                         VALUES (?1, 'run-1', ?2, 'read_file', ?3, ?4, ?5, ?6, 6, 7)",
+                        (id, call, arguments, capabilities, state, outcome),
+                    )?;
+                }
                 connection.execute(
                     "INSERT INTO actor_leases (actor_id, generation, owner_id, expires_at)
                      VALUES ('actor-1', 1, 'owner-1', 999999)",
@@ -339,38 +417,177 @@ mod tests {
         ] {
             assert!(tables.contains(&table.to_string()), "missing {table}");
         }
+        let outbox_columns = store
+            .connection
+            .call(|connection| {
+                let mut statement = connection.prepare("PRAGMA table_info(outbox)")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        for lifecycle_column in [
+            "state",
+            "attempt_count",
+            "claim_owner",
+            "claim_expires_at",
+            "last_error",
+            "updated_at",
+        ] {
+            assert!(
+                !outbox_columns
+                    .iter()
+                    .any(|column| column == lifecycle_column),
+                "v2 outbox must not contain delivery lifecycle column {lifecycle_column}"
+            );
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn v1_migration_archives_outbox_and_quarantines_active_work() -> Result<()> {
-        let path = temp_db_path("v1-quarantine");
-        seed_v1_runtime(&path).await?;
-        let store = SqliteRuntimeStore::open(&path).await?;
+        let db = TempDb::new("v1-quarantine");
+        seed_v1_runtime(db.path()).await?;
+        let store = SqliteRuntimeStore::open(db.path()).await?;
         let probe = store.v2_probe().await?;
 
         assert_eq!(probe.user_version, 2);
         assert_eq!(probe.archived_outbox, 7);
         assert_eq!(probe.archived_outbox_states, 7);
         assert_eq!(probe.archived_unmanaged_files, 1);
+        assert_eq!(
+            probe.archived_nonnull_errors, 0,
+            "authoritative v1 had no outbox last_error source"
+        );
         assert_eq!(probe.v2_outbox, 0);
         assert_eq!(probe.active_runs, 0);
         assert_eq!(probe.pending_events, 0);
-        assert_eq!(probe.quarantined_entities, 4);
+        assert_eq!(probe.quarantined_entities, 12);
         assert_eq!(probe.actor_leases, 0);
         assert_eq!(probe.work_item_state.as_deref(), Some("failed_terminal"));
         assert_eq!(probe.run_state.as_deref(), Some("failed_terminal"));
         assert_eq!(probe.event_state.as_deref(), Some("failed_terminal"));
         assert_eq!(probe.attempt_state.as_deref(), Some("outcome_unknown"));
         assert_eq!(probe.foreign_key_errors, 0);
+        let evidence = store
+            .connection
+            .call(|connection| {
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                    connection.query_row(
+                        "SELECT count(*) FROM work_items WHERE state IN ('ready','waiting','blocked_unknown_outcome','waiting_for_decision')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state FROM events WHERE id = 'event-blocked'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state FROM tool_attempts WHERE id = 'attempt-prepared'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state FROM tool_attempts WHERE id = 'attempt-unknown'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state FROM tool_attempts WHERE id = 'attempt-decision'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT count(*) FROM legacy_runtime_quarantine
+                         WHERE entity_type = 'event' AND entity_id = 'event-blocked'
+                           AND json_extract(snapshot_json, '$.payload_json') = '{\"kind\":\"blocked-evidence\"}'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT count(*) FROM legacy_runtime_quarantine
+                         WHERE entity_type = 'tool_attempt' AND entity_id = 'attempt-unknown'
+                           AND json_extract(snapshot_json, '$.tool_name') = 'read_file'
+                           AND json_extract(snapshot_json, '$.arguments_json') = '{\"path\":\"/ambiguous\"}'
+                           AND json_extract(snapshot_json, '$.capabilities_json') = '[\"fs_read\"]'
+                           AND json_extract(snapshot_json, '$.outcome_json') = '{\"error\":\"unknown\"}'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await?;
+        assert_eq!(evidence.0, 0, "no parent work may remain dispatchable");
+        assert_eq!(evidence.1, "failed_terminal");
+        assert_eq!(evidence.2, "cancelled_known");
+        assert_eq!(evidence.3, "outcome_unknown");
+        assert_eq!(evidence.4, "waiting_for_decision");
+        assert_eq!(evidence.5, 1, "blocked event payload must be preserved");
+        assert_eq!(evidence.6, 1, "ambiguous tool evidence must be complete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_deliveries_reject_update_delete_and_parent_cascade() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        store
+            .connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(
+                    "INSERT INTO actors (id, enabled, tools_json, created_at) VALUES ('actor-1', 1, '[]', 1);
+                     INSERT INTO work_items (id, actor_id, kind, audience_kind, state, created_at, updated_at)
+                     VALUES ('work-1', 'actor-1', 'interactive', 'actor_private', 'completed', 1, 1);
+                     INSERT INTO events (id, actor_id, work_item_id, mailbox_sequence, gateway, external_id,
+                        kind, audience_kind, payload_json, state, created_at, updated_at)
+                     VALUES ('event-1', 'actor-1', 'work-1', 0, 'test', 'external-1', 'user_message',
+                        'actor_private', '{}', 'completed', 1, 1);
+                     INSERT INTO runs (id, actor_id, work_item_id, state, lease_generation, observed_sequence,
+                        created_at, updated_at)
+                     VALUES ('run-1', 'actor-1', 'work-1', 'completed', 1, 0, 1, 1);
+                     INSERT INTO local_requests (request_id, actor_id, event_id, work_item_id, prompt_sha256,
+                        state, created_at, updated_at)
+                     VALUES ('request-1', 'actor-1', 'event-1', 'work-1',
+                        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'active', 1, 1);
+                     INSERT INTO result_bundles (id, request_id, delivery_count, manifest_sha256, state,
+                        created_at, updated_at)
+                     VALUES ('bundle-1', 'request-1', 1,
+                        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'pending', 1, 1);
+                     UPDATE local_requests SET state = 'completed', result_bundle_id = 'bundle-1' WHERE request_id = 'request-1';
+                     INSERT INTO outbox (id, intent_key, actor_id, work_item_id, run_id, intent_class,
+                        audience_kind, payload_json, created_at)
+                     VALUES ('outbox-1', 'intent-1', 'actor-1', 'work-1', 'run-1', 'response',
+                        'actor_private', '{}', 1);
+                     INSERT INTO outbox_deliveries (id, outbox_id, bundle_id, ordinal, transport, address, created_at)
+                     VALUES ('delivery-1', 'outbox-1', 'bundle-1', 0, 'local_ipc', 'request-1', 1);",
+                )?;
+                transaction.commit()
+            })
+            .await?;
+
+        for statement in [
+            "UPDATE outbox_deliveries SET ordinal = 1 WHERE id = 'delivery-1'",
+            "DELETE FROM outbox_deliveries WHERE id = 'delivery-1'",
+            "DELETE FROM result_bundles WHERE id = 'bundle-1'",
+        ] {
+            let result = store
+                .connection
+                .call(move |connection| connection.execute(statement, []))
+                .await;
+            assert!(
+                result.is_err(),
+                "append-only membership allowed: {statement}"
+            );
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn v1_migration_rolls_back_every_schema_change_on_failure() -> Result<()> {
-        let path = temp_db_path("v1-rollback");
-        seed_v1_runtime(&path).await?;
-        let connection = Connection::open(&path).await?;
+        let db = TempDb::new("v1-rollback");
+        seed_v1_runtime(db.path()).await?;
+        let connection = Connection::open(db.path()).await?;
         connection
             .call(|connection| {
                 connection.execute_batch(
@@ -382,8 +599,8 @@ mod tests {
             .await?;
         connection.close().await?;
 
-        assert!(SqliteRuntimeStore::open(&path).await.is_err());
-        let connection = Connection::open(&path).await?;
+        assert!(SqliteRuntimeStore::open(db.path()).await.is_err());
+        let connection = Connection::open(db.path()).await?;
         let (version, old_outbox, archive_exists) = connection
             .call(|connection| {
                 Ok::<_, tokio_rusqlite::rusqlite::Error>((

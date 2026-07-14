@@ -150,6 +150,11 @@ rtk git commit -m "feat(runtime): add serve configuration types"
 **Files:**
 - Create: `src/runtime/migrations/0002_serve.sql`
 - Modify: `src/runtime/sqlite.rs`
+- Modify: `src/runtime/model.rs`
+- Modify: `src/runtime/store.rs`
+- Modify: `src/runtime/service.rs`
+- Modify: `src/runtime/sqlite/checkpoint.rs`
+- Modify: `src/runtime/sqlite/outbox.rs`
 
 **Interfaces:**
 - Consumes: Task 1 domain state names.
@@ -224,16 +229,25 @@ CREATE TABLE result_bundles (
 
 Add `artifacts`, v2 intent-only `outbox`, immutable `outbox_deliveries`, `cancel_targets`, `legacy_outbox_archive`, and `legacy_runtime_quarantine`. Add `failure_count`, `next_attempt_at`, `last_error`, and `cancellation_requested_at` to `work_items`. Rebuild v1 outbox into archive only; terminalize/quarantine nonterminal v1 runtime; update `PRAGMA user_version = 2` last inside one immediate transaction.
 
+Because the v2 outbox is genuinely intent-only, remove the legacy row-level `OutboxStore`, `OutboxRecord`, `OutboxState`, and `LocalKernel::drain_outbox` in this task rather than retaining compatibility lifecycle columns. Update checkpoint inserts and existing tests to inspect immutable intents directly through test-only helpers. `RuntimeStore` no longer depends on `OutboxStore`; Task 5 adds the replacement `BundleStore` after local request routes exist.
+
 - [ ] **Step 4: Run migration tests and inspect integrity**
 
-Run: `rtk cargo test runtime::sqlite::tests`
+Run separately:
+
+```bash
+rtk cargo test runtime::sqlite::tests
+rtk cargo test runtime::sqlite::checkpoint::tests
+rtk cargo test runtime::service::tests
+rtk cargo test runtime::runner::tests
+```
 
 Expected: PASS, including `PRAGMA foreign_key_check` returning no rows and archive/source count equality.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-rtk git add src/runtime/migrations src/runtime/sqlite.rs
+rtk git add src/runtime/migrations src/runtime/model.rs src/runtime/store.rs src/runtime/service.rs src/runtime/sqlite.rs src/runtime/sqlite/checkpoint.rs src/runtime/sqlite/outbox.rs
 rtk git commit -m "feat(runtime): migrate durable store to schema v2"
 ```
 
@@ -550,9 +564,9 @@ pub enum AckOutcome { Delivered, AlreadyDelivered }
 
 Extract one private `create_terminal_bundles(transaction, request_ids, payloads, terminal_state, now)` helper used by successful finalization, cancellation, fifth-failure terminalization, and oversize replacement. Validate canonical payload/manifest sizes before inserting original intents. Gather managed file artifacts from durable tool outcomes and emit typed file intents.
 
-- [ ] **Step 5: Remove the v1 `OutboxStore` drain API**
+- [ ] **Step 5: Complete bundle adoption after the Task 2 legacy removal**
 
-Delete `pending_outbox`, `mark_outbox_delivered`, `LocalKernel::drain_outbox`, and row-level `OutboxState` control flow. Keep `OutboxPayload` as immutable intent data, updated so file payloads reference `ArtifactId`, managed path, size, and hash.
+Verify with `rtk rg 'OutboxStore|OutboxRecord|OutboxState|drain_outbox' src` that Task 2 left no row-level lifecycle API. Keep `OutboxPayload` as immutable intent data, updated so file payloads reference `ArtifactId`, managed path, size, and hash. Replace any remaining test-only intent inspection with bundle assertions where the new bundle behavior now owns the expectation.
 
 - [ ] **Step 6: Run bundle and kernel tests**
 

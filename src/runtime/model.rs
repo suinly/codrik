@@ -261,17 +261,6 @@ pub enum AttemptState {
     WaitingForDecision,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutboxState {
-    Pending,
-    Delivering,
-    Delivered,
-    FailedRetryable,
-    FailedTerminal,
-    OutcomeUnknown,
-    AcknowledgedDuplicate,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalRequestState {

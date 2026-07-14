@@ -651,8 +651,8 @@ fn insert_outbox(
     transaction.execute(
         "INSERT INTO outbox(
             id, intent_key, actor_id, work_item_id, run_id, intent_class,
-            audience_kind, audience_address, payload_json, state, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?10)
+            audience_kind, audience_address, payload_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(intent_key) DO NOTHING",
         params![
             intent.id.as_str(),
@@ -786,8 +786,8 @@ mod tests {
             store::{
                 AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore, ContextStore,
                 DispatchStore, FinalizeOutcome, FinalizeRun, IngressStore, NewInboundEvent,
-                NewOutboxIntent, NewToolAttempt, OutboxPayload, OutboxStore,
-                RuntimeAuthorizationStore, StaleLease, ToolAttemptStore,
+                NewOutboxIntent, NewToolAttempt, OutboxPayload, RuntimeAuthorizationStore,
+                StaleLease, ToolAttemptStore,
             },
         },
     };
@@ -889,7 +889,7 @@ mod tests {
                 .unwrap(),
             FinalizeOutcome::Preempted { newest_sequence: 2 }
         );
-        assert!(store.pending_outbox().await.unwrap().is_empty());
+        assert!(store.outbox_intents().await.unwrap().is_empty());
 
         let resumed = store
             .attach_next_run(&run.lease, 8, Timestamp(201))
@@ -933,7 +933,7 @@ mod tests {
             store.finalize_run(command, Timestamp(203)).await.unwrap(),
             FinalizeOutcome::Completed
         );
-        let outbox = store.pending_outbox().await.unwrap();
+        let outbox = store.outbox_intents().await.unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].intent_key, "intent-1");
         assert!(store.source_events_completed(&resumed).await.unwrap());
@@ -955,7 +955,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.downcast_ref::<StaleLease>().is_some());
-        assert!(store.pending_outbox().await.unwrap().is_empty());
+        assert!(store.outbox_intents().await.unwrap().is_empty());
         assert!(!store.source_events_completed(&run).await.unwrap());
         store.release_lease(&replacement).await.unwrap();
     }
