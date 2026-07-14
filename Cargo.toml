@@ -26,3 +26,6 @@ tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 tokio-util = "0.7.17"
 uuid = { version = "1.23.4", features = ["serde", "v4"] }
 yaml_serde = "0.10.4"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }

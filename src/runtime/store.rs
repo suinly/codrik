@@ -40,6 +40,14 @@ pub struct ExpiredArtifact {
     pub owner: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferencedArtifact {
+    pub id: ArtifactId,
+    pub managed_path: PathBuf,
+    pub size: u64,
+    pub sha256: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedArtifact {
     pub id: ArtifactId,
@@ -75,8 +83,14 @@ pub trait ArtifactStore: Send + Sync {
         now: Timestamp,
         limit: usize,
     ) -> Result<Vec<ExpiredArtifact>>;
-    async fn remove_claimed_staging(&self, artifact: &ExpiredArtifact) -> Result<bool>;
+    async fn complete_claimed_staging(&self, artifact: &ExpiredArtifact) -> Result<bool>;
     async fn artifact_path_exists(&self, path: &std::path::Path) -> Result<bool>;
+    async fn referenced_artifact(
+        &self,
+        actor: &ActorId,
+        sha256: &str,
+        size: u64,
+    ) -> Result<Option<ReferencedArtifact>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

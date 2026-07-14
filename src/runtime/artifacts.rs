@@ -1,11 +1,16 @@
 use std::{
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
+    sync::{Arc, Weak},
     time::UNIX_EPOCH,
 };
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Mutex, OwnedMutexGuard},
+};
 
 use crate::{
     agent::tool::{ToolArtifact, ToolExecution},
@@ -37,11 +42,30 @@ pub struct ArtifactManager<S, C> {
     root: PathBuf,
     store: S,
     clock: C,
+    path_locks: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
+    #[cfg(test)]
+    test_copy_delay: Option<std::time::Duration>,
+    #[cfg(test)]
+    test_copy_failure: bool,
+    #[cfg(test)]
+    test_gc_pause: Option<Arc<TestPause>>,
+}
+
+#[cfg(test)]
+struct TestPause {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+struct PreparedArtifact {
+    artifact: ManagedArtifact,
+    lease: ArtifactLease,
+    partial: PathBuf,
 }
 
 impl<S, C> ArtifactManager<S, C>
 where
-    S: RuntimeStore + Clone,
+    S: RuntimeStore + Clone + 'static,
     C: Clock,
 {
     pub fn new(root: impl Into<PathBuf>, store: S, clock: C) -> Self {
@@ -49,6 +73,13 @@ where
             root: root.into(),
             store,
             clock,
+            path_locks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            test_copy_delay: None,
+            #[cfg(test)]
+            test_copy_failure: false,
+            #[cfg(test)]
+            test_gc_pause: None,
         }
     }
 
@@ -58,19 +89,18 @@ where
         attempt: &AttemptId,
         execution: ToolExecution,
     ) -> Result<DurableToolExecution> {
-        let mut artifacts = Vec::with_capacity(execution.artifacts.len());
-        let mut leases = Vec::with_capacity(execution.artifacts.len());
+        let root = self.prepare_root().await?;
+        let actor_dir =
+            create_private_child(&root, &actor_directory(run.lease.actor_id.as_str())).await?;
+        let staging_dir = create_private_child(&actor_dir, ".staging").await?;
+        let mut prepared = Vec::with_capacity(execution.artifacts.len());
         for raw in execution.artifacts {
             let ToolArtifact::File(file) = raw;
             let size = validate_source(&file.path).await?;
             let id = ArtifactId::new();
             let owner = uuid::Uuid::new_v4().to_string();
-            let actor_dir = self.root.join(actor_directory(run.lease.actor_id.as_str()));
-            let staging_dir = actor_dir.join(".staging");
-            ensure_private_directory(&self.root).await?;
-            ensure_private_directory(&actor_dir).await?;
-            ensure_private_directory(&staging_dir).await?;
             let partial = staging_dir.join(format!("{}.partial", id.as_str()));
+            validate_confined_path(&root, &partial, true).await?;
             let now = self.clock.now();
             let lease = self
                 .store
@@ -92,27 +122,72 @@ where
                 .await?;
             let (sha256, lease) = self.copy_and_hash(&file.path, &partial, lease).await?;
             let final_path = actor_dir.join(&sha256);
-            if tokio::fs::try_exists(&final_path).await? {
-                let metadata = tokio::fs::symlink_metadata(&final_path).await?;
-                if !metadata.file_type().is_file() || metadata.len() != size {
-                    bail!("managed artifact collision for {sha256}");
-                }
-                tokio::fs::remove_file(&partial).await?;
-            } else {
-                tokio::fs::rename(&partial, &final_path).await?;
-            }
-            sync_directory(&actor_dir).await?;
-            artifacts.push(ManagedArtifact {
-                id,
-                managed_path: final_path,
-                display_name: file.display_name,
-                media_type: file.media_type,
-                size,
-                sha256,
-                caption: file.caption,
+            validate_confined_path(&root, &final_path, true).await?;
+            prepared.push(PreparedArtifact {
+                artifact: ManagedArtifact {
+                    id,
+                    managed_path: final_path,
+                    display_name: file.display_name,
+                    media_type: file.media_type,
+                    size,
+                    sha256,
+                    caption: file.caption,
+                },
+                lease,
+                partial,
             });
-            leases.push(lease);
         }
+
+        // The daemon's InstanceLock guarantees one process authority. This registry coordinates
+        // all canonical-path mutations inside that process, from validation through DB commit.
+        let paths = prepared
+            .iter()
+            .map(|item| item.artifact.managed_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut path_guards = Vec::with_capacity(paths.len());
+        for path in paths {
+            path_guards.push(self.lock_path(path).await);
+        }
+        for item in &prepared {
+            if let Some(existing) = self
+                .store
+                .referenced_artifact(
+                    &run.lease.actor_id,
+                    &item.artifact.sha256,
+                    item.artifact.size,
+                )
+                .await?
+            {
+                if existing.managed_path != item.artifact.managed_path {
+                    bail!("referenced artifact is outside its canonical path");
+                }
+                validate_canonical_file(
+                    &root,
+                    &existing.managed_path,
+                    item.artifact.size,
+                    &item.artifact.sha256,
+                )
+                .await?;
+                tokio::fs::remove_file(&item.partial).await?;
+            } else if tokio::fs::try_exists(&item.artifact.managed_path).await? {
+                validate_canonical_file(
+                    &root,
+                    &item.artifact.managed_path,
+                    item.artifact.size,
+                    &item.artifact.sha256,
+                )
+                .await?;
+                tokio::fs::remove_file(&item.partial).await?;
+            } else {
+                tokio::fs::rename(&item.partial, &item.artifact.managed_path).await?;
+            }
+        }
+        sync_directory(&actor_dir).await?;
+        let artifacts = prepared.iter().map(|item| item.artifact.clone()).collect();
+        let leases = prepared
+            .iter()
+            .map(|item| item.lease.clone())
+            .collect::<Vec<_>>();
         let durable = DurableToolExecution {
             observation: execution.observation,
             artifacts,
@@ -120,6 +195,7 @@ where
         self.store
             .commit_staged_execution(run, attempt, durable, &leases, self.clock.now())
             .await?;
+        drop(path_guards);
         match self.store.recover_attempt(attempt).await? {
             crate::runtime::store::AttemptRecovery::Terminal(AttemptOutcome::Succeeded {
                 execution,
@@ -132,7 +208,7 @@ where
         &self,
         source: &Path,
         destination: &Path,
-        mut lease: ArtifactLease,
+        lease: ArtifactLease,
     ) -> Result<(String, ArtifactLease)> {
         let mut input = open_source_no_follow(source).await?;
         let metadata = input.metadata().await?;
@@ -146,62 +222,145 @@ where
             options.mode(0o600);
         }
         let mut output = options.open(destination).await?;
-        let mut hash = Sha256::new();
-        let mut copied = 0_u64;
-        let mut since_renewal = 0_u64;
-        let mut buffer = vec![0_u8; 64 * 1024];
-        loop {
-            let count = input.read(&mut buffer).await?;
-            if count == 0 {
-                break;
+        let lease = Arc::new(Mutex::new(lease));
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let heartbeat_store = self.store.clone();
+        let heartbeat_clock = self.clock.clone();
+        let heartbeat_lease = lease.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => return Ok::<(), anyhow::Error>(()),
+                    _ = interval.tick() => {
+                        let current = heartbeat_lease.lock().await.clone();
+                        let renewed = heartbeat_store.renew_staging(
+                            &current, heartbeat_clock.now().plus_millis(30_000)).await?;
+                        *heartbeat_lease.lock().await = renewed;
+                    }
+                }
             }
-            copied = copied.saturating_add(count as u64);
-            since_renewal += count as u64;
-            if copied > MAX_ARTIFACT_BYTES || copied > metadata.len() {
-                bail!("artifact changed or exceeded 256 MiB while copying");
+        });
+        let copy_result: Result<String> = async {
+            let mut hash = Sha256::new();
+            let mut copied = 0_u64;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let count = input.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                copied = copied.saturating_add(count as u64);
+                if copied > MAX_ARTIFACT_BYTES || copied > metadata.len() {
+                    bail!("artifact changed or exceeded 256 MiB while copying");
+                }
+                output.write_all(&buffer[..count]).await?;
+                hash.update(&buffer[..count]);
+                #[cfg(test)]
+                if self.test_copy_failure {
+                    bail!("injected artifact copy failure");
+                }
+                #[cfg(test)]
+                if let Some(delay) = self.test_copy_delay {
+                    tokio::time::sleep(delay).await;
+                }
             }
-            output.write_all(&buffer[..count]).await?;
-            hash.update(&buffer[..count]);
-            if since_renewal >= 8 * 1024 * 1024 {
-                lease = self
-                    .store
-                    .renew_staging(&lease, self.clock.now().plus_millis(30_000))
-                    .await?;
-                since_renewal = 0;
+            if copied != metadata.len() {
+                bail!("artifact changed while copying");
             }
+            output.sync_all().await?;
+            Ok(format!("{:x}", hash.finalize()))
         }
-        if copied != metadata.len() {
-            bail!("artifact changed while copying");
-        }
-        output.sync_all().await?;
-        Ok((format!("{:x}", hash.finalize()), lease))
+        .await;
+        let _ = stop_tx.send(());
+        let heartbeat_result = heartbeat.await?;
+        let sha256 = copy_result?;
+        heartbeat_result?;
+        let lease = lease.lock().await.clone();
+        Ok((sha256, lease))
     }
 
     pub async fn collect_garbage(&self, now: Timestamp) -> Result<()> {
+        let root = self.prepare_root().await?;
         for expired in self.store.claim_expired_staging(now, 256).await? {
-            if self.store.remove_claimed_staging(&expired).await? {
-                match tokio::fs::remove_file(&expired.managed_path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+            validate_confined_path(&root, &expired.managed_path, true).await?;
+            let _guard = self.lock_path(expired.managed_path.clone()).await;
+            match tokio::fs::remove_file(&expired.managed_path).await {
+                Ok(()) => sync_directory(expired.managed_path.parent().unwrap()).await?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
+            self.store.complete_claimed_staging(&expired).await?;
         }
-        let root = self.root.clone();
-        let files = tokio::task::spawn_blocking(move || orphan_candidates(&root)).await??;
+        let scan_root = root.clone();
+        let files = tokio::task::spawn_blocking(move || orphan_candidates(&scan_root)).await??;
+        let cutoff = now.0.saturating_sub(3_600_000);
         for path in files {
+            validate_confined_path(&root, &path, false).await?;
             if self.store.artifact_path_exists(&path).await? {
                 continue;
             }
             let metadata = tokio::fs::symlink_metadata(&path).await?;
-            if !metadata.file_type().is_file() || modified_millis(&metadata)? > now.0 - 3_600_000 {
+            if !metadata.file_type().is_file() || modified_millis(&metadata)? > cutoff {
                 continue;
             }
+            #[cfg(test)]
+            if let Some(pause) = &self.test_gc_pause {
+                pause.entered.notify_one();
+                pause.resume.notified().await;
+            }
+            let _guard = self.lock_path(path.clone()).await;
             if !self.store.artifact_path_exists(&path).await? {
                 tokio::fs::remove_file(path).await?;
             }
         }
         Ok(())
+    }
+
+    async fn lock_path(&self, path: PathBuf) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.path_locks.lock().await;
+            locks.retain(|_, value| value.strong_count() > 0);
+            if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(path, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    async fn prepare_root(&self) -> Result<PathBuf> {
+        reject_parent_components(&self.root)?;
+        tokio::fs::create_dir_all(&self.root).await?;
+        let metadata = tokio::fs::symlink_metadata(&self.root).await?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("artifact root must be a real directory");
+        }
+        let root = tokio::fs::canonicalize(&self.root).await?;
+        ensure_private_directory(&root).await?;
+        Ok(root)
+    }
+
+    #[cfg(test)]
+    fn with_test_copy_delay(mut self, delay: std::time::Duration) -> Self {
+        self.test_copy_delay = Some(delay);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_copy_failure(mut self) -> Self {
+        self.test_copy_failure = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_gc_pause(mut self, pause: Arc<TestPause>) -> Self {
+        self.test_gc_pause = Some(pause);
+        self
     }
 }
 
@@ -229,11 +388,91 @@ async fn sync_directory(path: &Path) -> Result<()> {
 }
 
 async fn ensure_private_directory(path: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(path).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
+async fn create_private_child(parent: &Path, name: &str) -> Result<PathBuf> {
+    let path = parent.join(name);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("artifact path component is a symlink")
+        }
+        Ok(metadata) if !metadata.is_dir() => bail!("artifact path component is not a directory"),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir(&path).await?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    ensure_private_directory(&path).await?;
+    Ok(path)
+}
+
+fn reject_parent_components(path: &Path) -> Result<()> {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("artifact path containing '..' is not confined");
+    }
+    Ok(())
+}
+
+async fn validate_confined_path(root: &Path, path: &Path, allow_missing_leaf: bool) -> Result<()> {
+    reject_parent_components(path)?;
+    if !path.is_absolute() || !path.starts_with(root) || path == root {
+        bail!("managed path is not confined to artifact root");
+    }
+    let relative = path.strip_prefix(root)?;
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = root.to_owned();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("invalid managed path component");
+        };
+        current.push(component);
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("managed path component is a symlink");
+                }
+                if index + 1 < components.len() && !metadata.is_dir() {
+                    bail!("managed path parent is not a directory");
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && allow_missing_leaf
+                    && index + 1 == components.len() => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+async fn validate_canonical_file(root: &Path, path: &Path, size: u64, sha256: &str) -> Result<()> {
+    validate_confined_path(root, path, false).await?;
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if !metadata.file_type().is_file() || metadata.len() != size {
+        bail!("canonical artifact size mismatch");
+    }
+    let mut file = open_source_no_follow(path).await?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    if format!("{:x}", hash.finalize()) != sha256 {
+        bail!("canonical artifact hash mismatch");
     }
     Ok(())
 }
@@ -244,14 +483,28 @@ fn orphan_candidates(root: &Path) -> Result<Vec<PathBuf>> {
         return Ok(files);
     }
     for actor in std::fs::read_dir(root)? {
-        let actor = actor?.path();
-        if !actor.is_dir() {
+        let actor = actor?;
+        let actor_type = actor.file_type()?;
+        let actor = actor.path();
+        if actor_type.is_symlink() || !actor_type.is_dir() {
             continue;
         }
         for entry in std::fs::read_dir(actor)? {
-            let path = entry?.path();
-            if path.is_file() {
+            let entry = entry?;
+            let entry_type = entry.file_type()?;
+            let path = entry.path();
+            if entry_type.is_symlink() {
+                continue;
+            }
+            if entry_type.is_file() {
                 files.push(path);
+            } else if entry_type.is_dir() && entry.file_name() == ".staging" {
+                for partial in std::fs::read_dir(path)? {
+                    let partial = partial?;
+                    if partial.file_type()?.is_file() {
+                        files.push(partial.path());
+                    }
+                }
             }
         }
     }
@@ -266,9 +519,10 @@ fn modified_millis(metadata: &std::fs::Metadata) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
     use anyhow::Result;
+    use sha2::Digest;
 
     use crate::{
         agent::tool::{FileArtifact, ToolArtifact, ToolCapabilities, ToolExecution},
@@ -284,7 +538,7 @@ mod tests {
         },
     };
 
-    use super::{ArtifactManager, MAX_ARTIFACT_BYTES, validate_source};
+    use super::{ArtifactManager, MAX_ARTIFACT_BYTES, TestPause, validate_source};
 
     #[tokio::test]
     async fn regular_file_passes_preflight() -> Result<()> {
@@ -450,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_quota_rejects_more_than_two_gib_of_staging() -> Result<()> {
+    async fn actor_quota_does_not_count_unretained_staging() -> Result<()> {
         let fixture = ArtifactFixture::new().await?;
         let attempt = fixture.running_attempt("call-quota").await?;
         for index in 0..8 {
@@ -473,7 +727,7 @@ mod tests {
                 )
                 .await?;
         }
-        let error = fixture
+        fixture
             .store
             .begin_staging(
                 crate::runtime::store::BeginArtifact {
@@ -490,9 +744,7 @@ mod tests {
                 },
                 Timestamp(10),
             )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("2 GiB"));
+            .await?;
         Ok(())
     }
 
@@ -568,11 +820,342 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stage_rejects_symlinked_actor_directory() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let source = fixture.root.join("source-symlink.txt");
+        tokio::fs::write(&source, b"artifact").await?;
+        let outside = fixture.root.join("outside");
+        tokio::fs::create_dir_all(&outside).await?;
+        tokio::fs::create_dir_all(&fixture.managed).await?;
+        let actor = fixture
+            .managed
+            .join(super::actor_directory(fixture.run.lease.actor_id.as_str()));
+        std::os::unix::fs::symlink(&outside, &actor)?;
+        let attempt = fixture.running_attempt("call-symlink-dir").await?;
+
+        let error = fixture
+            .manager
+            .stage_execution(
+                &fixture.run,
+                &attempt,
+                file_execution(&source, "report.txt"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("symlink") || error.to_string().contains("confined"));
+        assert!(std::fs::read_dir(outside)?.next().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_rejects_db_crafted_path_outside_root_without_unlinking() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let attempt = fixture.running_attempt("call-crafted-gc").await?;
+        let victim = fixture.root.join("victim.txt");
+        tokio::fs::write(&victim, b"keep").await?;
+        fixture
+            .store
+            .begin_staging(
+                crate::runtime::store::BeginArtifact {
+                    id: crate::runtime::model::ArtifactId::new(),
+                    actor_id: fixture.run.lease.actor_id.clone(),
+                    attempt_id: attempt,
+                    managed_path: victim.clone(),
+                    display_name: "victim".into(),
+                    media_type: "text/plain".into(),
+                    size: 4,
+                    caption: None,
+                    owner: "crafted".into(),
+                    lease_until: Timestamp(10),
+                },
+                Timestamp(1),
+            )
+            .await?;
+
+        let error = fixture
+            .manager
+            .collect_garbage(Timestamp(11))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("confined") || error.to_string().contains("artifact root")
+        );
+        assert_eq!(tokio::fs::read(victim).await?, b"keep");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_existing_canonical_file_is_rejected() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let source = fixture.root.join("source-corrupt.txt");
+        tokio::fs::write(&source, b"good").await?;
+        let sha = format!("{:x}", sha2::Sha256::digest(b"good"));
+        let actor = fixture
+            .managed
+            .join(super::actor_directory(fixture.run.lease.actor_id.as_str()));
+        tokio::fs::create_dir_all(&actor).await?;
+        tokio::fs::write(actor.join(sha), b"evil").await?;
+        let attempt = fixture.running_attempt("call-corrupt").await?;
+
+        let error = fixture
+            .manager
+            .stage_execution(
+                &fixture.run,
+                &attempt,
+                file_execution(&source, "report.txt"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("hash") || error.to_string().contains("collision"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_or_wrong_root_canonical_database_row_cannot_checkpoint() -> Result<()> {
+        for wrong_root in [false, true] {
+            let fixture = ArtifactFixture::new().await?;
+            let source = fixture
+                .root
+                .join(format!("source-missing-{wrong_root}.txt"));
+            tokio::fs::write(&source, b"missing").await?;
+            let sha = format!("{:x}", sha2::Sha256::digest(b"missing"));
+            let expected = fixture
+                .managed
+                .join(super::actor_directory(fixture.run.lease.actor_id.as_str()))
+                .join(&sha);
+            let stored = if wrong_root {
+                fixture.root.join("wrong-root").join(&sha)
+            } else {
+                expected
+            };
+            fixture
+                .store
+                .seed_referenced_artifact_probe(
+                    fixture.run.lease.actor_id.as_str(),
+                    &stored,
+                    7,
+                    &sha,
+                )
+                .await?;
+            let attempt = fixture
+                .running_attempt(&format!("call-missing-{wrong_root}"))
+                .await?;
+
+            let error = fixture
+                .manager
+                .stage_execution(
+                    &fixture.run,
+                    &attempt,
+                    file_execution(&source, "report.txt"),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("canonical")
+                    || error.to_string().contains("outside")
+                    || error.to_string().contains("No such file")
+            );
+            assert_eq!(
+                fixture.store.recover_attempt(&attempt).await?,
+                AttemptRecovery::OutcomeUnknown
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_scans_old_untracked_staging_partials() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let staging = fixture.managed.join("actor").join(".staging");
+        tokio::fs::create_dir_all(&staging).await?;
+        let orphan = staging.join("old.partial");
+        tokio::fs::write(&orphan, b"old").await?;
+        fixture.manager.collect_garbage(Timestamp(i64::MAX)).await?;
+        assert!(!orphan.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_timestamp_cutoff_saturates() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        fixture.manager.collect_garbage(Timestamp(i64::MIN)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_unlink_keeps_claimed_staging_row_for_retry() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let attempt = fixture.running_attempt("call-unlink-fail").await?;
+        let actor = fixture.managed.join("unlink-actor");
+        tokio::fs::create_dir_all(&actor).await?;
+        let directory = actor.join("cannot-unlink-as-file");
+        tokio::fs::create_dir(&directory).await?;
+        fixture
+            .store
+            .begin_staging(
+                crate::runtime::store::BeginArtifact {
+                    id: crate::runtime::model::ArtifactId::new(),
+                    actor_id: fixture.run.lease.actor_id.clone(),
+                    attempt_id: attempt,
+                    managed_path: directory.clone(),
+                    display_name: "dir".into(),
+                    media_type: "x".into(),
+                    size: 0,
+                    caption: None,
+                    owner: "stage".into(),
+                    lease_until: Timestamp(10),
+                },
+                Timestamp(1),
+            )
+            .await?;
+        assert!(
+            fixture
+                .manager
+                .collect_garbage(Timestamp(11))
+                .await
+                .is_err()
+        );
+        assert!(fixture.store.artifact_path_exists(&directory).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crash_after_unlink_before_complete_is_retryable() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let attempt = fixture.running_attempt("call-crash-cleanup").await?;
+        let actor = fixture.managed.join("crash-actor");
+        tokio::fs::create_dir_all(&actor).await?;
+        let partial = actor.join("crash.partial");
+        tokio::fs::write(&partial, b"partial").await?;
+        fixture
+            .store
+            .begin_staging(
+                crate::runtime::store::BeginArtifact {
+                    id: crate::runtime::model::ArtifactId::new(),
+                    actor_id: fixture.run.lease.actor_id.clone(),
+                    attempt_id: attempt,
+                    managed_path: partial.clone(),
+                    display_name: "partial".into(),
+                    media_type: "x".into(),
+                    size: 7,
+                    caption: None,
+                    owner: "stage".into(),
+                    lease_until: Timestamp(10),
+                },
+                Timestamp(1),
+            )
+            .await?;
+        let claimed = fixture
+            .store
+            .claim_expired_staging(Timestamp(11), 1)
+            .await?;
+        tokio::fs::remove_file(&partial).await?;
+        assert!(fixture.store.artifact_path_exists(&partial).await?);
+
+        fixture.manager.collect_garbage(Timestamp(41_012)).await?;
+
+        assert!(!fixture.store.artifact_path_exists(&partial).await?);
+        assert_eq!(claimed.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_copy_renews_staging_lease_on_time_not_byte_progress() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let source = fixture.root.join("slow.txt");
+        tokio::fs::write(&source, vec![7_u8; 128 * 1024]).await?;
+        let attempt = fixture.running_attempt("call-slow").await?;
+        let manager = fixture
+            .manager
+            .clone()
+            .with_test_copy_delay(std::time::Duration::from_secs(31));
+        let run = fixture.run.clone();
+        let task = tokio::spawn(async move {
+            manager
+                .stage_execution(&run, &attempt, file_execution(&source, "slow.txt"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        fixture.clock.advance(31_000);
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+
+        assert!(task.await??.artifacts[0].managed_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_copy_stops_lease_heartbeat() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let source = fixture.root.join("failed-copy.txt");
+        tokio::fs::write(&source, b"fail").await?;
+        let attempt = fixture.running_attempt("call-failed-copy").await?;
+        let manager = fixture.manager.clone().with_test_copy_failure();
+        assert!(
+            manager
+                .stage_execution(
+                    &fixture.run,
+                    &attempt,
+                    file_execution(&source, "failed.txt")
+                )
+                .await
+                .is_err()
+        );
+        fixture.clock.advance(40_000);
+        tokio::time::advance(std::time::Duration::from_secs(40)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fixture.store.staging_expiry_probe(&attempt).await?,
+            Some(Timestamp(30_010))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_gc_racing_successful_commit_preserves_referenced_bytes() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let source = fixture.root.join("race.txt");
+        tokio::fs::write(&source, b"race bytes").await?;
+        let sha = format!("{:x}", sha2::Sha256::digest(b"race bytes"));
+        let actor = fixture
+            .managed
+            .join(super::actor_directory(fixture.run.lease.actor_id.as_str()));
+        tokio::fs::create_dir_all(&actor).await?;
+        let canonical = actor.join(sha);
+        tokio::fs::write(&canonical, b"race bytes").await?;
+        let pause = Arc::new(TestPause {
+            entered: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let gc_manager = fixture.manager.clone().with_test_gc_pause(pause.clone());
+        let gc = tokio::spawn(async move { gc_manager.collect_garbage(Timestamp(i64::MAX)).await });
+        pause.entered.notified().await;
+
+        let attempt = fixture.running_attempt("call-race").await?;
+        fixture
+            .manager
+            .stage_execution(&fixture.run, &attempt, file_execution(&source, "race.txt"))
+            .await?;
+        pause.resume.notify_one();
+        gc.await??;
+
+        assert_eq!(tokio::fs::read(canonical).await?, b"race bytes");
+        Ok(())
+    }
+
     struct ArtifactFixture {
         root: PathBuf,
         managed: PathBuf,
         store: SqliteRuntimeStore,
         manager: ArtifactManager<SqliteRuntimeStore, ManualClock>,
+        clock: ManualClock,
         run: crate::runtime::store::AttachedRun,
     }
 
@@ -580,7 +1163,8 @@ mod tests {
         async fn new() -> Result<Self> {
             let root = temp_path("fixture");
             let managed = root.join("managed");
-            tokio::fs::create_dir_all(&root).await?;
+            tokio::fs::create_dir_all(&managed).await?;
+            let managed = tokio::fs::canonicalize(managed).await?;
             let store = SqliteRuntimeStore::open(root.join("runtime.sqlite3")).await?;
             store
                 .import_legacy_authorization(
@@ -614,7 +1198,7 @@ mod tests {
                 )
                 .await?;
             let lease = store
-                .acquire_ready_actor("worker", Timestamp(3), Timestamp(10_000))
+                .acquire_ready_actor("worker", Timestamp(3), Timestamp(100_000))
                 .await?
                 .unwrap();
             let run = store
@@ -632,13 +1216,15 @@ mod tests {
                     Timestamp(5),
                 )
                 .await?;
-            let manager = ArtifactManager::new(&managed, store.clone(), ManualClock::new(10));
+            let clock = ManualClock::new(10);
+            let manager = ArtifactManager::new(&managed, store.clone(), clock.clone());
             Ok(Self {
                 root,
                 managed,
                 store,
                 manager,
                 run,
+                clock,
             })
         }
 

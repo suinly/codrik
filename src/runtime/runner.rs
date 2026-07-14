@@ -68,7 +68,7 @@ impl<L, T, S, C> ActorRunner<L, T, S, C>
 where
     L: LlmClient + Send + Sync,
     T: ToolExecutor + Send + Sync,
-    S: RuntimeStore + Clone,
+    S: RuntimeStore + Clone + 'static,
     C: Clock,
 {
     pub fn new(
@@ -773,7 +773,8 @@ mod tests {
             std::env::temp_dir().join(format!("codrik-runner-artifact-{}", uuid::Uuid::new_v4()));
         let source = root.join("source.txt");
         let managed = root.join("managed");
-        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::create_dir_all(&managed).await.unwrap();
+        let managed = tokio::fs::canonicalize(managed).await.unwrap();
         tokio::fs::write(&source, b"runner artifact").await.unwrap();
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let llm = ScriptedLlm {

@@ -19,7 +19,7 @@ impl<L, T, S, C> ReadyRunner for ActorRunner<L, T, S, C>
 where
     L: crate::llm::client::LlmClient + Send + Sync,
     T: crate::agent::tool::ToolExecutor + Send + Sync,
-    S: RuntimeStore + Send + Sync + Clone,
+    S: RuntimeStore + Send + Sync + Clone + 'static,
     C: crate::runtime::model::Clock,
 {
     fn now(&self) -> Timestamp {
