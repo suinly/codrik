@@ -7,7 +7,7 @@ use crate::{
     runtime::{
         model::{ActorId, Audience, EventId, RunId, Timestamp, WorkItemId},
         sqlite::{SqliteRuntimeStore, map_call_error},
-        store::{ActorLease, AttachedRun, DispatchStore, StaleLease},
+        store::{ActorLease, AttachedRun, ControlEvent, ControlStore, DispatchStore, StaleLease},
     },
 };
 
@@ -306,6 +306,64 @@ impl DispatchStore for SqliteRuntimeStore {
     }
 }
 
+#[async_trait]
+impl ControlStore for SqliteRuntimeStore {
+    async fn newer_control_event(
+        &self,
+        lease: &ActorLease,
+        observed_sequence: i64,
+        now: Timestamp,
+    ) -> Result<Option<ControlEvent>> {
+        let lease = lease.clone();
+        self.connection
+            .call(move |connection| -> Result<Option<ControlEvent>> {
+                let transaction = connection.transaction()?;
+                ensure_current_lease(&transaction, &lease, now)?;
+                let event = transaction
+                    .query_row(
+                        "SELECT events.id, events.mailbox_sequence, events.kind
+                         FROM events
+                         WHERE events.actor_id = ?1
+                           AND events.state = 'pending'
+                           AND events.mailbox_sequence > ?2
+                           AND events.kind IN ('cancel_requested', 'user_message')
+                           AND EXISTS (
+                              SELECT 1 FROM runs
+                              JOIN work_items ON work_items.id = runs.work_item_id
+                              WHERE runs.actor_id = events.actor_id
+                                AND runs.state = 'active'
+                                AND work_items.audience_kind = events.audience_kind
+                                AND work_items.audience_address IS events.audience_address
+                           )
+                         ORDER BY CASE events.kind
+                            WHEN 'cancel_requested' THEN 0 ELSE 1 END,
+                            events.mailbox_sequence
+                         LIMIT 1",
+                        params![lease.actor_id.as_str(), observed_sequence],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                event
+                    .map(|(id, sequence, kind)| {
+                        Ok(ControlEvent {
+                            event_id: EventId::from_string(id),
+                            sequence,
+                            kind: decode_event_kind(&kind)?,
+                        })
+                    })
+                    .transpose()
+            })
+            .await
+            .map_err(map_call_error)
+    }
+}
+
 struct StoredEvent {
     id: String,
     sequence: i64,
@@ -385,6 +443,15 @@ fn event_message(payload_json: &str) -> Result<Message> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("inbound event payload is missing text"))?;
     Ok(Message::user(text))
+}
+
+fn decode_event_kind(kind: &str) -> Result<crate::runtime::model::EventKind> {
+    match kind {
+        "user_message" => Ok(crate::runtime::model::EventKind::UserMessage),
+        "cancel_requested" => Ok(crate::runtime::model::EventKind::CancelRequested),
+        "external_completion" => Ok(crate::runtime::model::EventKind::ExternalCompletion),
+        _ => bail!("invalid stored event kind: {kind}"),
+    }
 }
 
 #[cfg(test)]
@@ -583,5 +650,57 @@ mod tests {
         store.release_lease(&first).await.unwrap();
 
         assert_eq!(store.current_lease().await.unwrap(), Some(second));
+    }
+
+    #[tokio::test]
+    async fn durable_cancellation_survives_signal_loss() {
+        use crate::runtime::{
+            model::EventKind,
+            signals::ActorSignals,
+            store::{ControlEvent, ControlStore, NewInboundEvent},
+        };
+
+        let store = store_with_event().await;
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(100), Timestamp(400))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(101))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .ingest(
+                NewInboundEvent {
+                    gateway: "local".into(),
+                    external_id: "cancel-1".into(),
+                    identity_provider: "telegram".into(),
+                    identity_subject: "123".into(),
+                    kind: EventKind::CancelRequested,
+                    audience: Audience::ActorPrivate,
+                    payload_json: r#"{"type":"cancel"}"#.into(),
+                },
+                Timestamp(200),
+            )
+            .await
+            .unwrap();
+
+        let signals = ActorSignals::default();
+        drop(signals);
+
+        let control = store
+            .newer_control_event(&lease, run.observed_sequence, Timestamp(300))
+            .await
+            .unwrap();
+        assert!(matches!(
+            control,
+            Some(ControlEvent {
+                sequence: 2,
+                kind: EventKind::CancelRequested,
+                ..
+            })
+        ));
     }
 }

@@ -5,7 +5,7 @@ use tokio_rusqlite::params;
 use crate::runtime::{
     model::{OutboxId, OutboxState, Timestamp},
     sqlite::{SqliteRuntimeStore, map_call_error},
-    store::{OutboxPayload, OutboxRecord, OutboxStore},
+    store::{OutboxRecord, OutboxStore},
 };
 
 #[async_trait]

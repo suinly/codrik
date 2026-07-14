@@ -228,3 +228,20 @@ pub trait OutboxStore: Send + Sync {
         now: Timestamp,
     ) -> Result<()>;
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlEvent {
+    pub event_id: EventId,
+    pub sequence: i64,
+    pub kind: EventKind,
+}
+
+#[async_trait]
+pub trait ControlStore: Send + Sync {
+    async fn newer_control_event(
+        &self,
+        lease: &ActorLease,
+        observed_sequence: i64,
+        now: Timestamp,
+    ) -> Result<Option<ControlEvent>>;
+}
