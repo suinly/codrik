@@ -39,17 +39,29 @@ impl SqliteRuntimeStore {
 
     async fn initialize(connection: Connection, use_wal: bool) -> Result<Self> {
         connection
-            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+            .call(move |connection| -> Result<()> {
                 connection
                     .execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
                 if use_wal {
                     connection.execute_batch("PRAGMA journal_mode = WAL;")?;
                 }
-                connection.execute_batch(INITIAL_MIGRATION)?;
+                let version =
+                    connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+                match version {
+                    0 => {
+                        let transaction = connection.transaction()?;
+                        transaction.execute_batch(INITIAL_MIGRATION)?;
+                        transaction.execute_batch("PRAGMA user_version = 1;")?;
+                        transaction.commit()?;
+                    }
+                    1 => {}
+                    other => anyhow::bail!("unsupported runtime schema version: {other}"),
+                }
                 Ok(())
             })
             .await
-            .map_err(|error| anyhow!("failed to initialize runtime database: {error}"))?;
+            .map_err(map_call_error)
+            .context("failed to initialize runtime database")?;
 
         Ok(Self { connection })
     }

@@ -106,6 +106,10 @@ where
         }
     }
 
+    pub fn now(&self) -> crate::runtime::model::Timestamp {
+        self.clock.now()
+    }
+
     async fn run_leased(
         &self,
         lease: &crate::runtime::store::ActorLease,
