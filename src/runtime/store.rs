@@ -1,5 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::{agent::message::Message, auth::LegacyAuthorizationSnapshot, runtime::model::*};
 
@@ -153,4 +155,76 @@ pub struct AttachedRun {
     pub source_event_ids: Vec<EventId>,
     pub audience: Audience,
     pub messages: Vec<Message>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckpointRun {
+    pub run: AttachedRun,
+    pub incorporated_event_ids: Vec<EventId>,
+    pub checkpointed_attempt_ids: Vec<AttemptId>,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutboxPayload {
+    Text {
+        text: String,
+    },
+    File {
+        path: PathBuf,
+        display_name: String,
+        media_type: String,
+        caption: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct NewOutboxIntent {
+    pub id: OutboxId,
+    pub intent_key: String,
+    pub intent_class: String,
+    pub audience: Audience,
+    pub payload: OutboxPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxRecord {
+    pub id: OutboxId,
+    pub intent_key: String,
+    pub payload: OutboxPayload,
+    pub state: OutboxState,
+    pub attempt_count: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct FinalizeRun {
+    pub run: AttachedRun,
+    pub incorporated_event_ids: Vec<EventId>,
+    pub final_messages: Vec<Message>,
+    pub outbox: Vec<NewOutboxIntent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    Completed,
+    Preempted { newest_sequence: i64 },
+}
+
+#[async_trait]
+pub trait CheckpointStore: Send + Sync {
+    async fn checkpoint_run(&self, command: CheckpointRun, now: Timestamp) -> Result<()>;
+    async fn finalize_run(&self, command: FinalizeRun, now: Timestamp) -> Result<FinalizeOutcome>;
+}
+
+#[async_trait]
+pub trait OutboxStore: Send + Sync {
+    async fn pending_outbox(&self) -> Result<Vec<OutboxRecord>>;
+    async fn mark_outbox_delivered(&self, id: &OutboxId, now: Timestamp) -> Result<()>;
+    async fn mark_outbox_failed_terminal(
+        &self,
+        id: &OutboxId,
+        error: &str,
+        now: Timestamp,
+    ) -> Result<()>;
 }

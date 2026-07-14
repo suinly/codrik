@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::llm::client::LlmToolCall;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<MessagePart>,
@@ -81,7 +83,7 @@ fn text_from_parts(parts: &[MessagePart]) -> String {
         .join("\n")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub id: String,
     pub relative_path: PathBuf,
@@ -111,13 +113,14 @@ impl Attachment {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum MessagePart {
     Text(String),
     Attachment(Attachment),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInput {
     parts: Vec<MessagePart>,
 }
@@ -165,7 +168,7 @@ impl From<&str> for UserInput {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     User,
     Assistant,
@@ -175,7 +178,9 @@ pub enum Role {
 
 #[cfg(test)]
 mod tests {
-    use super::{Attachment, MessagePart, UserInput};
+    use crate::llm::client::LlmToolCall;
+
+    use super::{Attachment, Message, MessagePart, UserInput};
 
     #[test]
     fn user_input_preserves_text_then_attachment() {
@@ -203,5 +208,31 @@ mod tests {
     #[test]
     fn string_becomes_text_only_user_input() {
         assert_eq!(UserInput::from("hello").text(), "hello");
+    }
+
+    #[test]
+    fn message_serde_round_trip_preserves_tool_calls_and_attachments() {
+        let message = Message::assistant_tool_calls(
+            "working",
+            vec![LlmToolCall {
+                id: "call-1".into(),
+                name: "inspect".into(),
+                arguments: r#"{"path":"screen.png"}"#.into(),
+            }],
+        );
+        let attached = Message::user(UserInput::new().push_attachment(Attachment::new(
+            "att-1",
+            "attachments/att-1.png",
+            "screen.png",
+            "image/png",
+            4,
+            "abcd",
+        )));
+
+        for original in [message, attached] {
+            let json = serde_json::to_string(&original).unwrap();
+            let decoded: Message = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, original);
+        }
     }
 }

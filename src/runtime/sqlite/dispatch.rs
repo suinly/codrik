@@ -312,7 +312,7 @@ struct StoredEvent {
     payload_json: String,
 }
 
-fn ensure_current_lease(
+pub(super) fn ensure_current_lease(
     transaction: &tokio_rusqlite::rusqlite::Transaction<'_>,
     lease: &ActorLease,
     now: Timestamp,
