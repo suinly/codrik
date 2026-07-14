@@ -135,6 +135,12 @@ impl CheckpointStore for SqliteRuntimeStore {
                 if changed != 1 {
                     bail!("cancellation event is no longer pending");
                 }
+                transaction.execute(
+                    "UPDATE tool_attempts
+                     SET state = 'outcome_unknown', updated_at = ?2
+                     WHERE run_id = ?1 AND state = 'running'",
+                    params![run.run_id.as_str(), now.0],
+                )?;
                 let request_ids = cancellation_target_requests(&transaction, &run, &control)?;
                 let cancellation = NewOutboxIntent {
                     id: OutboxId::new(),
@@ -1511,7 +1517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_cancellation_archives_every_request_but_preserves_unknown_attempt_truth() {
+    async fn local_cancellation_archives_every_request_and_marks_running_attempt_unknown() {
         let (store, run, mut requests) = local_store_with_run(2).await;
         let late_request = RequestId::new();
         store
@@ -1535,10 +1541,6 @@ mod tests {
             .mark_attempt_running(&run, &attempt.id, Timestamp(111))
             .await
             .unwrap();
-        assert_eq!(
-            store.recover_attempt(&attempt.id).await.unwrap(),
-            AttemptRecovery::OutcomeUnknown
-        );
         store
             .cancel_for_actor(
                 &run.lease.actor_id,
@@ -1591,6 +1593,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(nonterminal_events, 0);
+        let attempt_id = attempt.id.to_string();
+        let durable_attempt_state = store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT state FROM tool_attempts WHERE id = ?1",
+                    [attempt_id],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(durable_attempt_state, "outcome_unknown");
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await.unwrap(),
+            AttemptRecovery::OutcomeUnknown
+        );
         assert_eq!(
             store.recover_attempt(&attempt.id).await.unwrap(),
             AttemptRecovery::OutcomeUnknown

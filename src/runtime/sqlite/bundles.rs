@@ -41,6 +41,16 @@ impl BundleStore for SqliteRuntimeStore {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
+                transaction.execute(
+                    "UPDATE result_bundles
+                     SET state = 'failed_retryable', claim_owner = NULL,
+                         claim_expires_at = NULL, next_attempt_at = ?1,
+                         last_error = 'bundle claim expired before acknowledgement',
+                         updated_at = ?1
+                     WHERE state = 'delivering' AND claim_expires_at IS NOT NULL
+                       AND claim_expires_at <= ?1",
+                    [now.0],
+                )?;
                 let candidates = {
                     let mut statement = transaction.prepare(
                         "SELECT id, request_id FROM result_bundles
@@ -150,16 +160,30 @@ impl BundleStore for SqliteRuntimeStore {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
-                let (request_id, state) = transaction
+                let (request_id, state, reciprocal_bundle_id) = transaction
                     .query_row(
-                        "SELECT request_id, state FROM result_bundles WHERE id = ?1",
+                        "SELECT result_bundles.request_id, result_bundles.state,
+                                local_requests.result_bundle_id
+                         FROM result_bundles
+                         JOIN local_requests
+                           ON local_requests.request_id = result_bundles.request_id
+                         WHERE result_bundles.id = ?1",
                         [ack.bundle_id.as_str()],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
                     )
                     .optional()?
                     .ok_or_else(|| anyhow!("bundle was not found"))?;
                 if request_id != ack.request_id.as_str() {
                     bail!("bundle does not belong to request");
+                }
+                if reciprocal_bundle_id.as_deref() != Some(ack.bundle_id.as_str()) {
+                    bail!("request does not reciprocally own the acknowledged bundle");
                 }
                 let canonical_bundle = load_bundle_row(&transaction, ack.bundle_id.as_str())?;
                 let durable = {
@@ -601,6 +625,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_delivering_bundle_is_recovered_and_reclaimed_without_stealing_live_claim() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let expired = seed_bundle(&store, "delivering", 1, false).await.unwrap();
+        let live = seed_bundle(&store, "delivering", 1, false).await.unwrap();
+        let live_bundle = live.bundle_id.to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE result_bundles SET claim_expires_at = 50 WHERE id = ?1",
+                    [live_bundle],
+                )
+            })
+            .await
+            .unwrap();
+        let old_claim = BundleClaim {
+            bundle_id: expired.bundle_id.clone(),
+            owner: "worker".into(),
+            expires_at: Timestamp(30),
+        };
+
+        let claimed = store
+            .claim_ready_bundles(
+                "replacement",
+                &[expired.request_id.clone(), live.request_id.clone()],
+                Timestamp(31),
+                Timestamp(60),
+                32,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].bundle.id, expired.bundle_id);
+        assert_eq!(claimed[0].claim.owner, "replacement");
+        assert!(
+            store
+                .renew_bundle(&old_claim, Timestamp(32), Timestamp(70))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .fail_bundle_retryable(&old_claim, "stale worker", Timestamp(40), Timestamp(32))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_bundle(&live.bundle_id).await.unwrap().state,
+            BundleState::Delivering
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_null_reciprocal_request_bundle_link_without_state_change() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "delivering", 1, false).await.unwrap();
+        let request_id = seeded.request_id.to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+                connection.execute(
+                    "UPDATE local_requests SET result_bundle_id = NULL WHERE request_id = ?1",
+                    [request_id],
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .acknowledge_bundle(seeded.ack(), Timestamp(2))
+                .await
+                .is_err()
+        );
+        assert_eq!(bundle_state(&store, &seeded.bundle_id).await, "delivering");
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_crossed_reciprocal_request_bundle_links_without_state_change() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let first = seed_bundle(&store, "delivering", 1, false).await.unwrap();
+        let second = seed_bundle(&store, "delivering", 1, false).await.unwrap();
+        let first_request = first.request_id.to_string();
+        let second_request = second.request_id.to_string();
+        let first_bundle = first.bundle_id.to_string();
+        let second_bundle = second.bundle_id.to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+                connection.execute(
+                    "UPDATE local_requests SET result_bundle_id = NULL
+                     WHERE request_id IN (?1, ?2)",
+                    params![first_request, second_request],
+                )?;
+                connection.execute(
+                    "UPDATE local_requests SET result_bundle_id = ?2 WHERE request_id = ?1",
+                    params![first_request, second_bundle],
+                )?;
+                connection.execute(
+                    "UPDATE local_requests SET result_bundle_id = ?2 WHERE request_id = ?1",
+                    params![second_request, first_bundle],
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .acknowledge_bundle(first.ack(), Timestamp(2))
+                .await
+                .is_err()
+        );
+        assert_eq!(bundle_state(&store, &first.bundle_id).await, "delivering");
+    }
+
+    #[tokio::test]
     async fn ack_validates_request_route_without_partial_state_change() {
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
         let seeded = seed_bundle(&store, "delivering", 1, true).await.unwrap();
@@ -673,6 +816,21 @@ mod tests {
                 delivery_ids: self.delivery_ids.clone(),
             }
         }
+    }
+
+    async fn bundle_state(store: &SqliteRuntimeStore, id: &BundleId) -> String {
+        let id = id.to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT state FROM result_bundles WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap()
     }
 
     async fn seed_bundle(
