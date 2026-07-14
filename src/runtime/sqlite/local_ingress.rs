@@ -188,17 +188,21 @@ impl LocalIngressStore for SqliteRuntimeStore {
                     )
                     .optional()?
                     .ok_or_else(|| anyhow!("local request was not found for actor"))?;
-                let already_terminal = state != "active";
-                let affected_request_ids = if already_terminal {
-                    Vec::new()
-                } else {
-                    transaction.execute(
-                        "UPDATE work_items
-                         SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?2),
-                             updated_at = max(updated_at, ?2)
-                         WHERE id = ?1",
-                        params![work_item_id, now.0],
-                    )?;
+                if state != "active" {
+                    return Ok(CancelOutcome {
+                        cancel_id: command.cancel_id,
+                        affected_request_ids: Vec::new(),
+                        already_terminal: true,
+                    });
+                }
+                transaction.execute(
+                    "UPDATE work_items
+                     SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?2),
+                         updated_at = max(updated_at, ?2)
+                     WHERE id = ?1",
+                    params![work_item_id, now.0],
+                )?;
+                let affected_request_ids = {
                     let mut statement = transaction.prepare(
                         "SELECT request_id FROM local_requests
                          WHERE actor_id = ?1 AND work_item_id = ?2 AND state = 'active'
@@ -216,7 +220,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                 let event_id = EventId::new();
                 let payload_json = serde_json::to_string(&StoredCancelPayload {
                     request_id: command.request_id.clone(),
-                    already_terminal,
+                    already_terminal: false,
                 })?;
                 transaction.execute(
                     "INSERT INTO events(
@@ -232,7 +236,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                         LOCAL_CANCEL_GATEWAY,
                         command.cancel_id.as_str(),
                         payload_json,
-                        if already_terminal { "completed" } else { "pending" },
+                        "pending",
                         now.0,
                     ],
                 )?;
@@ -247,7 +251,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                 Ok(CancelOutcome {
                     cancel_id: command.cancel_id,
                     affected_request_ids,
-                    already_terminal,
+                    already_terminal: false,
                 })
             })
             .await
@@ -374,6 +378,25 @@ fn decode_local_request_state(value: &str) -> Result<LocalRequestState> {
 
 #[cfg(test)]
 impl SqliteRuntimeStore {
+    async fn actor_event_sequence_counts(&self, actor: &ActorId) -> Result<(i64, i64)> {
+        let actor = actor.clone();
+        self.connection
+            .call(
+                move |connection| -> tokio_rusqlite::rusqlite::Result<(i64, i64)> {
+                    connection.query_row(
+                        "SELECT
+                        (SELECT count(*) FROM events WHERE actor_id = actors.id),
+                        next_mailbox_sequence
+                     FROM actors WHERE id = ?1",
+                        [actor.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                },
+            )
+            .await
+            .map_err(|error| anyhow!("failed to inspect actor ingress counts: {error}"))
+    }
+
     async fn gateway_counts(&self) -> Result<(i64, i64)> {
         self.connection
             .call(
@@ -664,6 +687,7 @@ mod tests {
             )
             .await?;
         let command = cancel("0190f2ef-0000-7000-8000-000000000043", request.clone())?;
+        let before = store.actor_event_sequence_counts(&actor).await?;
 
         let first = store
             .cancel_for_actor(&actor, command.clone(), Timestamp(3))
@@ -674,6 +698,8 @@ mod tests {
         assert!(first.already_terminal);
         assert!(first.affected_request_ids.is_empty());
         assert_eq!(second, first);
+        assert_eq!(store.actor_event_sequence_counts(&actor).await?, before);
+        assert_eq!(store.gateway_counts().await?, (1, 0));
         assert_eq!(
             store.resolve_local_request(&request).await?.unwrap().state,
             LocalRequestState::Completed

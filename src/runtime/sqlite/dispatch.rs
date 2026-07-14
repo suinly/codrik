@@ -38,11 +38,29 @@ impl DispatchStore for SqliteRuntimeStore {
                             OR actor_leases.owner_id = ?1
                             OR actor_leases.expires_at <= ?2
                          ) AND (
-                            EXISTS (SELECT 1 FROM events WHERE events.actor_id = actors.id AND events.state = 'pending')
+                            EXISTS (
+                               SELECT 1 FROM events
+                               JOIN work_items ON work_items.id = events.work_item_id
+                               WHERE events.actor_id = actors.id
+                                 AND events.state = 'pending'
+                                 AND (
+                                    work_items.cancellation_requested_at IS NULL
+                                    OR events.kind = 'cancel_requested'
+                                 )
+                            )
                             OR EXISTS (SELECT 1 FROM runs WHERE runs.actor_id = actors.id AND runs.state = 'active')
                          )
                          ORDER BY COALESCE(
-                            (SELECT MIN(mailbox_sequence) FROM events WHERE events.actor_id = actors.id AND events.state = 'pending'),
+                            (
+                               SELECT MIN(events.mailbox_sequence) FROM events
+                               JOIN work_items ON work_items.id = events.work_item_id
+                               WHERE events.actor_id = actors.id
+                                 AND events.state = 'pending'
+                                 AND (
+                                    work_items.cancellation_requested_at IS NULL
+                                    OR events.kind = 'cancel_requested'
+                                 )
+                            ),
                             (SELECT MIN(events.mailbox_sequence) FROM events JOIN run_events ON run_events.event_id = events.id JOIN runs ON runs.id = run_events.run_id WHERE runs.actor_id = actors.id AND runs.state = 'active'),
                             9223372036854775807
                          ), actors.id
@@ -346,11 +364,9 @@ impl ControlStore for SqliteRuntimeStore {
                            AND events.kind IN ('cancel_requested', 'user_message')
                            AND EXISTS (
                               SELECT 1 FROM runs
-                              JOIN work_items ON work_items.id = runs.work_item_id
                               WHERE runs.actor_id = events.actor_id
                                 AND runs.state = 'active'
-                                AND work_items.audience_kind = events.audience_kind
-                                AND work_items.audience_address IS events.audience_address
+                                AND runs.work_item_id = events.work_item_id
                            )
                          ORDER BY CASE events.kind
                             WHEN 'cancel_requested' THEN 0 ELSE 1 END,
@@ -509,6 +525,49 @@ impl SqliteRuntimeStore {
             .await
             .map_err(|error| anyhow!("failed to inspect actor lease: {error}"))
     }
+
+    async fn activate_event_for_test(
+        &self,
+        lease: &ActorLease,
+        work_item_id: &WorkItemId,
+        event_id: &EventId,
+        now: Timestamp,
+    ) -> Result<()> {
+        let lease = lease.clone();
+        let work_item_id = work_item_id.clone();
+        let event_id = event_id.clone();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                let transaction = connection.transaction()?;
+                let run_id = RunId::new();
+                transaction.execute(
+                    "INSERT INTO runs(
+                        id, actor_id, work_item_id, state, lease_generation,
+                        observed_sequence, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 'active', ?4, 0, ?5, ?5)",
+                    params![
+                        run_id.as_str(),
+                        lease.actor_id.as_str(),
+                        work_item_id.as_str(),
+                        lease.generation,
+                        now.0,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO run_events(run_id, event_id) VALUES (?1, ?2)",
+                    params![run_id.as_str(), event_id.as_str()],
+                )?;
+                transaction.execute(
+                    "UPDATE events SET state = 'processing', run_id = ?2, updated_at = ?3
+                     WHERE id = ?1",
+                    params![event_id.as_str(), run_id.as_str(), now.0],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
 }
 
 #[cfg(test)]
@@ -519,8 +578,9 @@ mod tests {
             model::{ActorId, Audience, CancelId, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                DispatchStore, IngressStore, LocalCancel, LocalIngressStore, LocalSubmission,
-                NewInboundEvent, RuntimeAuthorizationStore, StaleLease,
+                ControlStore, DispatchStore, IngressStore, LocalCancel, LocalIngressStore,
+                LocalSubmission, LocalSubmitOutcome, NewInboundEvent, RuntimeAuthorizationStore,
+                StaleLease,
             },
         },
     };
@@ -791,6 +851,164 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_work_with_only_ordinary_pending_input_is_not_ready() {
+        use crate::runtime::store::{CheckpointStore, ControlStore};
+
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: "actor:local:owner".into(),
+                        enabled: true,
+                        tools: vec!["*".into()],
+                        identities: vec![],
+                    }],
+                },
+                Timestamp(0),
+            )
+            .await
+            .unwrap();
+        let actor = ActorId::from_string("actor:local:owner");
+        let request = RequestId::parse("0190f2ef-0000-7000-8000-000000000071").unwrap();
+        store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: request.clone(),
+                    text: "orphan after cancel".into(),
+                    prompt_sha256: "b".repeat(64),
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .cancel_for_actor(
+                &actor,
+                LocalCancel {
+                    cancel_id: CancelId::parse("0190f2ef-0000-7000-8000-000000000072").unwrap(),
+                    request_id: request,
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(20))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        let control = store
+            .newer_control_event(&lease, run.observed_sequence, Timestamp(12))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .cancel_run(&run, &control, Timestamp(13))
+            .await
+            .unwrap();
+        store.release_lease(&lease).await.unwrap();
+
+        assert!(
+            store
+                .acquire_ready_actor("worker-2", Timestamp(14), Timestamp(24))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn control_for_old_private_work_does_not_wake_new_private_run() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: "actor:local:owner".into(),
+                        enabled: true,
+                        tools: vec!["*".into()],
+                        identities: vec![],
+                    }],
+                },
+                Timestamp(0),
+            )
+            .await
+            .unwrap();
+        let actor = ActorId::from_string("actor:local:owner");
+        let old_request = RequestId::parse("0190f2ef-0000-7000-8000-000000000081").unwrap();
+        store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: old_request.clone(),
+                    text: "old".into(),
+                    prompt_sha256: "c".repeat(64),
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .cancel_for_actor(
+                &actor,
+                LocalCancel {
+                    cancel_id: CancelId::parse("0190f2ef-0000-7000-8000-000000000082").unwrap(),
+                    request_id: old_request,
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        let new_request = RequestId::parse("0190f2ef-0000-7000-8000-000000000083").unwrap();
+        let (new_event, new_work) = match store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: new_request,
+                    text: "new".into(),
+                    prompt_sha256: "d".repeat(64),
+                },
+                Timestamp(3),
+            )
+            .await
+            .unwrap()
+        {
+            LocalSubmitOutcome::Accepted {
+                event_id,
+                work_item_id,
+                ..
+            } => (event_id, work_item_id),
+            outcome => panic!("expected accepted submit, got {outcome:?}"),
+        };
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(20))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .activate_event_for_test(&lease, &new_work, &new_event, Timestamp(11))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .newer_control_event(&lease, 0, Timestamp(12))
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }
