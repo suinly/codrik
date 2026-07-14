@@ -99,12 +99,49 @@ pub trait IngressStore: Send + Sync {
     async fn ingest(&self, event: NewInboundEvent, now: Timestamp) -> Result<IngressOutcome>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorLease {
     pub actor_id: ActorId,
     pub owner_id: String,
     pub generation: i64,
     pub expires_at: Timestamp,
+}
+
+#[derive(Debug)]
+pub struct StaleLease;
+
+impl std::fmt::Display for StaleLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stale actor lease")
+    }
+}
+
+impl std::error::Error for StaleLease {}
+
+#[async_trait]
+pub trait DispatchStore: Send + Sync {
+    async fn acquire_ready_actor(
+        &self,
+        owner: &str,
+        now: Timestamp,
+        lease_until: Timestamp,
+    ) -> Result<Option<ActorLease>>;
+
+    async fn renew_lease(
+        &self,
+        lease: &ActorLease,
+        now: Timestamp,
+        lease_until: Timestamp,
+    ) -> Result<ActorLease>;
+
+    async fn attach_next_run(
+        &self,
+        lease: &ActorLease,
+        max_events: usize,
+        now: Timestamp,
+    ) -> Result<Option<AttachedRun>>;
+
+    async fn release_lease(&self, lease: &ActorLease) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]

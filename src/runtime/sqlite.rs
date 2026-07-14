@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use tokio_rusqlite::Connection;
 
+mod dispatch;
 mod ingress;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");
@@ -10,6 +11,13 @@ const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
     connection: Connection,
+}
+
+fn map_call_error(error: tokio_rusqlite::Error<anyhow::Error>) -> anyhow::Error {
+    match error {
+        tokio_rusqlite::Error::Error(error) => error,
+        other => anyhow!(other.to_string()),
+    }
 }
 
 impl SqliteRuntimeStore {
