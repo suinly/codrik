@@ -3,7 +3,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
-use crate::agent::tool::{Tool, ToolHandler, ToolParameters};
+use crate::agent::tool::{Tool, ToolCapabilities, ToolHandler, ToolParameters};
 
 pub struct DatetimeTool;
 
@@ -19,6 +19,10 @@ impl ToolHandler for DatetimeTool {
             "Return the current date and time in the system timezone.",
             ToolParameters::new(),
         )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::read_only()
     }
 
     async fn execute(&self, _arguments: &str) -> Result<String> {

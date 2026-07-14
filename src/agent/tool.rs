@@ -2,6 +2,10 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::llm::client::RunContext;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tool {
@@ -97,7 +101,7 @@ pub enum ToolParameterKind {
     Boolean,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecution {
     pub observation: String,
     pub artifacts: Vec<ToolArtifact>,
@@ -112,12 +116,12 @@ impl ToolExecution {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolArtifact {
     File(FileArtifact),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileArtifact {
     pub path: PathBuf,
     pub display_name: String,
@@ -125,11 +129,64 @@ pub struct FileArtifact {
     pub caption: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCapabilities {
+    pub retry_safe: bool,
+    pub accepts_idempotency_key: bool,
+    pub cancellable: bool,
+    pub outcome_probe: bool,
+    pub compensatable: bool,
+    pub requires_approval: bool,
+}
+
+impl ToolCapabilities {
+    pub fn conservative() -> Self {
+        Self {
+            retry_safe: false,
+            accepts_idempotency_key: false,
+            cancellable: false,
+            outcome_probe: false,
+            compensatable: false,
+            requires_approval: false,
+        }
+    }
+
+    pub fn read_only() -> Self {
+        Self {
+            retry_safe: true,
+            ..Self::conservative()
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ToolCallContext {
+    pub attempt_id: String,
+    pub authorized_tools: Vec<String>,
+    pub cancellation: RunContext,
+}
+
+impl ToolCallContext {
+    pub fn legacy(cancellation: RunContext) -> Self {
+        Self {
+            attempt_id: Uuid::new_v4().to_string(),
+            authorized_tools: Vec::new(),
+            cancellation,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ToolExecutor {
     fn definitions(&self) -> Vec<Tool>;
+    fn capabilities(&self, name: &str) -> Option<ToolCapabilities>;
 
-    async fn execute(&self, name: &str, arguments: &str) -> Result<ToolExecution>;
+    async fn execute(
+        &self,
+        name: &str,
+        arguments: &str,
+        context: &ToolCallContext,
+    ) -> Result<ToolExecution>;
 }
 
 #[async_trait]
@@ -142,9 +199,17 @@ pub trait ToolHandler: Send + Sync {
 
     fn definition(&self) -> Tool;
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::conservative()
+    }
+
     async fn execute(&self, arguments: &str) -> Result<String>;
 
-    async fn execute_typed(&self, arguments: &str) -> Result<ToolExecution> {
+    async fn execute_typed(
+        &self,
+        arguments: &str,
+        _context: &ToolCallContext,
+    ) -> Result<ToolExecution> {
         Ok(ToolExecution::text(self.execute(arguments).await?))
     }
 }

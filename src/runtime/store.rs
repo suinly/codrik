@@ -3,7 +3,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{agent::message::Message, auth::LegacyAuthorizationSnapshot, runtime::model::*};
+use crate::{
+    agent::{
+        message::Message,
+        tool::{ToolCapabilities, ToolExecution},
+    },
+    auth::LegacyAuthorizationSnapshot,
+    runtime::model::*,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeActor {
@@ -244,4 +251,69 @@ pub trait ControlStore: Send + Sync {
         observed_sequence: i64,
         now: Timestamp,
     ) -> Result<Option<ControlEvent>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct NewToolAttempt {
+    pub id: AttemptId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub capabilities: ToolCapabilities,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolAttempt {
+    pub id: AttemptId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub capabilities: ToolCapabilities,
+    pub state: AttemptState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    Succeeded { execution: ToolExecution },
+    FailedKnown { message: String },
+    CancelledKnown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttemptRecovery {
+    MayInvoke,
+    OutcomeUnknown,
+    Terminal(AttemptOutcome),
+}
+
+#[async_trait]
+pub trait ToolAttemptStore: Send + Sync {
+    async fn prepare_attempt(
+        &self,
+        run: &AttachedRun,
+        attempt: NewToolAttempt,
+        now: Timestamp,
+    ) -> Result<ToolAttempt>;
+    async fn mark_attempt_running(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        now: Timestamp,
+    ) -> Result<()>;
+    async fn finish_attempt(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        outcome: AttemptOutcome,
+        now: Timestamp,
+    ) -> Result<()>;
+    async fn recover_attempt(&self, id: &AttemptId) -> Result<AttemptRecovery>;
+    async fn block_unknown_attempt(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        now: Timestamp,
+    ) -> Result<()>;
+    async fn unresolved_attempts(&self, run: &AttachedRun) -> Result<Vec<ToolAttempt>>;
 }

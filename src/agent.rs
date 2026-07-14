@@ -3,7 +3,7 @@ pub mod tool;
 mod tool_observation;
 
 use crate::agent::message::{Message, UserInput};
-use crate::agent::tool::ToolExecutor;
+use crate::agent::tool::{ToolCallContext, ToolExecutor};
 use crate::llm::client::{
     AgentActivityEvent, AgentActivitySink, LlmClient, LlmRequest, LlmResponse, LlmStreamClient,
     LlmStreamEvent, LlmStreamSink, NoopAgentActivitySink, RUN_CANCELLED, RunContext,
@@ -59,7 +59,10 @@ where
                 _ = context.cancelled() => bail!(RUN_CANCELLED),
             };
 
-            if let Some(answer) = self.record_response(response, &mut activity, None).await? {
+            if let Some(answer) = self
+                .record_response(response, &mut activity, None, context)
+                .await?
+            {
                 return Ok(answer);
             }
         }
@@ -133,7 +136,8 @@ where
 
             if response.tool_calls.is_empty() {
                 let answer = response.content.clone();
-                self.record_response(response, activity, Some(sink)).await?;
+                self.record_response(response, activity, Some(sink), context)
+                    .await?;
                 context.ensure_not_cancelled()?;
                 stream_events.commit_to(sink).await?;
                 return Ok(answer);
@@ -144,7 +148,8 @@ where
                     .on_activity(AgentActivityEvent::Description(response.content.clone()))
                     .await;
             }
-            self.record_response(response, activity, Some(sink)).await?;
+            self.record_response(response, activity, Some(sink), context)
+                .await?;
         }
     }
 
@@ -185,6 +190,7 @@ where
         response: LlmResponse,
         activity: &mut dyn AgentActivitySink,
         mut output: Option<&mut dyn LlmStreamSink>,
+        context: &RunContext,
     ) -> Result<Option<String>> {
         if response.tool_calls.is_empty() {
             self.memory
@@ -209,7 +215,11 @@ where
                 .await;
             let (observation, succeeded) = match self
                 .tools
-                .execute(&tool_call.name, &tool_call.arguments)
+                .execute(
+                    &tool_call.name,
+                    &tool_call.arguments,
+                    &ToolCallContext::legacy(context.clone()),
+                )
                 .await
             {
                 Ok(execution) => {
@@ -305,7 +315,7 @@ mod tests {
         agent::{
             Agent,
             message::{Message, Role},
-            tool::{Tool, ToolExecution, ToolExecutor},
+            tool::{Tool, ToolCallContext, ToolExecution, ToolExecutor},
         },
         llm::client::{
             AgentActivityEvent, AgentActivitySink, LlmClient, LlmRequest, LlmResponse,
@@ -478,7 +488,16 @@ mod tests {
             Vec::new()
         }
 
-        async fn execute(&self, _name: &str, _arguments: &str) -> Result<ToolExecution> {
+        fn capabilities(&self, _name: &str) -> Option<crate::agent::tool::ToolCapabilities> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _arguments: &str,
+            _context: &ToolCallContext,
+        ) -> Result<ToolExecution> {
             unreachable!("no tools are defined")
         }
     }
@@ -498,7 +517,16 @@ mod tests {
             vec![Tool::new("demo", "Demo tool", Default::default())]
         }
 
-        async fn execute(&self, name: &str, _arguments: &str) -> Result<ToolExecution> {
+        fn capabilities(&self, name: &str) -> Option<crate::agent::tool::ToolCapabilities> {
+            (name == "demo").then(crate::agent::tool::ToolCapabilities::conservative)
+        }
+
+        async fn execute(
+            &self,
+            name: &str,
+            _arguments: &str,
+            _context: &ToolCallContext,
+        ) -> Result<ToolExecution> {
             assert_eq!(name, "demo");
 
             match self.behavior {

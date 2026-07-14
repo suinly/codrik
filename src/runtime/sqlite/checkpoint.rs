@@ -7,11 +7,12 @@ use tokio_rusqlite::params;
 use crate::{
     agent::message::Message,
     runtime::{
-        model::{Audience, EventId, Timestamp},
+        model::{AttemptId, AttemptState, Audience, EventId, Timestamp},
         sqlite::{SqliteRuntimeStore, dispatch::ensure_current_lease, map_call_error},
         store::{
-            AttachedRun, CheckpointRun, CheckpointStore, FinalizeOutcome, FinalizeRun,
-            NewOutboxIntent,
+            AttachedRun, AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore,
+            FinalizeOutcome, FinalizeRun, NewOutboxIntent, NewToolAttempt, ToolAttempt,
+            ToolAttemptStore,
         },
     },
 };
@@ -90,6 +91,303 @@ impl CheckpointStore for SqliteRuntimeStore {
     }
 }
 
+#[async_trait]
+impl ToolAttemptStore for SqliteRuntimeStore {
+    async fn prepare_attempt(
+        &self,
+        run: &AttachedRun,
+        attempt: NewToolAttempt,
+        now: Timestamp,
+    ) -> Result<ToolAttempt> {
+        let run = run.clone();
+        self.connection
+            .call(move |connection| -> Result<ToolAttempt> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                validate_run(&transaction, &run, now)?;
+                let capabilities_json = serde_json::to_string(&attempt.capabilities)?;
+                transaction.execute(
+                    "INSERT INTO tool_attempts(
+                        id, run_id, tool_call_id, tool_name, arguments_json,
+                        capabilities_json, state, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', ?7, ?7)
+                     ON CONFLICT(run_id, tool_call_id) DO NOTHING",
+                    params![
+                        attempt.id.as_str(),
+                        run.run_id.as_str(),
+                        attempt.tool_call_id,
+                        attempt.tool_name,
+                        attempt.arguments_json,
+                        capabilities_json,
+                        now.0,
+                    ],
+                )?;
+                let stored =
+                    load_attempt_by_call(&transaction, run.run_id.as_str(), &attempt.tool_call_id)?;
+                if stored.tool_name != attempt.tool_name
+                    || stored.arguments_json != attempt.arguments_json
+                    || stored.capabilities != attempt.capabilities
+                {
+                    bail!("tool call id was reused with different attempt data");
+                }
+                transaction.commit()?;
+                Ok(stored)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn mark_attempt_running(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        now: Timestamp,
+    ) -> Result<()> {
+        transition_attempt(self, run, id, "prepared", "running", None, now).await
+    }
+
+    async fn finish_attempt(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        outcome: AttemptOutcome,
+        now: Timestamp,
+    ) -> Result<()> {
+        let next_state = match &outcome {
+            AttemptOutcome::Succeeded { .. } => "succeeded",
+            AttemptOutcome::FailedKnown { .. } => "failed_known",
+            AttemptOutcome::CancelledKnown => "cancelled_known",
+        };
+        let outcome_json = serde_json::to_string(&outcome)?;
+        transition_attempt(
+            self,
+            run,
+            id,
+            "running",
+            next_state,
+            Some(outcome_json),
+            now,
+        )
+        .await
+    }
+
+    async fn recover_attempt(&self, id: &AttemptId) -> Result<AttemptRecovery> {
+        let id = id.to_string();
+        self.connection
+            .call(move |connection| -> Result<AttemptRecovery> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let (state, outcome_json) = transaction.query_row(
+                    "SELECT state, outcome_json FROM tool_attempts WHERE id = ?1",
+                    [id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?;
+                let recovery = match state.as_str() {
+                    "prepared" => AttemptRecovery::MayInvoke,
+                    "running" => {
+                        let changed = transaction.execute(
+                            "UPDATE tool_attempts SET state = 'outcome_unknown', updated_at = updated_at
+                             WHERE id = ?1 AND state = 'running'",
+                            [id.as_str()],
+                        )?;
+                        if changed != 1 {
+                            bail!("attempt changed during recovery");
+                        }
+                        AttemptRecovery::OutcomeUnknown
+                    }
+                    "outcome_unknown" | "waiting_for_decision" => {
+                        AttemptRecovery::OutcomeUnknown
+                    }
+                    "succeeded" | "failed_known" | "cancelled_known" => {
+                        let outcome_json = outcome_json
+                            .ok_or_else(|| anyhow!("terminal attempt is missing its outcome"))?;
+                        AttemptRecovery::Terminal(serde_json::from_str(&outcome_json)?)
+                    }
+                    other => bail!("invalid stored attempt state: {other}"),
+                };
+                transaction.commit()?;
+                Ok(recovery)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn block_unknown_attempt(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        now: Timestamp,
+    ) -> Result<()> {
+        let run = run.clone();
+        let id = id.to_string();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                validate_run(&transaction, &run, now)?;
+                let changed = transaction.execute(
+                    "UPDATE tool_attempts SET state = 'waiting_for_decision', updated_at = ?3
+                     WHERE id = ?1 AND run_id = ?2 AND state = 'outcome_unknown'",
+                    params![id, run.run_id.as_str(), now.0],
+                )?;
+                if changed != 1 {
+                    bail!("attempt is not outcome_unknown");
+                }
+                transaction.execute(
+                    "UPDATE work_items SET state = 'waiting_for_decision', updated_at = ?2
+                     WHERE id = ?1",
+                    params![run.work_item_id.as_str(), now.0],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn unresolved_attempts(&self, run: &AttachedRun) -> Result<Vec<ToolAttempt>> {
+        let run = run.clone();
+        self.connection
+            .call(move |connection| -> Result<Vec<ToolAttempt>> {
+                ensure_matching_lease(connection, &run)?;
+                let mut statement = connection.prepare(
+                    "SELECT id, tool_call_id, tool_name, arguments_json, capabilities_json, state
+                     FROM tool_attempts
+                     WHERE run_id = ?1
+                       AND (state IN ('prepared', 'running', 'outcome_unknown', 'waiting_for_decision')
+                            OR observation_checkpointed = 0)
+                     ORDER BY created_at, id",
+                )?;
+                statement
+                    .query_map([run.run_id.as_str()], attempt_row)?
+                    .map(|row| decode_attempt(row?))
+                    .collect()
+            })
+            .await
+            .map_err(map_call_error)
+    }
+}
+
+async fn transition_attempt(
+    store: &SqliteRuntimeStore,
+    run: &AttachedRun,
+    id: &AttemptId,
+    expected_state: &'static str,
+    next_state: &'static str,
+    outcome_json: Option<String>,
+    now: Timestamp,
+) -> Result<()> {
+    let run = run.clone();
+    let id = id.to_string();
+    store
+        .connection
+        .call(move |connection| -> Result<()> {
+            let transaction = connection.transaction_with_behavior(
+                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+            )?;
+            validate_run(&transaction, &run, now)?;
+            let changed = transaction.execute(
+                "UPDATE tool_attempts SET state = ?4, outcome_json = ?5, updated_at = ?6
+                 WHERE id = ?1 AND run_id = ?2 AND state = ?3",
+                params![
+                    id,
+                    run.run_id.as_str(),
+                    expected_state,
+                    next_state,
+                    outcome_json,
+                    now.0,
+                ],
+            )?;
+            if changed != 1 {
+                bail!("attempt is not in expected state {expected_state}");
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(map_call_error)
+}
+
+fn load_attempt_by_call(
+    transaction: &tokio_rusqlite::rusqlite::Transaction<'_>,
+    run_id: &str,
+    tool_call_id: &str,
+) -> Result<ToolAttempt> {
+    let row = transaction.query_row(
+        "SELECT id, tool_call_id, tool_name, arguments_json, capabilities_json, state
+         FROM tool_attempts WHERE run_id = ?1 AND tool_call_id = ?2",
+        params![run_id, tool_call_id],
+        attempt_row,
+    )?;
+    decode_attempt(row)
+}
+
+fn attempt_row(
+    row: &tokio_rusqlite::rusqlite::Row<'_>,
+) -> tokio_rusqlite::rusqlite::Result<(String, String, String, String, String, String)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn decode_attempt(row: (String, String, String, String, String, String)) -> Result<ToolAttempt> {
+    Ok(ToolAttempt {
+        id: AttemptId::from_string(row.0),
+        tool_call_id: row.1,
+        tool_name: row.2,
+        arguments_json: row.3,
+        capabilities: serde_json::from_str(&row.4)?,
+        state: decode_attempt_state(&row.5)?,
+    })
+}
+
+fn decode_attempt_state(state: &str) -> Result<AttemptState> {
+    match state {
+        "prepared" => Ok(AttemptState::Prepared),
+        "running" => Ok(AttemptState::Running),
+        "succeeded" => Ok(AttemptState::Succeeded),
+        "failed_known" => Ok(AttemptState::FailedKnown),
+        "outcome_unknown" => Ok(AttemptState::OutcomeUnknown),
+        "cancelled_known" => Ok(AttemptState::CancelledKnown),
+        "waiting_for_decision" => Ok(AttemptState::WaitingForDecision),
+        _ => bail!("invalid stored attempt state: {state}"),
+    }
+}
+
+fn ensure_matching_lease(
+    connection: &tokio_rusqlite::rusqlite::Connection,
+    run: &AttachedRun,
+) -> Result<()> {
+    let matches = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM actor_leases
+            JOIN runs ON runs.actor_id = actor_leases.actor_id
+            WHERE runs.id = ?1 AND runs.state = 'active'
+              AND actor_leases.actor_id = ?2 AND actor_leases.owner_id = ?3
+              AND actor_leases.generation = ?4 AND runs.lease_generation = ?4
+         )",
+        params![
+            run.run_id.as_str(),
+            run.lease.actor_id.as_str(),
+            run.lease.owner_id,
+            run.lease.generation,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !matches {
+        return Err(crate::runtime::store::StaleLease.into());
+    }
+    Ok(())
+}
+
 fn validate_run(
     transaction: &tokio_rusqlite::rusqlite::Transaction<'_>,
     run: &AttachedRun,
@@ -152,7 +450,8 @@ fn checkpoint_attempts(
     for attempt_id in attempt_ids {
         let changed = transaction.execute(
             "UPDATE tool_attempts SET observation_checkpointed = 1
-             WHERE id = ?1 AND run_id = ?2",
+             WHERE id = ?1 AND run_id = ?2
+               AND state IN ('succeeded', 'failed_known', 'cancelled_known')",
             params![attempt_id.as_str(), run.run_id.as_str()],
         )?;
         if changed != 1 {
@@ -327,21 +626,36 @@ impl SqliteRuntimeStore {
             .await
             .map_err(|error| anyhow!("failed to count pending events: {error}"))
     }
+
+    async fn work_item_state(&self, run: &AttachedRun) -> Result<String> {
+        let work_item_id = run.work_item_id.to_string();
+        self.connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT state FROM work_items WHERE id = ?1",
+                    [work_item_id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .map_err(|error| anyhow!("failed to inspect work item: {error}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        agent::message::Message,
+        agent::{message::Message, tool::ToolExecution},
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::LlmToolCall,
         runtime::{
             model::{Audience, OutboxId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                CheckpointRun, CheckpointStore, DispatchStore, FinalizeOutcome, FinalizeRun,
-                IngressStore, NewInboundEvent, NewOutboxIntent, OutboxPayload, OutboxStore,
-                RuntimeAuthorizationStore, StaleLease,
+                AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore, DispatchStore,
+                FinalizeOutcome, FinalizeRun, IngressStore, NewInboundEvent, NewOutboxIntent,
+                NewToolAttempt, OutboxPayload, OutboxStore, RuntimeAuthorizationStore, StaleLease,
+                ToolAttemptStore,
             },
         },
     };
@@ -512,6 +826,137 @@ mod tests {
         assert!(store.pending_outbox().await.unwrap().is_empty());
         assert!(!store.source_events_completed(&run).await.unwrap());
         store.release_lease(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_running_at_recovery_becomes_outcome_unknown() {
+        let (store, run) = store_with_run().await;
+        let attempt = store
+            .prepare_attempt(&run, new_attempt("call-1"), Timestamp(110))
+            .await
+            .unwrap();
+        assert_eq!(attempt.state, crate::runtime::model::AttemptState::Prepared);
+
+        store
+            .mark_attempt_running(&run, &attempt.id, Timestamp(111))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await.unwrap(),
+            AttemptRecovery::OutcomeUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_prepared_at_recovery_may_invoke() {
+        let (store, run) = store_with_run().await;
+        let attempt = store
+            .prepare_attempt(&run, new_attempt("call-1"), Timestamp(110))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await.unwrap(),
+            AttemptRecovery::MayInvoke
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_prepare_is_idempotent_for_run_tool_call_id() {
+        let (store, run) = store_with_run().await;
+        let first = store
+            .prepare_attempt(&run, new_attempt("call-1"), Timestamp(110))
+            .await
+            .unwrap();
+        let second = store
+            .prepare_attempt(&run, new_attempt("call-1"), Timestamp(111))
+            .await
+            .unwrap();
+
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn attempt_terminal_outcome_remains_unresolved_until_observation_checkpoint() {
+        let (store, run) = store_with_run().await;
+        let attempt = store
+            .prepare_attempt(&run, new_attempt("call-1"), Timestamp(110))
+            .await
+            .unwrap();
+        store
+            .mark_attempt_running(&run, &attempt.id, Timestamp(111))
+            .await
+            .unwrap();
+        let outcome = AttemptOutcome::Succeeded {
+            execution: ToolExecution::text("2026-07-14"),
+        };
+        store
+            .finish_attempt(&run, &attempt.id, outcome.clone(), Timestamp(112))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await.unwrap(),
+            AttemptRecovery::Terminal(outcome)
+        );
+        assert_eq!(store.unresolved_attempts(&run).await.unwrap().len(), 1);
+
+        store
+            .checkpoint_run(
+                CheckpointRun {
+                    run: run.clone(),
+                    incorporated_event_ids: run.source_event_ids.clone(),
+                    checkpointed_attempt_ids: vec![attempt.id],
+                    messages: vec![Message::tool_result("call-1", "2026-07-14")],
+                },
+                Timestamp(113),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.unresolved_attempts(&run).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attempt_unknown_outcome_blocks_work_for_decision() {
+        let (store, run) = store_with_run().await;
+        let attempt = store
+            .prepare_attempt(&run, new_attempt("call-1"), Timestamp(110))
+            .await
+            .unwrap();
+        store
+            .mark_attempt_running(&run, &attempt.id, Timestamp(111))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await.unwrap(),
+            AttemptRecovery::OutcomeUnknown
+        );
+
+        store
+            .block_unknown_attempt(&run, &attempt.id, Timestamp(112))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.work_item_state(&run).await.unwrap(),
+            "waiting_for_decision"
+        );
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await.unwrap(),
+            AttemptRecovery::OutcomeUnknown
+        );
+    }
+
+    fn new_attempt(tool_call_id: &str) -> NewToolAttempt {
+        NewToolAttempt {
+            id: crate::runtime::model::AttemptId::new(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: "datetime".into(),
+            arguments_json: "{}".into(),
+            capabilities: crate::agent::tool::ToolCapabilities::read_only(),
+        }
     }
 
     fn finalize(run: &crate::runtime::store::AttachedRun, intent_key: &str) -> FinalizeRun {

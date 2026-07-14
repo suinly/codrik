@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent::tool::{Tool, ToolHandler, ToolParameter, ToolParameters},
+    agent::tool::{Tool, ToolCapabilities, ToolHandler, ToolParameter, ToolParameters},
     skills::{Skill, SkillRegistry},
 };
 
@@ -29,6 +29,10 @@ impl ToolHandler for SkillsListTool {
             "List available local skills with their name, description, and source.",
             ToolParameters::new(),
         )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::read_only()
     }
 
     async fn execute(&self, _arguments: &str) -> Result<String> {
@@ -71,6 +75,10 @@ impl ToolHandler for SkillsReadTool {
                     ),
                 ),
         )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::read_only()
     }
 
     async fn execute(&self, arguments: &str) -> Result<String> {

@@ -6,7 +6,8 @@ use serde::Deserialize;
 use tokio::fs;
 
 use crate::agent::tool::{
-    FileArtifact, Tool, ToolArtifact, ToolExecution, ToolHandler, ToolParameter, ToolParameters,
+    FileArtifact, Tool, ToolArtifact, ToolCallContext, ToolCapabilities, ToolExecution,
+    ToolHandler, ToolParameter, ToolParameters,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,11 +67,19 @@ impl ToolHandler for SendFileTool {
         )
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::read_only()
+    }
+
     async fn execute(&self, _arguments: &str) -> Result<String> {
         bail!("send_file requires typed tool execution")
     }
 
-    async fn execute_typed(&self, arguments: &str) -> Result<ToolExecution> {
+    async fn execute_typed(
+        &self,
+        arguments: &str,
+        _context: &ToolCallContext,
+    ) -> Result<ToolExecution> {
         let arguments: SendFileArguments =
             serde_json::from_str(arguments).context("failed to parse send_file arguments")?;
         let (prefix, relative) = arguments
@@ -126,7 +135,10 @@ mod tests {
     use anyhow::Result;
     use tokio::fs;
 
-    use crate::agent::tool::{ToolArtifact, ToolHandler};
+    use crate::{
+        agent::tool::{ToolArtifact, ToolCallContext, ToolHandler},
+        llm::client::RunContext,
+    };
 
     use super::{FileRoot, SendFileTool, SendFileToolConfig};
 
@@ -145,7 +157,10 @@ mod tests {
         });
 
         let result = tool
-            .execute_typed(r#"{"path":"session/report.pdf","caption":"Report"}"#)
+            .execute_typed(
+                r#"{"path":"session/report.pdf","caption":"Report"}"#,
+                &ToolCallContext::legacy(RunContext::new()),
+            )
             .await?;
 
         assert!(matches!(
@@ -170,7 +185,10 @@ mod tests {
         let error = SendFileTool::new(SendFileToolConfig {
             roots: vec![FileRoot::new("session", &root)],
         })
-        .execute_typed(r#"{"path":"session/escape"}"#)
+        .execute_typed(
+            r#"{"path":"session/escape"}"#,
+            &ToolCallContext::legacy(RunContext::new()),
+        )
         .await
         .expect_err("symlink escape must fail");
 

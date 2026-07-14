@@ -10,7 +10,9 @@ mod web_browser;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use crate::agent::tool::{Tool, ToolExecution, ToolExecutor, ToolExposure, ToolHandler};
+use crate::agent::tool::{
+    Tool, ToolCallContext, ToolCapabilities, ToolExecution, ToolExecutor, ToolExposure, ToolHandler,
+};
 use crate::skills::SkillRegistry;
 pub use send_file::FileRoot;
 
@@ -85,12 +87,24 @@ impl ToolExecutor for ToolRegistry {
             .collect()
     }
 
-    async fn execute(&self, name: &str, arguments: &str) -> Result<ToolExecution> {
+    fn capabilities(&self, name: &str) -> Option<ToolCapabilities> {
+        self.handlers
+            .iter()
+            .find(|handler| handler.name() == name)
+            .map(|handler| handler.capabilities())
+    }
+
+    async fn execute(
+        &self,
+        name: &str,
+        arguments: &str,
+        context: &ToolCallContext,
+    ) -> Result<ToolExecution> {
         let Some(handler) = self.handlers.iter().find(|handler| handler.name() == name) else {
             bail!("unknown tool: {name}");
         };
 
-        handler.execute_typed(arguments).await
+        handler.execute_typed(arguments, context).await
     }
 }
 
@@ -104,6 +118,16 @@ mod tests {
         let datetime_name = datetime::DatetimeTool.definition().name;
 
         assert!(tools.iter().any(|tool| tool.name == datetime_name));
+    }
+
+    #[test]
+    fn tool_capabilities_are_conservative_by_default() {
+        let registry = ToolRegistry::new();
+
+        assert!(registry.capabilities("datetime").unwrap().retry_safe);
+        assert!(registry.capabilities("send_file").unwrap().retry_safe);
+        assert!(!registry.capabilities("bash").unwrap().retry_safe);
+        assert!(!registry.capabilities("skills_update").unwrap().retry_safe);
     }
 
     #[test]
@@ -190,7 +214,11 @@ mod tests {
         );
 
         let execution = registry
-            .execute("bash", r#"{"command":"pwd"}"#)
+            .execute(
+                "bash",
+                r#"{"command":"pwd"}"#,
+                &ToolCallContext::legacy(crate::llm::client::RunContext::new()),
+            )
             .await
             .expect("bash should execute");
         let result: serde_json::Value =
@@ -209,7 +237,11 @@ mod tests {
     async fn execute_rejects_disallowed_tools() {
         let result =
             ToolRegistry::with_allowed_tools_and_config(Vec::<String>::new(), default_config())
-                .execute("datetime", "{}")
+                .execute(
+                    "datetime",
+                    "{}",
+                    &ToolCallContext::legacy(crate::llm::client::RunContext::new()),
+                )
                 .await;
 
         assert_eq!(result.unwrap_err().to_string(), "unknown tool: datetime");
