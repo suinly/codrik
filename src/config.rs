@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -14,6 +14,65 @@ pub struct AppConfig {
     pub telegram: Option<TelegramConfig>,
     #[serde(default)]
     pub attachments: AttachmentConfig,
+    #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeConfig {
+    pub actor_id: String,
+    #[serde(default)]
+    pub database_path: Option<PathBuf>,
+    #[serde(default)]
+    pub socket_path: Option<PathBuf>,
+    #[serde(default)]
+    pub lock_path: Option<PathBuf>,
+    #[serde(default)]
+    pub artifact_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePaths {
+    pub database: PathBuf,
+    pub socket: PathBuf,
+    pub lock: PathBuf,
+    pub artifacts: PathBuf,
+    pub client_requests: PathBuf,
+}
+
+impl RuntimeConfig {
+    pub fn resolve_paths(&self, codrik_home: &Path) -> Result<RuntimePaths> {
+        if self.actor_id.trim().is_empty() {
+            bail!("runtime.actor_id must not be blank");
+        }
+
+        Ok(RuntimePaths {
+            database: resolve_runtime_path(
+                self.database_path.as_deref(),
+                codrik_home,
+                "runtime.sqlite",
+            ),
+            socket: resolve_runtime_path(self.socket_path.as_deref(), codrik_home, "codrik.sock"),
+            lock: resolve_runtime_path(self.lock_path.as_deref(), codrik_home, "runtime.lock"),
+            artifacts: resolve_runtime_path(
+                self.artifact_path.as_deref(),
+                codrik_home,
+                "artifacts",
+            ),
+            client_requests: codrik_home.join("client").join("requests"),
+        })
+    }
+}
+
+fn resolve_runtime_path(configured: Option<&Path>, codrik_home: &Path, default: &str) -> PathBuf {
+    let Some(path) = configured else {
+        return codrik_home.join(default);
+    };
+
+    match path.strip_prefix("~/") {
+        Ok(relative) => codrik_home.join(relative),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +126,19 @@ impl AppConfig {
 
         Ok(config)
     }
+
+    pub fn required_runtime(&self) -> Result<&RuntimeConfig> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .context("runtime configuration is required; add a runtime section to config.yml")?;
+
+        if runtime.actor_id.trim().is_empty() {
+            bail!("runtime.actor_id must not be blank");
+        }
+
+        Ok(runtime)
+    }
 }
 
 fn default_config_path() -> Result<PathBuf> {
@@ -94,6 +166,8 @@ pub fn codrik_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use anyhow::Result;
 
     use super::{AppConfig, ImageDetailConfig};
@@ -116,6 +190,68 @@ mod tests {
 
         assert_eq!(config.attachments.max_file_size_mb, 32);
         assert_eq!(config.attachments.image_detail, ImageDetailConfig::High);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_defaults_under_codrik_home() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: actor:local:owner\n",
+        )?;
+
+        let paths = config
+            .required_runtime()?
+            .resolve_paths(Path::new("/tmp/codrik-home"))?;
+
+        assert_eq!(
+            paths.database,
+            PathBuf::from("/tmp/codrik-home/runtime.sqlite")
+        );
+        assert_eq!(paths.socket, PathBuf::from("/tmp/codrik-home/codrik.sock"));
+        assert_eq!(paths.lock, PathBuf::from("/tmp/codrik-home/runtime.lock"));
+        assert_eq!(paths.artifacts, PathBuf::from("/tmp/codrik-home/artifacts"));
+        assert_eq!(
+            paths.client_requests,
+            PathBuf::from("/tmp/codrik-home/client/requests")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_expands_only_a_leading_home_prefix() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: actor:local:owner\n  database_path: ~/data/runtime.sqlite\n  socket_path: $HOME/codrik.sock\n  lock_path: data/~/runtime.lock\n",
+        )?;
+
+        let paths = config
+            .required_runtime()?
+            .resolve_paths(Path::new("/tmp/codrik-home"))?;
+
+        assert_eq!(
+            paths.database,
+            PathBuf::from("/tmp/codrik-home/data/runtime.sqlite")
+        );
+        assert_eq!(paths.socket, PathBuf::from("$HOME/codrik.sock"));
+        assert_eq!(paths.lock, PathBuf::from("data/~/runtime.lock"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_rejects_blank_actor_id() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: '   '\n",
+        )?;
+
+        assert!(config.required_runtime().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_may_be_omitted_while_parsing() -> Result<()> {
+        let config: AppConfig =
+            yaml_serde::from_str("api_key: key\nbase_url: https://example.test/v1\nmodel: test\n")?;
+
+        assert!(config.required_runtime().is_err());
         Ok(())
     }
 }

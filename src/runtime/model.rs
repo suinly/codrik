@@ -29,12 +29,62 @@ macro_rules! id_type {
     };
 }
 
+macro_rules! uuid_id_type {
+    ($name:ident) => {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4().to_string())
+            }
+
+            pub fn parse(value: &str) -> Result<Self, uuid::Error> {
+                Uuid::parse_str(value).map(|id| Self(id.to_string()))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(&value).map_err(serde::de::Error::custom)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
 id_type!(ActorId);
 id_type!(EventId);
 id_type!(WorkItemId);
 id_type!(RunId);
 id_type!(AttemptId);
 id_type!(OutboxId);
+uuid_id_type!(RequestId);
+uuid_id_type!(CancelId);
+uuid_id_type!(BundleId);
+uuid_id_type!(DeliveryId);
+uuid_id_type!(ArtifactId);
+
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_SUBMIT_BYTES: usize = 256 * 1024;
+pub const MAX_FINAL_CHUNK_BYTES: usize = 192 * 1024;
+pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+pub const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_BUNDLE_DELIVERIES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp(pub i64);
@@ -83,6 +133,77 @@ impl ManualClock {
 impl Clock for ManualClock {
     fn now(&self) -> Timestamp {
         Timestamp(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ArtifactId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState,
+        MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES, MAX_FINAL_CHUNK_BYTES, MAX_FRAME_BYTES,
+        MAX_MANIFEST_BYTES, MAX_SUBMIT_BYTES, RequestId,
+    };
+
+    #[test]
+    fn request_ids_reject_non_uuid_strings() {
+        assert!(RequestId::parse("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn serve_ids_round_trip_through_text_and_json() -> anyhow::Result<()> {
+        fn round_trip<T>(value: T) -> anyhow::Result<()>
+        where
+            T: serde::Serialize
+                + serde::de::DeserializeOwned
+                + std::fmt::Display
+                + PartialEq
+                + std::fmt::Debug,
+        {
+            let text = value.to_string();
+            let json = serde_json::to_string(&value)?;
+            let decoded: T = serde_json::from_str(&json)?;
+            assert_eq!(decoded, value);
+            assert_eq!(json, format!("\"{text}\""));
+            Ok(())
+        }
+
+        round_trip(RequestId::new())?;
+        round_trip(CancelId::new())?;
+        round_trip(BundleId::new())?;
+        round_trip(DeliveryId::new())?;
+        round_trip(ArtifactId::new())?;
+        Ok(())
+    }
+
+    #[test]
+    fn serve_protocol_limits_are_exact() {
+        assert_eq!(MAX_FRAME_BYTES, 1024 * 1024);
+        assert_eq!(MAX_SUBMIT_BYTES, 256 * 1024);
+        assert_eq!(MAX_FINAL_CHUNK_BYTES, 192 * 1024);
+        assert_eq!(MAX_MANIFEST_BYTES, 256 * 1024);
+        assert_eq!(MAX_BUNDLE_BYTES, 16 * 1024 * 1024);
+        assert_eq!(MAX_BUNDLE_DELIVERIES, 1024);
+    }
+
+    #[test]
+    fn serve_states_use_schema_v2_names() -> anyhow::Result<()> {
+        assert_eq!(
+            serde_json::to_string(&LocalRequestState::Active)?,
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LocalRequestState::FailedTerminal)?,
+            "\"failed_terminal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BundleState::FailedRetryable)?,
+            "\"failed_retryable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BundleState::FailedTerminal)?,
+            "\"failed_terminal\""
+        );
+        Ok(())
     }
 }
 
@@ -149,4 +270,23 @@ pub enum OutboxState {
     FailedTerminal,
     OutcomeUnknown,
     AcknowledgedDuplicate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalRequestState {
+    Active,
+    Completed,
+    Cancelled,
+    FailedTerminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleState {
+    Pending,
+    Delivering,
+    Delivered,
+    FailedRetryable,
+    FailedTerminal,
 }
