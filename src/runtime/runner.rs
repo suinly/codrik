@@ -10,6 +10,7 @@ use crate::{
     },
     llm::client::{LlmClient, LlmRequest, LlmToolCall, RunContext},
     runtime::{
+        artifacts::ArtifactManager,
         model::{AttemptId, Clock, EventKind, OutboxId},
         signals::ActorSignals,
         store::{
@@ -60,13 +61,14 @@ pub struct ActorRunner<L, T, S, C> {
     clock: C,
     signals: ActorSignals,
     limits: RunnerLimits,
+    artifacts: ArtifactManager<S, C>,
 }
 
 impl<L, T, S, C> ActorRunner<L, T, S, C>
 where
     L: LlmClient + Send + Sync,
     T: ToolExecutor + Send + Sync,
-    S: RuntimeStore,
+    S: RuntimeStore + Clone,
     C: Clock,
 {
     pub fn new(
@@ -77,6 +79,21 @@ where
         signals: ActorSignals,
         limits: RunnerLimits,
     ) -> Self {
+        let artifact_root =
+            std::env::temp_dir().join(format!("codrik-runtime-artifacts-{}", uuid::Uuid::new_v4()));
+        Self::with_artifact_root(store, llm, tools, clock, signals, limits, artifact_root)
+    }
+
+    pub fn with_artifact_root(
+        store: S,
+        llm: L,
+        tools: T,
+        clock: C,
+        signals: ActorSignals,
+        limits: RunnerLimits,
+        artifact_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let artifacts = ArtifactManager::new(artifact_root, store.clone(), clock.clone());
         Self {
             store,
             llm,
@@ -84,6 +101,7 @@ where
             clock,
             signals,
             limits,
+            artifacts,
         }
     }
 
@@ -162,14 +180,25 @@ where
                         .execute(&attempt.tool_name, &attempt.arguments_json, &tool_context)
                         .await
                     {
-                        Ok(execution) => AttemptOutcome::Succeeded { execution },
+                        Ok(execution) => match self
+                            .artifacts
+                            .stage_execution(&run, &attempt.id, execution)
+                            .await
+                        {
+                            Ok(execution) => AttemptOutcome::Succeeded { execution },
+                            Err(error) => AttemptOutcome::FailedKnown {
+                                message: error.to_string(),
+                            },
+                        },
                         Err(error) => AttemptOutcome::FailedKnown {
                             message: error.to_string(),
                         },
                     };
-                    self.store
-                        .finish_attempt(&run, &attempt.id, outcome.clone(), self.clock.now())
-                        .await?;
+                    if !matches!(outcome, AttemptOutcome::Succeeded { .. }) {
+                        self.store
+                            .finish_attempt(&run, &attempt.id, outcome.clone(), self.clock.now())
+                            .await?;
+                    }
                     outcome
                 }
                 AttemptRecovery::OutcomeUnknown => {
@@ -363,10 +392,25 @@ where
                     .execute(&tool_call.name, &tool_call.arguments, &tool_context)
                     .await
                 {
-                    Ok(execution) => {
-                        let observation = tool_observation::success(&execution.observation);
-                        (AttemptOutcome::Succeeded { execution }, observation)
-                    }
+                    Ok(execution) => match self
+                        .artifacts
+                        .stage_execution(&run, &attempt.id, execution)
+                        .await
+                    {
+                        Ok(execution) => {
+                            let observation = tool_observation::success(&execution.observation);
+                            (AttemptOutcome::Succeeded { execution }, observation)
+                        }
+                        Err(error) => {
+                            let observation = tool_observation::failure(&error);
+                            (
+                                AttemptOutcome::FailedKnown {
+                                    message: error.to_string(),
+                                },
+                                observation,
+                            )
+                        }
+                    },
                     Err(error) => {
                         let observation = tool_observation::failure(&error);
                         (
@@ -377,9 +421,11 @@ where
                         )
                     }
                 };
-                self.store
-                    .finish_attempt(&run, &attempt.id, outcome, self.clock.now())
-                    .await?;
+                if !matches!(outcome, AttemptOutcome::Succeeded { .. }) {
+                    self.store
+                        .finish_attempt(&run, &attempt.id, outcome, self.clock.now())
+                        .await?;
+                }
                 checkpointed_attempt_ids.push(attempt.id);
                 checkpoint_messages.push(Message::tool_result(tool_call.id, observation));
             }
@@ -433,17 +479,20 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     use crate::{
-        agent::tool::{Tool, ToolCallContext, ToolCapabilities, ToolExecution, ToolExecutor},
+        agent::tool::{
+            FileArtifact, Tool, ToolArtifact, ToolCallContext, ToolCapabilities, ToolExecution,
+            ToolExecutor,
+        },
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::{LlmClient, LlmRequest, LlmResponse, LlmToolCall, RunContext},
         runtime::{
-            model::{ActorId, Audience, EventKind, ManualClock, Timestamp},
+            model::{ActorId, AttemptId, Audience, EventKind, ManualClock, Timestamp},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
             store::{
-                DispatchStore, IngressStore, NewInboundEvent, OutboxPayload,
-                RuntimeAuthorizationStore,
+                AttemptOutcome, AttemptRecovery, DispatchStore, IngressStore, NewInboundEvent,
+                OutboxPayload, RuntimeAuthorizationStore, ToolAttemptStore,
             },
         },
     };
@@ -506,6 +555,12 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingTools {
+        attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct ArtifactTools {
+        source: std::path::PathBuf,
         attempts: Arc<Mutex<Vec<String>>>,
     }
 
@@ -581,6 +636,35 @@ mod tests {
             assert_eq!(name, "datetime");
             self.attempts.lock().await.push(context.attempt_id.clone());
             Ok(ToolExecution::text("2026-07-14"))
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ArtifactTools {
+        fn definitions(&self) -> Vec<Tool> {
+            vec![Tool::new("datetime", "file", Default::default())]
+        }
+
+        fn capabilities(&self, name: &str) -> Option<ToolCapabilities> {
+            (name == "datetime").then(ToolCapabilities::read_only)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _arguments: &str,
+            context: &ToolCallContext,
+        ) -> Result<ToolExecution> {
+            self.attempts.lock().await.push(context.attempt_id.clone());
+            Ok(ToolExecution {
+                observation: "created report".into(),
+                artifacts: vec![ToolArtifact::File(FileArtifact {
+                    path: self.source.clone(),
+                    display_name: "report.txt".into(),
+                    media_type: "text/plain".into(),
+                    caption: Some("report".into()),
+                })],
+            })
         }
     }
 
@@ -680,6 +764,68 @@ mod tests {
         );
         assert_eq!(attempts.lock().await.len(), 1);
         assert_eq!(store.outbox_intents().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_file_tool_recovers_only_managed_path_and_hash() {
+        let store = store_with_text().await;
+        let root =
+            std::env::temp_dir().join(format!("codrik-runner-artifact-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source.txt");
+        let managed = root.join("managed");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(&source, b"runner artifact").await.unwrap();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let llm = ScriptedLlm {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                LlmResponse {
+                    content: "creating".into(),
+                    tool_calls: vec![LlmToolCall {
+                        id: "call-file".into(),
+                        name: "datetime".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                LlmResponse {
+                    content: "done".into(),
+                    tool_calls: Vec::new(),
+                },
+            ]))),
+        };
+        let runner = ActorRunner::with_artifact_root(
+            store.clone(),
+            llm,
+            ArtifactTools {
+                source: source.clone(),
+                attempts: attempts.clone(),
+            },
+            ManualClock::new(1_000),
+            ActorSignals::default(),
+            RunnerLimits::default(),
+            &managed,
+        );
+
+        assert_eq!(
+            runner.run_once("worker").await.unwrap(),
+            RunOnceOutcome::Completed
+        );
+        let id = AttemptId::from_string(attempts.lock().await[0].clone());
+        let AttemptRecovery::Terminal(AttemptOutcome::Succeeded { execution }) =
+            store.recover_attempt(&id).await.unwrap()
+        else {
+            panic!("missing durable success")
+        };
+        assert_eq!(execution.artifacts.len(), 1);
+        assert!(execution.artifacts[0].managed_path.starts_with(&managed));
+        assert_ne!(execution.artifacts[0].managed_path, source);
+        assert_eq!(execution.artifacts[0].sha256.len(), 64);
+        assert_eq!(
+            tokio::fs::read(&execution.artifacts[0].managed_path)
+                .await
+                .unwrap(),
+            b"runner artifact"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]

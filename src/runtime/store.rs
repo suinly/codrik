@@ -4,13 +4,80 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::{
-    agent::{
-        message::Message,
-        tool::{ToolCapabilities, ToolExecution},
-    },
+    agent::{message::Message, tool::ToolCapabilities},
     auth::LegacyAuthorizationSnapshot,
     runtime::model::*,
 };
+
+#[derive(Clone, Debug)]
+pub struct BeginArtifact {
+    pub id: ArtifactId,
+    pub actor_id: ActorId,
+    pub attempt_id: AttemptId,
+    pub managed_path: PathBuf,
+    pub display_name: String,
+    pub media_type: String,
+    pub size: u64,
+    pub caption: Option<String>,
+    pub owner: String,
+    pub lease_until: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactLease {
+    pub id: ArtifactId,
+    pub actor_id: ActorId,
+    pub attempt_id: AttemptId,
+    pub managed_path: PathBuf,
+    pub owner: String,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredArtifact {
+    pub id: ArtifactId,
+    pub managed_path: PathBuf,
+    pub owner: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedArtifact {
+    pub id: ArtifactId,
+    pub managed_path: PathBuf,
+    pub display_name: String,
+    pub media_type: String,
+    pub size: u64,
+    pub sha256: String,
+    pub caption: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DurableToolExecution {
+    pub observation: String,
+    pub artifacts: Vec<ManagedArtifact>,
+}
+
+#[async_trait]
+pub trait ArtifactStore: Send + Sync {
+    async fn begin_staging(&self, command: BeginArtifact, now: Timestamp) -> Result<ArtifactLease>;
+    async fn renew_staging(&self, lease: &ArtifactLease, until: Timestamp)
+    -> Result<ArtifactLease>;
+    async fn commit_staged_execution(
+        &self,
+        run: &AttachedRun,
+        attempt: &AttemptId,
+        execution: DurableToolExecution,
+        leases: &[ArtifactLease],
+        now: Timestamp,
+    ) -> Result<()>;
+    async fn claim_expired_staging(
+        &self,
+        now: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<ExpiredArtifact>>;
+    async fn remove_claimed_staging(&self, artifact: &ExpiredArtifact) -> Result<bool>;
+    async fn artifact_path_exists(&self, path: &std::path::Path) -> Result<bool>;
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeActor {
@@ -326,7 +393,7 @@ pub struct ToolAttempt {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AttemptOutcome {
-    Succeeded { execution: ToolExecution },
+    Succeeded { execution: DurableToolExecution },
     FailedKnown { message: String },
     CancelledKnown,
 }
@@ -380,11 +447,16 @@ pub trait ContextStore: Send + Sync {
 }
 
 pub trait RuntimeStore:
-    DispatchStore + CheckpointStore + ControlStore + ToolAttemptStore + ContextStore
+    DispatchStore + CheckpointStore + ControlStore + ToolAttemptStore + ContextStore + ArtifactStore
 {
 }
 
 impl<T> RuntimeStore for T where
-    T: DispatchStore + CheckpointStore + ControlStore + ToolAttemptStore + ContextStore
+    T: DispatchStore
+        + CheckpointStore
+        + ControlStore
+        + ToolAttemptStore
+        + ContextStore
+        + ArtifactStore
 {
 }

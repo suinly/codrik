@@ -777,7 +777,7 @@ impl SqliteRuntimeStore {
 #[cfg(test)]
 mod tests {
     use crate::{
-        agent::{message::Message, tool::ToolExecution},
+        agent::message::Message,
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::LlmToolCall,
         runtime::{
@@ -1066,7 +1066,10 @@ mod tests {
             .await
             .unwrap();
         let outcome = AttemptOutcome::Succeeded {
-            execution: ToolExecution::text("2026-07-14"),
+            execution: crate::runtime::store::DurableToolExecution {
+                observation: "2026-07-14".into(),
+                artifacts: Vec::new(),
+            },
         };
         store
             .finish_attempt(&run, &attempt.id, outcome.clone(), Timestamp(112))
