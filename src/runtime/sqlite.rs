@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use tokio_rusqlite::Connection;
 
+mod ingress;
+
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");
 
 #[derive(Clone)]

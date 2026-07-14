@@ -38,6 +38,27 @@ pub struct AuthorizedActor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyAuthorizationSnapshot {
+    pub version: u32,
+    pub actors: Vec<LegacyActor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyActor {
+    pub id: String,
+    pub enabled: bool,
+    pub tools: Vec<String>,
+    pub identities: Vec<LegacyIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyIdentity {
+    pub provider: String,
+    pub subject: String,
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthDecision {
     Authorized(AuthorizedActor),
     Denied,
@@ -77,6 +98,10 @@ impl AuthorizationStore {
     pub async fn authorize(&self, identity: &GatewayIdentity) -> Result<AuthDecision> {
         let users = self.read_users().await?;
         Ok(decision_for(actor_id_for(identity), users))
+    }
+
+    pub(crate) async fn snapshot(&self) -> Result<LegacyAuthorizationSnapshot> {
+        Ok(LegacyAuthorizationSnapshot::from(self.read_users().await?))
     }
 
     async fn read_users(&self) -> Result<StoredUsers> {
@@ -144,6 +169,32 @@ impl Default for StoredUsers {
         Self {
             version: 1,
             actors: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<StoredUsers> for LegacyAuthorizationSnapshot {
+    fn from(users: StoredUsers) -> Self {
+        Self {
+            version: users.version,
+            actors: users
+                .actors
+                .into_iter()
+                .map(|(id, actor)| LegacyActor {
+                    id,
+                    enabled: actor.enabled,
+                    tools: actor.tools,
+                    identities: actor
+                        .identities
+                        .into_iter()
+                        .map(|identity| LegacyIdentity {
+                            provider: identity.provider,
+                            subject: identity.subject,
+                            username: identity.username,
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -339,6 +390,30 @@ mod tests {
             store.authorize(&telegram_identity("123", "Owner")).await?,
             AuthDecision::Denied
         );
+
+        fs::remove_dir_all(store.path().parent().unwrap())
+            .await
+            .ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_preserves_actor_permissions_and_identities() -> Result<()> {
+        let store = AuthorizationStore::new(temp_users_path());
+        store.start(telegram_identity("123", "Owner")).await?;
+        let mut users = store.read_users().await?;
+        users.actors.get_mut("actor:telegram:123").unwrap().tools =
+            vec!["*".to_string(), "bash".to_string()];
+        store.write_users(&users).await?;
+
+        let snapshot = store.snapshot().await?;
+
+        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.actors.len(), 1);
+        assert_eq!(snapshot.actors[0].id, "actor:telegram:123");
+        assert_eq!(snapshot.actors[0].tools, vec!["*", "bash"]);
+        assert_eq!(snapshot.actors[0].identities[0].provider, "telegram");
+        assert_eq!(snapshot.actors[0].identities[0].subject, "123");
 
         fs::remove_dir_all(store.path().parent().unwrap())
             .await
