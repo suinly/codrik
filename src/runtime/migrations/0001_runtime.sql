@@ -27,7 +27,7 @@ CREATE TABLE work_items (
     kind TEXT NOT NULL CHECK (kind IN ('interactive', 'external')),
     audience_kind TEXT NOT NULL CHECK (audience_kind IN ('actor_private', 'conversation_scoped', 'shareable')),
     audience_address TEXT,
-    state TEXT NOT NULL CHECK (state IN ('ready', 'waiting', 'completed', 'cancelled', 'failed_terminal', 'blocked_unknown_outcome', 'waiting_for_decision')),
+    state TEXT NOT NULL CHECK (state IN ('ready', 'waiting', 'completed', 'cancelled', 'failed_terminal', 'blocked_unknown_outcome', 'blocked_malformed', 'waiting_for_decision')),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     CHECK ((audience_kind = 'conversation_scoped') = (audience_address IS NOT NULL))

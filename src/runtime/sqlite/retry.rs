@@ -84,7 +84,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use tokio_rusqlite::rusqlite::{Error, ErrorCode, ffi};
 
-    use super::{call_with_busy_retry, is_authority_failure};
+    use super::{call_connection_with_busy_retry, call_with_busy_retry, is_authority_failure};
 
     fn busy() -> anyhow::Error {
         anyhow!(Error::SqliteFailure(
@@ -131,6 +131,80 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "corrupt");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_retry_exhausts_real_sqlite_write_contention() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "codrik-busy-retry-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let locker = tokio_rusqlite::Connection::open(&path).await?;
+        let contender = tokio_rusqlite::Connection::open(&path).await?;
+        locker
+            .call(|connection| -> Result<()> {
+                connection.busy_timeout(std::time::Duration::ZERO)?;
+                connection.execute_batch(
+                    "CREATE TABLE values_for_test(value INTEGER); BEGIN IMMEDIATE;
+                     INSERT INTO values_for_test VALUES (1);",
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(super::super::map_call_error)?;
+        contender
+            .call(|connection| -> Result<()> {
+                connection.busy_timeout(std::time::Duration::ZERO)?;
+                Ok(())
+            })
+            .await
+            .map_err(super::super::map_call_error)?;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = tokio::time::Instant::now();
+        let error = call_connection_with_busy_retry(&contender, {
+            let calls = calls.clone();
+            move |connection| -> Result<()> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                transaction.commit()?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(85));
+        assert!(is_authority_failure(&error));
+        locker
+            .call(|connection| -> Result<()> {
+                connection.execute_batch("ROLLBACK")?;
+                Ok(())
+            })
+            .await
+            .map_err(super::super::map_call_error)?;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_retry_propagates_non_busy_error_once() {
+        let connection = tokio_rusqlite::Connection::open_in_memory().await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let error = call_connection_with_busy_retry(&connection, {
+            let calls = calls.clone();
+            move |_connection| -> Result<()> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("invalid checkpoint transition"))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(error.to_string(), "invalid checkpoint transition");
     }
 
     #[test]

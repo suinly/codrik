@@ -16,6 +16,7 @@ use crate::{
             bundles::{manifest_for, payload_from_outbox},
             dispatch::ensure_current_lease,
             map_call_error,
+            retry::call_connection_with_busy_retry,
         },
         store::{
             AttachedRun, AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore,
@@ -28,29 +29,28 @@ use crate::{
 #[async_trait]
 impl CheckpointStore for SqliteRuntimeStore {
     async fn checkpoint_run(&self, command: CheckpointRun, now: Timestamp) -> Result<()> {
-        self.connection
-            .call(move |connection| -> Result<()> {
-                let transaction = connection.transaction_with_behavior(
-                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
-                )?;
-                validate_run(&transaction, &command.run, now)?;
-                incorporate_events(&transaction, &command.run, &command.incorporated_event_ids)?;
-                checkpoint_attempts(
-                    &transaction,
-                    &command.run,
-                    &command.checkpointed_attempt_ids,
-                )?;
-                insert_messages(&transaction, &command.run, &command.messages, now)?;
-                transaction.commit()?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_error)
+        call_connection_with_busy_retry(&self.connection, move |connection| -> Result<()> {
+            let transaction = connection.transaction_with_behavior(
+                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+            )?;
+            validate_run(&transaction, &command.run, now)?;
+            incorporate_events(&transaction, &command.run, &command.incorporated_event_ids)?;
+            checkpoint_attempts(
+                &transaction,
+                &command.run,
+                &command.checkpointed_attempt_ids,
+            )?;
+            insert_messages(&transaction, &command.run, &command.messages, now)?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn finalize_run(&self, command: FinalizeRun, now: Timestamp) -> Result<FinalizeOutcome> {
-        self.connection
-            .call(move |connection| -> Result<FinalizeOutcome> {
+        call_connection_with_busy_retry(
+            &self.connection,
+            move |connection| -> Result<FinalizeOutcome> {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
@@ -103,9 +103,9 @@ impl CheckpointStore for SqliteRuntimeStore {
                 )?;
                 transaction.commit()?;
                 Ok(FinalizeOutcome::Completed)
-            })
-            .await
-            .map_err(map_call_error)
+            },
+        )
+        .await
     }
 
     async fn cancel_run(
@@ -116,71 +116,69 @@ impl CheckpointStore for SqliteRuntimeStore {
     ) -> Result<()> {
         let run = run.clone();
         let control = control.clone();
-        self.connection
-            .call(move |connection| -> Result<()> {
-                let transaction = connection.transaction_with_behavior(
-                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
-                )?;
-                validate_run(&transaction, &run, now)?;
-                let changed = transaction.execute(
-                    "UPDATE events SET state = 'cancelled', updated_at = ?3
+        call_connection_with_busy_retry(&self.connection, move |connection| -> Result<()> {
+            let transaction = connection.transaction_with_behavior(
+                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+            )?;
+            validate_run(&transaction, &run, now)?;
+            let changed = transaction.execute(
+                "UPDATE events SET state = 'cancelled', updated_at = ?3
                      WHERE id = ?1 AND actor_id = ?2 AND state = 'pending'
                        AND kind = 'cancel_requested'",
-                    params![
-                        control.event_id.as_str(),
-                        run.lease.actor_id.as_str(),
-                        now.0
-                    ],
-                )?;
-                if changed != 1 {
-                    bail!("cancellation event is no longer pending");
-                }
-                transaction.execute(
-                    "UPDATE tool_attempts
+                params![
+                    control.event_id.as_str(),
+                    run.lease.actor_id.as_str(),
+                    now.0
+                ],
+            )?;
+            if changed != 1 {
+                bail!("cancellation event is no longer pending");
+            }
+            transaction.execute(
+                "UPDATE tool_attempts
                      SET state = 'outcome_unknown', updated_at = ?2
                      WHERE run_id = ?1 AND state = 'running'",
-                    params![run.run_id.as_str(), now.0],
+                params![run.run_id.as_str(), now.0],
+            )?;
+            let request_ids = cancellation_target_requests(&transaction, &run, &control)?;
+            let cancellation = NewOutboxIntent {
+                id: OutboxId::new(),
+                intent_key: format!("run:{}:cancelled", run.run_id),
+                intent_class: "terminal_error".into(),
+                audience: run.audience.clone(),
+                payload: crate::runtime::store::OutboxPayload::TerminalError {
+                    code: "cancelled".into(),
+                    message: "request was cancelled".into(),
+                },
+            };
+            if !request_ids.is_empty() {
+                let terminal_context = TerminalBundleContext::from(&run);
+                create_terminal_bundles(
+                    &transaction,
+                    &terminal_context,
+                    &request_ids,
+                    vec![cancellation],
+                    LocalRequestState::Cancelled,
+                    now,
                 )?;
-                let request_ids = cancellation_target_requests(&transaction, &run, &control)?;
-                let cancellation = NewOutboxIntent {
-                    id: OutboxId::new(),
-                    intent_key: format!("run:{}:cancelled", run.run_id),
-                    intent_class: "terminal_error".into(),
-                    audience: run.audience.clone(),
-                    payload: crate::runtime::store::OutboxPayload::TerminalError {
-                        code: "cancelled".into(),
-                        message: "request was cancelled".into(),
-                    },
-                };
-                if !request_ids.is_empty() {
-                    let terminal_context = TerminalBundleContext::from(&run);
-                    create_terminal_bundles(
-                        &transaction,
-                        &terminal_context,
-                        &request_ids,
-                        vec![cancellation],
-                        LocalRequestState::Cancelled,
-                        now,
-                    )?;
-                }
-                transaction.execute(
-                    "UPDATE events SET state = 'cancelled', updated_at = ?2
+            }
+            transaction.execute(
+                "UPDATE events SET state = 'cancelled', updated_at = ?2
                      WHERE work_item_id = ?1 AND state IN ('pending','processing')",
-                    params![run.work_item_id.as_str(), now.0],
-                )?;
-                transaction.execute(
-                    "UPDATE runs SET state = 'cancelled', updated_at = ?2 WHERE id = ?1",
-                    params![run.run_id.as_str(), now.0],
-                )?;
-                transaction.execute(
-                    "UPDATE work_items SET state = 'cancelled', updated_at = ?2 WHERE id = ?1",
-                    params![run.work_item_id.as_str(), now.0],
-                )?;
-                transaction.commit()?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_error)
+                params![run.work_item_id.as_str(), now.0],
+            )?;
+            transaction.execute(
+                "UPDATE runs SET state = 'cancelled', updated_at = ?2 WHERE id = ?1",
+                params![run.run_id.as_str(), now.0],
+            )?;
+            transaction.execute(
+                "UPDATE work_items SET state = 'cancelled', updated_at = ?2 WHERE id = ?1",
+                params![run.work_item_id.as_str(), now.0],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -242,8 +240,9 @@ impl ToolAttemptStore for SqliteRuntimeStore {
         now: Timestamp,
     ) -> Result<ToolAttempt> {
         let run = run.clone();
-        self.connection
-            .call(move |connection| -> Result<ToolAttempt> {
+        call_connection_with_busy_retry(
+            &self.connection,
+            move |connection| -> Result<ToolAttempt> {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
@@ -275,9 +274,9 @@ impl ToolAttemptStore for SqliteRuntimeStore {
                 }
                 transaction.commit()?;
                 Ok(stored)
-            })
-            .await
-            .map_err(map_call_error)
+            },
+        )
+        .await
     }
 
     async fn mark_attempt_running(
@@ -316,8 +315,7 @@ impl ToolAttemptStore for SqliteRuntimeStore {
 
     async fn recover_attempt(&self, id: &AttemptId) -> Result<AttemptRecovery> {
         let id = id.to_string();
-        self.connection
-            .call(move |connection| -> Result<AttemptRecovery> {
+        call_connection_with_busy_retry(&self.connection, move |connection| -> Result<AttemptRecovery> {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
@@ -353,7 +351,6 @@ impl ToolAttemptStore for SqliteRuntimeStore {
                 Ok(recovery)
             })
             .await
-            .map_err(map_call_error)
     }
 
     async fn block_unknown_attempt(
@@ -364,30 +361,28 @@ impl ToolAttemptStore for SqliteRuntimeStore {
     ) -> Result<()> {
         let run = run.clone();
         let id = id.to_string();
-        self.connection
-            .call(move |connection| -> Result<()> {
-                let transaction = connection.transaction_with_behavior(
-                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
-                )?;
-                validate_run(&transaction, &run, now)?;
-                let changed = transaction.execute(
-                    "UPDATE tool_attempts SET state = 'waiting_for_decision', updated_at = ?3
+        call_connection_with_busy_retry(&self.connection, move |connection| -> Result<()> {
+            let transaction = connection.transaction_with_behavior(
+                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+            )?;
+            validate_run(&transaction, &run, now)?;
+            let changed = transaction.execute(
+                "UPDATE tool_attempts SET state = 'waiting_for_decision', updated_at = ?3
                      WHERE id = ?1 AND run_id = ?2 AND state = 'outcome_unknown'",
-                    params![id, run.run_id.as_str(), now.0],
-                )?;
-                if changed != 1 {
-                    bail!("attempt is not outcome_unknown");
-                }
-                transaction.execute(
-                    "UPDATE work_items SET state = 'waiting_for_decision', updated_at = ?2
+                params![id, run.run_id.as_str(), now.0],
+            )?;
+            if changed != 1 {
+                bail!("attempt is not outcome_unknown");
+            }
+            transaction.execute(
+                "UPDATE work_items SET state = 'waiting_for_decision', updated_at = ?2
                      WHERE id = ?1",
-                    params![run.work_item_id.as_str(), now.0],
-                )?;
-                transaction.commit()?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_error)
+                params![run.work_item_id.as_str(), now.0],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn unresolved_attempts(&self, run: &AttachedRun) -> Result<Vec<ToolAttempt>> {
@@ -424,33 +419,29 @@ async fn transition_attempt(
 ) -> Result<()> {
     let run = run.clone();
     let id = id.to_string();
-    store
-        .connection
-        .call(move |connection| -> Result<()> {
-            let transaction = connection.transaction_with_behavior(
-                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
-            )?;
-            validate_run(&transaction, &run, now)?;
-            let changed = transaction.execute(
-                "UPDATE tool_attempts SET state = ?4, outcome_json = ?5, updated_at = ?6
+    call_connection_with_busy_retry(&store.connection, move |connection| -> Result<()> {
+        let transaction = connection
+            .transaction_with_behavior(tokio_rusqlite::rusqlite::TransactionBehavior::Immediate)?;
+        validate_run(&transaction, &run, now)?;
+        let changed = transaction.execute(
+            "UPDATE tool_attempts SET state = ?4, outcome_json = ?5, updated_at = ?6
                  WHERE id = ?1 AND run_id = ?2 AND state = ?3",
-                params![
-                    id,
-                    run.run_id.as_str(),
-                    expected_state,
-                    next_state,
-                    outcome_json,
-                    now.0,
-                ],
-            )?;
-            if changed != 1 {
-                bail!("attempt is not in expected state {expected_state}");
-            }
-            transaction.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(map_call_error)
+            params![
+                id,
+                run.run_id.as_str(),
+                expected_state,
+                next_state,
+                outcome_json,
+                now.0,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("attempt is not in expected state {expected_state}");
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+    .await
 }
 
 fn load_attempt_by_call(

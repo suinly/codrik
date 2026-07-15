@@ -44,6 +44,7 @@ impl DispatchStore for SqliteRuntimeStore {
                                JOIN work_items ON work_items.id = events.work_item_id
                                WHERE events.actor_id = actors.id
                                  AND events.state = 'pending'
+                                 AND work_items.state = 'ready'
                                  AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                                  AND (
                                     work_items.cancellation_requested_at IS NULL
@@ -53,7 +54,12 @@ impl DispatchStore for SqliteRuntimeStore {
                             OR EXISTS (
                                SELECT 1 FROM runs JOIN work_items ON work_items.id = runs.work_item_id
                                WHERE runs.actor_id = actors.id AND runs.state = 'active'
+                                 AND work_items.state = 'ready'
                                  AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
+                            )
+                            OR EXISTS (
+                               SELECT 1 FROM events WHERE events.actor_id = actors.id
+                                 AND events.state = 'pending' AND events.work_item_id IS NULL
                             )
                          )
                          ORDER BY COALESCE(
@@ -62,13 +68,15 @@ impl DispatchStore for SqliteRuntimeStore {
                                JOIN work_items ON work_items.id = events.work_item_id
                                WHERE events.actor_id = actors.id
                                  AND events.state = 'pending'
+                                 AND work_items.state = 'ready'
                                  AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                                  AND (
                                     work_items.cancellation_requested_at IS NULL
                                     OR events.kind = 'cancel_requested'
                                  )
                             ),
-                            (SELECT MIN(events.mailbox_sequence) FROM events JOIN run_events ON run_events.event_id = events.id JOIN runs ON runs.id = run_events.run_id WHERE runs.actor_id = actors.id AND runs.state = 'active'),
+                            (SELECT MIN(events.mailbox_sequence) FROM events JOIN run_events ON run_events.event_id = events.id JOIN runs ON runs.id = run_events.run_id JOIN work_items ON work_items.id = runs.work_item_id WHERE runs.actor_id = actors.id AND runs.state = 'active' AND work_items.state = 'ready'),
+                            (SELECT MIN(events.mailbox_sequence) FROM events WHERE events.actor_id = actors.id AND events.state = 'pending' AND events.work_item_id IS NULL),
                             9223372036854775807
                          ), actors.id
                          LIMIT 1",
@@ -159,13 +167,19 @@ impl DispatchStore for SqliteRuntimeStore {
                         EXISTS (
                           SELECT 1 FROM events JOIN work_items ON work_items.id = events.work_item_id
                           WHERE events.actor_id = actors.id AND events.state = 'pending'
+                            AND work_items.state = 'ready'
                             AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?3)
                             AND (work_items.cancellation_requested_at IS NULL OR events.kind = 'cancel_requested')
                         )
                         OR EXISTS (
                           SELECT 1 FROM runs JOIN work_items ON work_items.id = runs.work_item_id
                           WHERE runs.actor_id = actors.id AND runs.state = 'active'
+                            AND work_items.state = 'ready'
                             AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?3)
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM events WHERE events.actor_id = actors.id
+                            AND events.state = 'pending' AND events.work_item_id IS NULL
                         )
                       )
                 )",
@@ -265,6 +279,7 @@ impl DispatchStore for SqliteRuntimeStore {
                          FROM runs
                          JOIN work_items ON work_items.id = runs.work_item_id
                          WHERE runs.actor_id = ?1 AND runs.state = 'active'
+                           AND work_items.state = 'ready'
                            AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                          ORDER BY runs.updated_at, runs.id
                          LIMIT 1",
@@ -285,12 +300,37 @@ impl DispatchStore for SqliteRuntimeStore {
                     if let Some(active) = active {
                         active
                     } else {
+                        let unassigned = transaction.query_row(
+                            "SELECT id, audience_kind, audience_address, kind FROM events
+                             WHERE actor_id = ?1 AND state = 'pending' AND work_item_id IS NULL
+                             ORDER BY mailbox_sequence LIMIT 1",
+                            [lease.actor_id.as_str()],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?)),
+                        ).optional()?;
+                        if let Some((event_id, audience_kind, audience_address, event_kind)) = unassigned {
+                            let work_id = WorkItemId::new();
+                            let work_kind = if event_kind == "external_completion" { "external" } else { "interactive" };
+                            transaction.execute(
+                                "INSERT INTO work_items(id, actor_id, kind, audience_kind, audience_address, state, created_at, updated_at)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?6)",
+                                params![work_id.as_str(), lease.actor_id.as_str(), work_kind, audience_kind, audience_address, now.0],
+                            )?;
+                            transaction.execute(
+                                "UPDATE events SET work_item_id = ?2, updated_at = ?3 WHERE id = ?1 AND work_item_id IS NULL",
+                                params![event_id, work_id.as_str(), now.0],
+                            )?;
+                            transaction.execute(
+                                "UPDATE local_requests SET work_item_id = ?2, updated_at = ?3 WHERE event_id = ?1 AND work_item_id IS NULL",
+                                params![event_id, work_id.as_str(), now.0],
+                            )?;
+                        }
                         let selected = transaction
                             .query_row(
                                 "SELECT work_items.id, work_items.audience_kind, work_items.audience_address
                                  FROM events
                                  JOIN work_items ON work_items.id = events.work_item_id
                                  WHERE events.actor_id = ?1 AND events.state = 'pending'
+                                   AND work_items.state = 'ready'
                                    AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                                    AND (
                                       work_items.cancellation_requested_at IS NULL
@@ -417,7 +457,7 @@ impl DispatchStore for SqliteRuntimeStore {
                             "run_id": run_id,
                         }).to_string();
                         transaction.execute(
-                            "UPDATE work_items SET state = 'blocked_unknown_outcome',
+                            "UPDATE work_items SET state = 'blocked_malformed',
                              next_attempt_at = NULL, last_error = ?2, updated_at = ?3 WHERE id = ?1",
                             params![work_item_id, diagnostic, now.0],
                         )?;
@@ -451,7 +491,7 @@ impl DispatchStore for SqliteRuntimeStore {
                         "run_id": run_id,
                     }).to_string();
                     transaction.execute(
-                        "UPDATE work_items SET state = 'blocked_unknown_outcome',
+                        "UPDATE work_items SET state = 'blocked_malformed',
                          next_attempt_at = NULL, last_error = ?2, updated_at = ?3 WHERE id = ?1",
                         params![work_item_id, diagnostic, now.0],
                     )?;
@@ -767,7 +807,7 @@ mod tests {
             model::{ActorId, Audience, CancelId, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                ControlStore, DispatchStore, FailureStore, IngressStore, LocalCancel,
+                ControlStore, DispatchStore, FailureFence, FailureStore, IngressStore, LocalCancel,
                 LocalIngressStore, LocalSubmission, LocalSubmitOutcome, NewInboundEvent,
                 RuntimeAuthorizationStore, StaleLease,
             },
@@ -860,7 +900,7 @@ mod tests {
                 .is_none()
         );
         let (work, event, diagnostic) = store.blocked_payload_probe().await.unwrap();
-        assert_eq!(work, "blocked_unknown_outcome");
+        assert_eq!(work, "blocked_malformed");
         assert_eq!(event, "blocked");
         assert!(diagnostic.unwrap().contains("malformed_persisted_payload"));
     }
@@ -879,7 +919,7 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .record_failure(&run.work_item_id, "retry", Timestamp(12))
+            .record_failure(&FailureFence::from(&run), "retry", Timestamp(12))
             .await
             .unwrap();
         store.release_lease(&lease).await.unwrap();

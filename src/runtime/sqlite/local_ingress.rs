@@ -271,7 +271,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(2)?,
                                 row.get::<_, String>(3)?,
                                 row.get::<_, Option<String>>(4)?,
                             ))
@@ -282,7 +282,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                         Ok(LocalRequestRecord {
                             request_id: RequestId::parse(&request_id)?,
                             actor_id: ActorId::from_string(actor_id),
-                            work_item_id: WorkItemId::from_string(work_item_id),
+                            work_item_id: work_item_id.map(WorkItemId::from_string),
                             state: decode_local_request_state(&state)?,
                             result_bundle_id: bundle_id
                                 .map(|id| BundleId::parse(&id))

@@ -141,7 +141,7 @@ mod tests {
     use super::{
         ArtifactId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState,
         MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES, MAX_FINAL_CHUNK_BYTES, MAX_FRAME_BYTES,
-        MAX_MANIFEST_BYTES, MAX_SUBMIT_BYTES, RequestId,
+        MAX_MANIFEST_BYTES, MAX_SUBMIT_BYTES, RequestId, WorkItemState,
     };
 
     #[test]
@@ -203,6 +203,14 @@ mod tests {
             serde_json::to_string(&BundleState::FailedTerminal)?,
             "\"failed_terminal\""
         );
+        assert_eq!(
+            serde_json::to_string(&WorkItemState::BlockedMalformed)?,
+            "\"blocked_malformed\""
+        );
+        assert_ne!(
+            WorkItemState::BlockedMalformed,
+            WorkItemState::BlockedUnknownOutcome
+        );
         Ok(())
     }
 }
@@ -231,7 +239,8 @@ pub enum EventState {
     Blocked,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkItemState {
     Ready,
     Waiting,
@@ -239,6 +248,7 @@ pub enum WorkItemState {
     Cancelled,
     FailedTerminal,
     BlockedUnknownOutcome,
+    BlockedMalformed,
     WaitingForDecision,
 }
 

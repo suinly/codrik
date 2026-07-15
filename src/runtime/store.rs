@@ -28,10 +28,7 @@ pub struct QuantumReport {
 
 #[derive(Debug)]
 pub enum QuantumFailure {
-    RecoverableWork {
-        work_item_id: WorkItemId,
-        message: String,
-    },
+    RecoverableWork { disposition: FailureDisposition },
     AuthorityUnavailable(anyhow::Error),
 }
 
@@ -54,12 +51,12 @@ pub enum FailureDisposition {
 pub trait FailureStore: Send + Sync {
     async fn record_failure(
         &self,
-        work: &WorkItemId,
+        fence: &FailureFence,
         error: &str,
         now: Timestamp,
     ) -> Result<FailureDisposition>;
 
-    async fn record_progress(&self, work: &WorkItemId, now: Timestamp) -> Result<()>;
+    async fn record_progress(&self, fence: &FailureFence, now: Timestamp) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -288,7 +285,7 @@ pub struct CancelOutcome {
 pub struct LocalRequestRecord {
     pub request_id: RequestId,
     pub actor_id: ActorId,
-    pub work_item_id: WorkItemId,
+    pub work_item_id: Option<WorkItemId>,
     pub state: LocalRequestState,
     pub result_bundle_id: Option<BundleId>,
 }
@@ -377,6 +374,23 @@ pub struct AttachedRun {
     pub request_ids: Vec<RequestId>,
     pub audience: Audience,
     pub messages: Vec<Message>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailureFence {
+    pub lease: ActorLease,
+    pub work_item_id: WorkItemId,
+    pub run_id: RunId,
+}
+
+impl From<&AttachedRun> for FailureFence {
+    fn from(run: &AttachedRun) -> Self {
+        Self {
+            lease: run.lease.clone(),
+            work_item_id: run.work_item_id.clone(),
+            run_id: run.run_id.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

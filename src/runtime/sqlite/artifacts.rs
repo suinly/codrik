@@ -10,7 +10,7 @@ use crate::runtime::{
     },
 };
 
-use super::{SqliteRuntimeStore, map_call_error};
+use super::{SqliteRuntimeStore, map_call_error, retry::call_connection_with_busy_retry};
 
 const MAX_ACTOR_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
@@ -20,8 +20,8 @@ impl ArtifactStore for SqliteRuntimeStore {
         if command.size > 256 * 1024 * 1024 {
             bail!("artifact exceeds the 256 MiB per-file limit");
         }
-        self.connection
-            .call(move |connection| -> Result<ArtifactLease> {
+        call_connection_with_busy_retry(&self.connection, move |connection| -> Result<ArtifactLease> {
+                let command = command.clone();
                 let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let size = i64::try_from(command.size)?;
                 transaction.execute(
@@ -46,7 +46,6 @@ impl ArtifactStore for SqliteRuntimeStore {
                 })
             })
             .await
-            .map_err(map_call_error)
     }
 
     async fn renew_staging(
@@ -84,7 +83,7 @@ impl ArtifactStore for SqliteRuntimeStore {
         &self,
         run: &crate::runtime::store::AttachedRun,
         attempt: &crate::runtime::model::AttemptId,
-        mut execution: DurableToolExecution,
+        execution: DurableToolExecution,
         leases: &[ArtifactLease],
         now: Timestamp,
     ) -> Result<()> {
@@ -98,8 +97,11 @@ impl ArtifactStore for SqliteRuntimeStore {
         let run = run.clone();
         let attempt = attempt.clone();
         let leases = leases.to_vec();
-        self.connection
-            .call(move |connection| -> Result<()> {
+        call_connection_with_busy_retry(&self.connection, move |connection| -> Result<()> {
+                let run = run.clone();
+                let attempt = attempt.clone();
+                let leases = leases.clone();
+                let mut execution = execution.clone();
                 let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let valid_run: bool = transaction.query_row(
                     "SELECT EXISTS(
@@ -175,7 +177,6 @@ impl ArtifactStore for SqliteRuntimeStore {
                 Ok(())
             })
             .await
-            .map_err(map_call_error)
     }
 
     async fn claim_expired_staging(

@@ -5,22 +5,20 @@ use anyhow::Result;
 use crate::runtime::{
     model::{ActorId, Clock},
     signals::ActorSignals,
-    store::{FailureDisposition, FailureStore, QuantumFailure, QuantumProgress, QuantumRunner},
+    store::{FailureDisposition, QuantumFailure, QuantumRunner},
 };
 
-pub struct ActorDispatcher<R, S, C> {
+pub struct ActorDispatcher<R, C> {
     actor_id: ActorId,
     owner: String,
     signals: ActorSignals,
     runner: R,
-    failures: S,
     clock: C,
 }
 
-impl<R, S, C> ActorDispatcher<R, S, C>
+impl<R, C> ActorDispatcher<R, C>
 where
     R: QuantumRunner,
-    S: FailureStore,
     C: Clock,
 {
     pub fn new(
@@ -28,7 +26,6 @@ where
         owner: impl Into<String>,
         signals: ActorSignals,
         runner: R,
-        failures: S,
         clock: C,
     ) -> Self {
         Self {
@@ -36,7 +33,6 @@ where
             owner: owner.into(),
             signals,
             runner,
-            failures,
             clock,
         }
     }
@@ -61,30 +57,14 @@ where
         loop {
             match self.runner.run_quantum(&self.actor_id, &self.owner).await {
                 Ok(report) => {
-                    if report.progress != QuantumProgress::None {
-                        if let Some(work) = report.work_item_id.as_ref() {
-                            self.failures
-                                .record_progress(work, self.clock.now())
-                                .await?;
-                        }
-                    }
                     if matches!(report.outcome, crate::runtime::runner::RunOnceOutcome::Idle) {
                         return Ok(());
                     }
                 }
-                Err(QuantumFailure::RecoverableWork {
-                    work_item_id,
-                    message,
-                }) => {
-                    match self
-                        .failures
-                        .record_failure(&work_item_id, &message, self.clock.now())
-                        .await?
-                    {
-                        FailureDisposition::RetryAt(_) => return Ok(()),
-                        FailureDisposition::Terminalized => continue,
-                    }
-                }
+                Err(QuantumFailure::RecoverableWork { disposition }) => match disposition {
+                    FailureDisposition::RetryAt(_) => return Ok(()),
+                    FailureDisposition::Terminalized => continue,
+                },
                 Err(QuantumFailure::AuthorityUnavailable(error)) => return Err(error),
             }
         }
@@ -112,8 +92,7 @@ mod tests {
         runner::RunOnceOutcome,
         signals::ActorSignals,
         store::{
-            FailureDisposition, FailureStore, QuantumFailure, QuantumProgress, QuantumReport,
-            QuantumRunner,
+            FailureDisposition, QuantumFailure, QuantumProgress, QuantumReport, QuantumRunner,
         },
     };
 
@@ -145,26 +124,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct RecordingFailures(Arc<Mutex<Vec<(WorkItemId, Timestamp, bool)>>>);
-
-    #[async_trait]
-    impl FailureStore for RecordingFailures {
-        async fn record_failure(
-            &self,
-            work: &WorkItemId,
-            _: &str,
-            now: Timestamp,
-        ) -> Result<FailureDisposition> {
-            self.0.lock().await.push((work.clone(), now, false));
-            Ok(FailureDisposition::RetryAt(now.plus_millis(1_000)))
-        }
-        async fn record_progress(&self, work: &WorkItemId, now: Timestamp) -> Result<()> {
-            self.0.lock().await.push((work.clone(), now, true));
-            Ok(())
-        }
-    }
-
     fn report(
         outcome: RunOnceOutcome,
         progress: QuantumProgress,
@@ -193,7 +152,6 @@ mod tests {
             "owner",
             ActorSignals::default(),
             runner,
-            RecordingFailures::default(),
             ManualClock::new(0),
         );
         let task = tokio::spawn(async move { dispatcher.run().await });
@@ -217,7 +175,6 @@ mod tests {
 
     #[tokio::test]
     async fn real_progress_resets_failure_history_but_replay_does_not() -> Result<()> {
-        let failures = RecordingFailures::default();
         let runner = ScriptedRunner {
             calls: Arc::new(AtomicUsize::new(0)),
             actors: Arc::new(Mutex::new(Vec::new())),
@@ -232,14 +189,10 @@ mod tests {
             "owner",
             ActorSignals::default(),
             runner,
-            failures.clone(),
             ManualClock::new(10),
         )
         .dispatch_ready()
         .await?;
-        let records = failures.0.lock().await;
-        assert_eq!(records.len(), 1);
-        assert!(records[0].2);
         Ok(())
     }
 
@@ -257,7 +210,6 @@ mod tests {
             "owner",
             ActorSignals::default(),
             runner,
-            RecordingFailures::default(),
             ManualClock::new(0),
         )
         .dispatch_ready()

@@ -75,7 +75,50 @@ individually before the full suite was rerun.
 
 ## Concerns
 
-The schema does not have a generic `blocked` work-item variant, so poison input
-uses `blocked_unknown_outcome` as the existing non-dispatchable blocked state.
-This is truthful and loop-safe, but a later schema revision may choose a more
-specific poison-data state.
+The original implementation reused `blocked_unknown_outcome` for poison input.
+The review correction below supersedes that decision with the distinct
+`blocked_malformed` state.
+
+## Review Correction
+
+The follow-up review identified authority and state-machine gaps in the first
+implementation. The correction makes failure bookkeeping part of the runner's
+lease-fenced quantum: `FailureFence` binds actor owner/generation, run, and work,
+and progress/failure updates validate that fence inside the same immediate
+transaction before the lease is released. A replaced worker therefore cannot
+reset or terminalize work after a newer generation checkpoints or finalizes it.
+
+Fifth-failure terminalization now detaches every unincorporated event and local
+request from the terminal work. Dispatch creates a fresh work item before the
+event is acquired again, while all ready/acquire paths require `state = 'ready'`
+for already-associated work. The terminal work and its incorporated request
+bundles remain immutable.
+
+Poison persistence now has the distinct `blocked_malformed` work state in the
+Rust model, fresh schema, poison transactions, and diagnostics. It is no longer
+conflated with the recoverable tool-safety state `blocked_unknown_outcome`.
+
+All Task 8 immediate authority writes involved in dispatch, checkpointing,
+finalization, cancellation, tool preparation/outcomes, artifact outcome commit,
+and failure/progress bookkeeping use the bounded busy/locked retry policy. The
+retry closure contains only the database transaction, so filesystem/tool/model
+effects are not repeated. A real two-connection SQLite write-lock test confirms
+four attempts with the exact 10/25/50 ms sleeps; a separate wrapper test confirms
+non-busy errors are propagated after one attempt.
+
+The production runner now durably checkpoints assistant tool-call output before
+tool execution. Focused tests exercise its four progress mappings directly:
+model checkpoint, known tool outcome, finalization, and incorporation replay
+with no progress.
+
+Correction verification:
+
+- `rtk cargo test runtime::sqlite::failures::tests` — 4 passed.
+- `rtk cargo test runtime::sqlite::dispatch::tests` — 9 passed.
+- `rtk cargo test runtime::sqlite::retry::tests` — 5 passed.
+- `rtk cargo test runtime::runner::tests` — 14 passed.
+- `rtk cargo test` — 318 passed, 1 ignored.
+- `rtk cargo check` — passed with the existing crate-wide unused/dead-code warnings.
+- `rtk cargo fmt --check` — passed.
+- `rtk cargo clippy --all-targets --all-features` — 0 errors; existing warnings remain.
+- `rtk git diff --check` — passed.

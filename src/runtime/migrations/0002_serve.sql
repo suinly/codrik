@@ -59,7 +59,7 @@ CREATE TABLE local_requests (
     request_id TEXT PRIMARY KEY,
     actor_id TEXT NOT NULL REFERENCES actors(id),
     event_id TEXT NOT NULL UNIQUE REFERENCES events(id),
-    work_item_id TEXT NOT NULL REFERENCES work_items(id),
+    work_item_id TEXT REFERENCES work_items(id),
     prompt_sha256 TEXT NOT NULL CHECK(length(prompt_sha256) = 64),
     state TEXT NOT NULL CHECK(state IN ('active','completed','cancelled','failed_terminal')),
     result_bundle_id TEXT UNIQUE REFERENCES result_bundles(id) DEFERRABLE INITIALLY DEFERRED,
