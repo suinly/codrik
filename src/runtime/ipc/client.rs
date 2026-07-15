@@ -150,6 +150,65 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn daemon_events_have_no_header_or_body_response_deadline() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let expected = request.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            FrameReader::new(&mut stream).read_client_request().await?;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            FrameWriter::new(&mut stream)
+                .write_server_event(&ServerEvent::new(ServerEventBody::TextDelta {
+                    request_id: expected.clone(),
+                    delta: "after idle".into(),
+                }))
+                .await?;
+            let event = ServerEvent::new(ServerEventBody::TextDelta {
+                request_id: expected,
+                delta: "slow body".into(),
+            });
+            let bytes = serde_json::to_vec(&event)?;
+            stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await?;
+            stream.write_all(&bytes[..1]).await?;
+            tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+            stream.write_all(&bytes[1..]).await?;
+            anyhow::Ok(())
+        });
+
+        let client = LocalIpcClient::new(socket.clone());
+        let mut events = client.resume(request).await?;
+        let first_event = {
+            let first = events.next_event();
+            tokio::pin!(first);
+            tokio::task::yield_now().await;
+            advance(std::time::Duration::from_secs(6)).await;
+            first.await?.unwrap()
+        };
+        assert!(
+            matches!(first_event.body, ServerEventBody::TextDelta { delta, .. } if delta == "after idle")
+        );
+        let second_event = {
+            let second = events.next_event();
+            tokio::pin!(second);
+            tokio::task::yield_now().await;
+            advance(std::time::Duration::from_secs(31)).await;
+            second.await?.unwrap()
+        };
+        assert!(
+            matches!(second_event.body, ServerEventBody::TextDelta { delta, .. } if delta == "slow body")
+        );
+        server.await??;
+        std::fs::remove_file(socket)?;
+        Ok(())
+    }
+
     fn temp_socket() -> PathBuf {
         PathBuf::from("/tmp").join(format!("c11-{}.sock", uuid::Uuid::new_v4()))
     }
@@ -303,7 +362,7 @@ impl fmt::Debug for ClientEventStream {
 
 impl ClientEventStream {
     pub async fn next_event(&mut self) -> Result<Option<ServerEvent>> {
-        match self.reader.read_server_event().await {
+        match self.reader.read_server_event_without_deadline().await {
             Ok(event) => Ok(Some(event)),
             Err(error) if error.code() == ProtocolErrorCode::IncompleteFrame => Ok(None),
             Err(error) => Err(error.into()),

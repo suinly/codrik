@@ -5,8 +5,8 @@ BIN_NAME="codrik"
 DEFAULT_REPO_URL="https://github.com/suinly/codrik"
 DEFAULT_BASE_URL="https://api.openai.com/v1"
 DEFAULT_MODEL="gpt-4.1-mini"
-CONFIGURED_GATEWAY="none"
 CONFIGURED_CONFIG_FILE=""
+CONFIGURED_RUNTIME_READY=0
 if [ -n "${HOME:-}" ]; then
   DEFAULT_INSTALL_DIR="$HOME/.local/bin"
   DEFAULT_CONFIG_DIR="$HOME/.codrik"
@@ -39,7 +39,7 @@ Environment:
   CODRIK_CONFIG_DIR    Config directory. Default: ~/.codrik
   CODRIK_HOME          Runtime data directory. Default: CODRIK_CONFIG_DIR
   CODRIK_SKIP_CONFIG   Set to 1 to skip interactive config setup.
-  CODRIK_SKIP_SERVICE  Set to 1 to skip gateway service setup.
+  CODRIK_SKIP_SERVICE  Set to 1 to skip foreground service setup.
 
 Examples:
   CODRIK_VERSION=v0.2.0 sh scripts/install.sh
@@ -176,19 +176,18 @@ write_config() {
   api_key="$2"
   base_url="$3"
   model="$4"
-  gateway="$5"
-  telegram_token="$6"
+  actor_id="$5"
 
   umask 077
   {
     printf 'api_key: "%s"\n' "$(yaml_escape "$api_key")"
     printf 'base_url: "%s"\n' "$(yaml_escape "$base_url")"
     printf 'model: "%s"\n' "$(yaml_escape "$model")"
-    if [ "$gateway" = "telegram" ]; then
-      printf 'telegram:\n'
-      printf '  token: "%s"\n' "$(yaml_escape "$telegram_token")"
+    printf 'runtime:\n'
+    if [ "$actor_id" = "actor:local:owner" ]; then
+      printf '  actor_id: actor:local:owner\n'
     else
-      printf 'telegram: null\n'
+      printf '  actor_id: "%s"\n' "$(yaml_escape "$actor_id")"
     fi
   } >"$config_file"
 }
@@ -202,20 +201,19 @@ write_systemd_user_service() {
   service_file="$1"
   bin_path="$2"
   config_file="$3"
-  gateway="$4"
-  config_dir="$5"
+  runtime_dir="$4"
 
   mkdir -p "$(dirname "$service_file")"
   cat >"$service_file" <<SERVICE
 [Unit]
-Description=Codrik $gateway gateway
+Description=Codrik foreground runtime
 After=network-online.target
 
 [Service]
 Type=simple
 Environment=CODRIK_CONFIG=$config_file
-Environment=CODRIK_HOME=$config_dir
-ExecStart=$bin_path gateway $gateway
+Environment=CODRIK_HOME=$runtime_dir
+ExecStart=$bin_path serve
 Restart=always
 RestartSec=5
 
@@ -228,9 +226,8 @@ write_launchd_service() {
   plist_file="$1"
   bin_path="$2"
   config_file="$3"
-  gateway="$4"
-  config_dir="$5"
-  label="com.suinly.codrik.$gateway"
+  runtime_dir="$4"
+  label="com.suinly.codrik"
 
   mkdir -p "$(dirname "$plist_file")"
   cat >"$plist_file" <<PLIST
@@ -239,28 +236,27 @@ write_launchd_service() {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>$(xml_escape "$label")</string>
+  <string>com.suinly.codrik</string>
   <key>ProgramArguments</key>
   <array>
     <string>$(xml_escape "$bin_path")</string>
-    <string>gateway</string>
-    <string>$(xml_escape "$gateway")</string>
+    <string>serve</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>CODRIK_CONFIG</key>
     <string>$(xml_escape "$config_file")</string>
     <key>CODRIK_HOME</key>
-    <string>$(xml_escape "$config_dir")</string>
+    <string>$(xml_escape "$runtime_dir")</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>$(xml_escape "$config_dir/$gateway.log")</string>
+  <string>$(xml_escape "$runtime_dir/codrik.log")</string>
   <key>StandardErrorPath</key>
-  <string>$(xml_escape "$config_dir/$gateway.err.log")</string>
+  <string>$(xml_escape "$runtime_dir/codrik.err.log")</string>
 </dict>
 </plist>
 PLIST
@@ -268,15 +264,14 @@ PLIST
 
 print_service_management_hint() {
   os="$1"
-  gateway="$2"
 
   case "$os" in
     Linux)
       cat <<HINT
-Manage the gateway service with:
-  systemctl --user status codrik-$gateway.service
-  systemctl --user restart codrik-$gateway.service
-  journalctl --user -u codrik-$gateway.service -f
+Manage the Codrik service with:
+  systemctl --user status codrik.service
+  systemctl --user restart codrik.service
+  journalctl --user -u codrik.service -f
 
 This is a user service, so do not use sudo, service, or systemctl without --user.
 To start it at boot without logging in, run:
@@ -285,13 +280,13 @@ HINT
       ;;
     Darwin)
       cat <<HINT
-Manage the gateway service with:
-  launchctl print gui/$(id -u)/com.suinly.codrik.$gateway
-  launchctl kickstart -k gui/$(id -u)/com.suinly.codrik.$gateway
+Manage the Codrik service with:
+  launchctl print gui/$(id -u)/com.suinly.codrik
+  launchctl kickstart -k gui/$(id -u)/com.suinly.codrik
 
 Logs:
-  ~/.codrik/$gateway.log
-  ~/.codrik/$gateway.err.log
+  ~/.codrik/codrik.log
+  ~/.codrik/codrik.err.log
 HINT
       ;;
   esac
@@ -311,11 +306,11 @@ enable_user_linger() {
   fi
 
   if loginctl enable-linger "$user_name"; then
-    echo "Enabled lingering for $user_name so the gateway can run after logout."
+    echo "Enabled lingering for $user_name so Codrik can run after logout."
   else
     cat >&2 <<HINT
 Could not enable lingering automatically.
-The gateway service may stop after logout. Run:
+The Codrik service may stop after logout. Run:
   loginctl enable-linger $user_name
 or, if your system requires elevated privileges:
   sudo loginctl enable-linger $user_name
@@ -323,53 +318,123 @@ HINT
   fi
 }
 
-install_gateway_service() {
-  gateway="$1"
-  bin_path="$2"
-  config_file="$3"
-  runtime_dir="$4"
+install_serve_service() {
+  bin_path="$1"
+  config_file="$2"
+  runtime_dir="$3"
   os="$(uname -s)"
 
-  [ "$gateway" != "none" ] || return
   mkdir -p "$runtime_dir"
+  chmod 700 "$runtime_dir"
 
   case "$os" in
     Linux)
       need_command systemctl
       need_command id
-      service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/codrik-$gateway.service"
-      write_systemd_user_service "$service_file" "$bin_path" "$config_file" "$gateway" "$runtime_dir"
+      service_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+      service_file="$service_dir/codrik.service"
+      systemctl --user disable --now codrik-telegram.service >/dev/null 2>&1 || true
+      rm -f "$service_dir/codrik-telegram.service"
+      write_systemd_user_service "$service_file" "$bin_path" "$config_file" "$runtime_dir"
       systemctl --user daemon-reload
-      systemctl --user enable --now "codrik-$gateway.service"
+      systemctl --user enable --now codrik.service
       enable_user_linger
-      echo "Started user service codrik-$gateway.service"
-      print_service_management_hint "$os" "$gateway"
+      echo "Started user service codrik.service"
+      print_service_management_hint "$os"
       ;;
     Darwin)
       need_command launchctl
       need_command id
-      plist_file="$HOME/Library/LaunchAgents/com.suinly.codrik.$gateway.plist"
-      label="com.suinly.codrik.$gateway"
-      write_launchd_service "$plist_file" "$bin_path" "$config_file" "$gateway" "$runtime_dir"
+      launch_dir="$HOME/Library/LaunchAgents"
+      old_plist="$launch_dir/com.suinly.codrik.telegram.plist"
+      plist_file="$launch_dir/com.suinly.codrik.plist"
+      label="com.suinly.codrik"
+      launchctl bootout "gui/$(id -u)" "$old_plist" >/dev/null 2>&1 || true
+      rm -f "$old_plist"
+      write_launchd_service "$plist_file" "$bin_path" "$config_file" "$runtime_dir"
       launchctl bootout "gui/$(id -u)" "$plist_file" >/dev/null 2>&1 || true
       launchctl bootstrap "gui/$(id -u)" "$plist_file"
       launchctl enable "gui/$(id -u)/$label"
       launchctl kickstart -k "gui/$(id -u)/$label"
       echo "Started LaunchAgent $label"
-      print_service_management_hint "$os" "$gateway"
+      print_service_management_hint "$os"
       ;;
     *)
-      echo "Gateway service setup is not supported on $os." >&2
+      echo "Service setup is not supported on $os." >&2
       ;;
   esac
 }
 
+authorization_has_actors() {
+  users_file="$1"
+  [ -s "$users_file" ] || return 1
+  compact="$(tr -d ' \t\r\n' <"$users_file")"
+  case "$compact" in
+    *'"actors":{}'*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+bootstrap_or_select_actor() {
+  runtime_dir="$1"
+  users_file="$runtime_dir/users.json"
+
+  mkdir -p "$runtime_dir"
+  chmod 700 "$runtime_dir"
+  if authorization_has_actors "$users_file"; then
+    echo "Existing users.json is user-owned and will not be modified: $users_file" >&2
+    actor_id=""
+    while [ -z "$actor_id" ]; do
+      actor_id="$(ask "Existing authorization actor ID" "")"
+      [ -n "$actor_id" ] || echo "An explicit actor ID is required." >&2
+    done
+    printf '%s\n' "$actor_id"
+    return
+  fi
+
+  umask 077
+  cat >"$users_file" <<'USERS'
+{
+  "version": 1,
+  "actors": {
+    "actor:local:owner": {
+      "enabled": true,
+      "display_name": null,
+      "identities": [],
+      "tools": ["*"]
+    }
+  }
+}
+USERS
+  chmod 600 "$users_file"
+  printf '%s\n' "actor:local:owner"
+}
+
+config_has_runtime_actor() {
+  config_file="$1"
+  sed -n '/^[[:space:]]*runtime:[[:space:]]*$/,/^[^[:space:]]/p' "$config_file" \
+    | sed -n '/^[[:space:]]*actor_id:[[:space:]]*[^[:space:]]/p' \
+    | sed -n '1p' \
+    | tr -d '\n' \
+    | sed 's/.*/yes/'
+}
+
+print_missing_runtime_actor() {
+  cat >&2 <<'YAML'
+Existing config is missing runtime.actor_id. Add exactly:
+runtime:
+  actor_id: <existing-actor-id>
+Codrik service was not started.
+YAML
+}
+
 configure_codrik() {
   config_dir="$1"
+  runtime_dir="$2"
   config_file="$config_dir/config.yml"
   legacy_config_file="$config_dir/codrik.config.yml"
-  CONFIGURED_GATEWAY="none"
   CONFIGURED_CONFIG_FILE="$config_file"
+  CONFIGURED_RUNTIME_READY=0
 
   [ -n "$config_dir" ] || die "could not determine config directory; set CODRIK_CONFIG_DIR"
 
@@ -390,14 +455,10 @@ configure_codrik() {
 
   if [ -f "$config_file" ] && ! ask_yes_no "$config_file already exists. Overwrite it?" "n"; then
     echo "Keeping existing config: $config_file"
-    if ask_yes_no "Install or restart a gateway service for the existing config?" "n"; then
-      while :; do
-        CONFIGURED_GATEWAY="$(ask "Gateway service to run (telegram)" "telegram")"
-        case "$CONFIGURED_GATEWAY" in
-          telegram) break ;;
-          *) echo "Supported gateway service: telegram." >&2 ;;
-        esac
-      done
+    if [ "$(config_has_runtime_actor "$config_file")" = "yes" ]; then
+      CONFIGURED_RUNTIME_READY=1
+    else
+      print_missing_runtime_actor
     fi
     return
   fi
@@ -412,34 +473,17 @@ configure_codrik() {
 
   base_url="$(ask "OpenAI-compatible base URL" "$DEFAULT_BASE_URL")"
   model="$(ask "Model" "$DEFAULT_MODEL")"
-
-  gateway="none"
-  if ask_yes_no "Configure a gateway?" "n"; then
-    while :; do
-      gateway="$(ask "Gateway (telegram)" "telegram")"
-      case "$gateway" in
-        telegram) break ;;
-        *) echo "Supported gateway: telegram." >&2 ;;
-      esac
-    done
-  fi
-
-  telegram_token=""
-  if [ "$gateway" = "telegram" ]; then
-    while [ -z "$telegram_token" ]; do
-      telegram_token="$(ask_secret "Telegram bot token")"
-      if [ -z "$telegram_token" ]; then
-        echo "Telegram bot token is required for telegram gateway." >&2
-      fi
-    done
-    echo "Telegram access will be bootstrapped in $config_dir/users.json when the first user sends /start."
-  fi
+  actor_id="$(bootstrap_or_select_actor "$runtime_dir")"
 
   mkdir -p "$config_dir"
-  write_config "$config_file" "$api_key" "$base_url" "$model" "$gateway" "$telegram_token"
-  CONFIGURED_GATEWAY="$gateway"
+  write_config "$config_file" "$api_key" "$base_url" "$model" "$actor_id"
+  CONFIGURED_RUNTIME_READY=1
   echo "Wrote config to $config_file"
 }
+
+if [ "${CODRIK_INSTALL_LIBRARY_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 case "${1:-}" in
   -h | --help)
@@ -456,6 +500,8 @@ need_command mkdir
 need_command mv
 need_command sed
 need_command dirname
+need_command tr
+need_command rm
 
 repo_url="${CODRIK_REPO_URL:-$DEFAULT_REPO_URL}"
 version="${CODRIK_VERSION:-latest}"
@@ -495,12 +541,12 @@ mv "$tmp_dir/$asset" "$install_dir/$BIN_NAME"
 echo "Installed $BIN_NAME $tag to $install_dir/$BIN_NAME"
 
 if [ "${CODRIK_SKIP_CONFIG:-0}" != "1" ]; then
-  configure_codrik "$config_dir"
+  configure_codrik "$config_dir" "$runtime_dir"
 fi
 
-if [ "${CODRIK_SKIP_SERVICE:-0}" != "1" ] && [ "$CONFIGURED_GATEWAY" != "none" ]; then
-  if is_interactive && ask_yes_no "Install and start $CONFIGURED_GATEWAY gateway service?" "y"; then
-    install_gateway_service "$CONFIGURED_GATEWAY" "$install_dir/$BIN_NAME" "$CONFIGURED_CONFIG_FILE" "$runtime_dir"
+if [ "${CODRIK_SKIP_SERVICE:-0}" != "1" ] && [ "$CONFIGURED_RUNTIME_READY" = "1" ]; then
+  if is_interactive && ask_yes_no "Install and start the Codrik service?" "y"; then
+    install_serve_service "$install_dir/$BIN_NAME" "$CONFIGURED_CONFIG_FILE" "$runtime_dir"
   fi
 fi
 

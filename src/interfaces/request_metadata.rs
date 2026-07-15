@@ -221,6 +221,7 @@ mod tests {
         store.set_state(&request, RequestMetadataState::Accepted)?;
         let ready = root.join("accepted-ready");
         let release = root.join("accepted-release");
+        let terminal_started = root.join("terminal-started");
         let executable = env::current_exe()?;
 
         let mut accepted = Command::new(&executable)
@@ -246,8 +247,9 @@ mod tests {
             .env("CODRIK_METADATA_HELPER_ROOT", &root)
             .env("CODRIK_METADATA_HELPER_REQUEST", request.to_string())
             .env("CODRIK_METADATA_HELPER_STATE", "terminal")
+            .env("CODRIK_METADATA_HELPER_STARTED", &terminal_started)
             .spawn()?;
-        std::thread::sleep(Duration::from_millis(100));
+        wait_for_path(&terminal_started)?;
         assert!(
             terminal.try_wait()?.is_none(),
             "terminal writer did not block"
@@ -274,6 +276,9 @@ mod tests {
             "terminal" => RequestMetadataState::Terminal,
             other => anyhow::bail!("unknown helper state {other}"),
         };
+        if let Ok(started) = env::var("CODRIK_METADATA_HELPER_STARTED") {
+            fs::write(started, b"attempting-set-state")?;
+        }
         RequestMetadataStore::new(root.into()).set_state(&request, state)
     }
 

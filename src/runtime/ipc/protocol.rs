@@ -353,6 +353,28 @@ where
         decode_envelope(&payload, ProtocolErrorCode::InvalidJson)
     }
 
+    pub async fn read_server_event_without_deadline(
+        &mut self,
+    ) -> Result<ServerEvent, ProtocolFailure> {
+        let payload = self.read_payload_without_deadline().await?;
+        decode_envelope(&payload, ProtocolErrorCode::InvalidJson)
+    }
+
+    async fn read_payload_without_deadline(&mut self) -> Result<Vec<u8>, ProtocolFailure> {
+        let mut header = [0_u8; 4];
+        self.inner
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| incomplete(error, "frame header is incomplete"))?;
+        let length = validate_frame_length(header)?;
+        let mut payload = vec![0_u8; length];
+        self.inner
+            .read_exact(&mut payload)
+            .await
+            .map_err(|error| incomplete(error, "frame body is incomplete"))?;
+        Ok(payload)
+    }
+
     async fn read_payload(&mut self) -> Result<Vec<u8>, ProtocolFailure> {
         let mut header = [0_u8; 4];
         match timeout(FRAME_HEADER_TIMEOUT, self.inner.read_exact(&mut header)).await {
@@ -365,19 +387,7 @@ where
             Ok(Err(error)) => return Err(incomplete(error, "frame header is incomplete")),
             Ok(Ok(_)) => {}
         }
-        let length = u32::from_be_bytes(header) as usize;
-        if length == 0 {
-            return Err(ProtocolFailure::new(
-                ProtocolErrorCode::ZeroLengthFrame,
-                "zero-length frames are forbidden",
-            ));
-        }
-        if length > MAX_FRAME_BYTES {
-            return Err(ProtocolFailure::new(
-                ProtocolErrorCode::FrameTooLarge,
-                format!("frame length {length} exceeds {MAX_FRAME_BYTES}"),
-            ));
-        }
+        let length = validate_frame_length(header)?;
 
         // The announced length is checked before this allocation.
         let mut payload = vec![0_u8; length];
@@ -390,6 +400,23 @@ where
             Ok(Ok(_)) => Ok(payload),
         }
     }
+}
+
+fn validate_frame_length(header: [u8; 4]) -> Result<usize, ProtocolFailure> {
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 {
+        return Err(ProtocolFailure::new(
+            ProtocolErrorCode::ZeroLengthFrame,
+            "zero-length frames are forbidden",
+        ));
+    }
+    if length > MAX_FRAME_BYTES {
+        return Err(ProtocolFailure::new(
+            ProtocolErrorCode::FrameTooLarge,
+            format!("frame length {length} exceeds {MAX_FRAME_BYTES}"),
+        ));
+    }
+    Ok(length)
 }
 
 fn incomplete(error: io::Error, context: &str) -> ProtocolFailure {
@@ -809,8 +836,15 @@ mod tests {
                 cancel_id: cancel_id(),
             }),
         ];
-        for value in values {
+        let expected = [
+            r#"{"version":1,"body":{"type":"submit","request_id":"0190f2ef-0000-7000-8000-000000000001","text":"hello"}}"#,
+            r#"{"version":1,"body":{"type":"resume","request_id":"0190f2ef-0000-7000-8000-000000000001"}}"#,
+            r#"{"version":1,"body":{"type":"ack_final","request_id":"0190f2ef-0000-7000-8000-000000000001","bundle_id":"0190f2ef-0000-7000-8000-000000000002","delivery_ids":["0190f2ef-0000-7000-8000-000000000003"]}}"#,
+            r#"{"version":1,"body":{"type":"cancel","request_id":"0190f2ef-0000-7000-8000-000000000001","cancel_id":"0190f2ef-0000-7000-8000-000000000004"}}"#,
+        ];
+        for (value, expected) in values.into_iter().zip(expected) {
             let json = serde_json::to_vec(&value)?;
+            assert_eq!(std::str::from_utf8(&json)?, expected);
             assert_eq!(serde_json::from_slice::<ClientRequest>(&json)?, value);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&json)?["version"],
@@ -886,8 +920,25 @@ mod tests {
                 resume_command: Some("codrik resume id".into()),
             }),
         ];
-        for value in values {
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let expected = [
+            r#"{"version":1,"body":{"type":"accepted","request_id":"0190f2ef-0000-7000-8000-000000000001","work_item_id":"0190f2ef-0000-7000-8000-000000000005","sequence":7}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"cancel_accepted","request_id":"0190f2ef-0000-7000-8000-000000000001","cancel_id":"0190f2ef-0000-7000-8000-000000000004","affected_request_ids":["0190f2ef-0000-7000-8000-000000000001"]}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"ack_accepted","request_id":"0190f2ef-0000-7000-8000-000000000001","bundle_id":"0190f2ef-0000-7000-8000-000000000002"}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"activity","request_id":"0190f2ef-0000-7000-8000-000000000001","event":{"type":"tool_finished","name":"bash","succeeded":true}}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"text_delta","request_id":"0190f2ef-0000-7000-8000-000000000001","delta":"part"}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"stream_gap","request_id":"0190f2ef-0000-7000-8000-000000000001"}}"#.to_string(),
+            format!(r#"{{"version":1,"body":{{"type":"final_begin","request_id":"0190f2ef-0000-7000-8000-000000000001","bundle_id":"0190f2ef-0000-7000-8000-000000000002","replay":false,"manifest":[{{"delivery_id":"0190f2ef-0000-7000-8000-000000000003","payload_kind":"text","decoded_bytes":16,"sha256":"{hash_a}","chunk_count":1}}]}}}}"#),
+            r#"{"version":1,"body":{"type":"final_chunk","request_id":"0190f2ef-0000-7000-8000-000000000001","bundle_id":"0190f2ef-0000-7000-8000-000000000002","delivery_id":"0190f2ef-0000-7000-8000-000000000003","chunk_index":0,"bytes_base64":"eA=="}}"#.to_string(),
+            format!(r#"{{"version":1,"body":{{"type":"final_end","request_id":"0190f2ef-0000-7000-8000-000000000001","bundle_id":"0190f2ef-0000-7000-8000-000000000002","manifest_sha256":"{hash_b}"}}}}"#),
+            r#"{"version":1,"body":{"type":"request_error","request_id":"0190f2ef-0000-7000-8000-000000000001","code":"missing_request","message":"not found"}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"protocol_error","code":"invalid_json","message":"bad json"}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"server_shutting_down","request_id":"0190f2ef-0000-7000-8000-000000000001","resume_command":"codrik resume id"}}"#.to_string(),
+        ];
+        for (value, expected) in values.into_iter().zip(expected) {
             let json = serde_json::to_vec(&value)?;
+            assert_eq!(std::str::from_utf8(&json)?, expected);
             assert_eq!(serde_json::from_slice::<ServerEvent>(&json)?, value);
         }
         Ok(())

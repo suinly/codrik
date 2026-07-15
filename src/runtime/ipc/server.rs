@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     io,
     sync::{
         Arc, Mutex, Weak,
@@ -34,6 +34,68 @@ use crate::runtime::{
 };
 
 pub const MAX_CONNECTIONS: usize = 64;
+
+#[derive(Clone, Default)]
+struct DecodeRegistry {
+    inner: Arc<DecodeRegistryInner>,
+}
+
+#[derive(Default)]
+struct DecodeRegistryInner {
+    next_ticket: AtomicU64,
+    pending: Mutex<BTreeSet<u64>>,
+    changed: tokio::sync::Notify,
+}
+
+struct DecodeGuard {
+    ticket: u64,
+    registry: DecodeRegistry,
+}
+
+impl DecodeRegistry {
+    fn register(&self) -> DecodeGuard {
+        let ticket = self.inner.next_ticket.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pending
+            .lock()
+            .expect("decode registry poisoned")
+            .insert(ticket);
+        DecodeGuard {
+            ticket,
+            registry: self.clone(),
+        }
+    }
+
+    async fn wait_for_prior(&self, ticket: u64) {
+        loop {
+            let changed = self.inner.changed.notified();
+            let prior_pending = self
+                .inner
+                .pending
+                .lock()
+                .expect("decode registry poisoned")
+                .range(..ticket)
+                .next()
+                .is_some();
+            if !prior_pending {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for DecodeGuard {
+    fn drop(&mut self) {
+        self.registry
+            .inner
+            .pending
+            .lock()
+            .expect("decode registry poisoned")
+            .remove(&self.ticket);
+        self.registry.inner.changed.notify_waiters();
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct SubmissionRegistry {
@@ -145,6 +207,7 @@ pub struct LocalIpcServer {
     submissions: SubmissionRegistry,
     connections: Arc<Semaphore>,
     active: ActiveConnections,
+    decodes: DecodeRegistry,
 }
 
 impl LocalIpcServer {
@@ -194,6 +257,7 @@ impl LocalIpcServer {
             submissions: SubmissionRegistry::default(),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             active: ActiveConnections::default(),
+            decodes: DecodeRegistry::default(),
         }
     }
 
@@ -238,10 +302,12 @@ impl LocalIpcServer {
                 credentials: self.credentials.clone(),
                 submissions: self.submissions.clone(),
                 active: self.active.clone(),
+                decodes: self.decodes.clone(),
             };
+            let decode = self.decodes.register();
             handlers.spawn(async move {
                 let _permit = permit;
-                let _ = handler.handle(stream).await;
+                let _ = handler.handle_with_decode(stream, Some(decode)).await;
             });
         }
     }
@@ -260,10 +326,19 @@ struct ConnectionHandler {
     credentials: Arc<dyn PeerCredentials>,
     submissions: SubmissionRegistry,
     active: ActiveConnections,
+    decodes: DecodeRegistry,
 }
 
 impl ConnectionHandler {
     async fn handle(&self, stream: UnixStream) -> Result<()> {
+        self.handle_with_decode(stream, None).await
+    }
+
+    async fn handle_with_decode(
+        &self,
+        stream: UnixStream,
+        decode: Option<DecodeGuard>,
+    ) -> Result<()> {
         // Authentication deliberately precedes even the first frame read.
         let stream =
             AuthorizedUnixStream::authorize(stream, self.credentials.as_ref())?.into_inner();
@@ -292,15 +367,28 @@ impl ConnectionHandler {
             sink.abort("server shutting down").await;
             return Ok(());
         }
+        let decode_ticket = decode.as_ref().map(|guard| guard.ticket);
         match request.body {
             ClientRequestBody::Submit { request_id, text } => {
-                self.submit(request_id, text, sink, read).await
+                let guard = match self.submissions.register(request_id.clone()) {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        self.submissions.wait_for(&request_id).await?;
+                        None
+                    }
+                };
+                drop(decode);
+                self.submit(request_id, text, sink, read, guard).await
             }
-            ClientRequestBody::Resume { request_id } => self.resume(request_id, sink, read).await,
+            ClientRequestBody::Resume { request_id } => {
+                drop(decode);
+                self.resume(request_id, sink, read, decode_ticket).await
+            }
             ClientRequestBody::Cancel {
                 request_id,
                 cancel_id,
             } => {
+                drop(decode);
                 let outcome = self
                     .ingress
                     .cancel_for_actor(
@@ -321,6 +409,7 @@ impl ConnectionHandler {
                 bundle_id,
                 delivery_ids,
             } => {
+                drop(decode);
                 let result = self
                     .outbox
                     .acknowledge(BundleAck {
@@ -357,14 +446,8 @@ impl ConnectionHandler {
         text: String,
         sink: Arc<SocketDeliverySink>,
         mut read: ReadHalf<UnixStream>,
+        guard: Option<SubmissionGuard>,
     ) -> Result<()> {
-        let guard = match self.submissions.register(request.clone()) {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                self.submissions.wait_for(&request).await?;
-                None
-            }
-        };
         let mut subscription = self
             .hub
             .subscribe_with_delivery_sink(request.clone(), sink.clone())?;
@@ -452,10 +535,18 @@ impl ConnectionHandler {
         request: RequestId,
         sink: Arc<SocketDeliverySink>,
         mut read: ReadHalf<UnixStream>,
+        decode_ticket: Option<u64>,
     ) -> Result<()> {
         self.submissions.wait_for(&request).await?;
         let delivery = self.hub.subscribe_delivery(request.clone(), sink.clone())?;
-        let record = self.ingress.resolve_local_request(&request).await?;
+        let mut record = self.ingress.resolve_local_request(&request).await?;
+        if record.is_none()
+            && let Some(ticket) = decode_ticket
+        {
+            self.decodes.wait_for_prior(ticket).await;
+            self.submissions.wait_for(&request).await?;
+            record = self.ingress.resolve_local_request(&request).await?;
+        }
         let result = self
             .serve_durable_request(request, record, sink, &mut read)
             .await;
@@ -859,8 +950,8 @@ mod tests {
     };
 
     use super::{
-        ActiveConnections, ConnectionHandler, IpcOutbox, LocalIpcServer, MAX_CONNECTIONS,
-        SocketDeliverySink, SubmissionRegistry,
+        ActiveConnections, ConnectionHandler, DecodeRegistry, IpcOutbox, LocalIpcServer,
+        MAX_CONNECTIONS, SocketDeliverySink, SubmissionRegistry,
     };
 
     struct SameUid;
@@ -980,7 +1071,7 @@ mod tests {
         ) -> Result<LocalSubmitOutcome> {
             use crate::runtime::outbox_worker::DeliveryRegistry;
             assert!(self.submissions.is_inflight(&command.request_id));
-            assert_eq!(self.hub.snapshot(&command.request_id).len(), 1);
+            assert!(!self.hub.snapshot(&command.request_id).is_empty());
             self.started.notify_waiters();
             self.release.notified().await;
             if !self.commit {
@@ -1175,6 +1266,7 @@ mod tests {
             credentials: Arc::new(SameUid),
             submissions,
             active: Default::default(),
+            decodes: Default::default(),
         }
     }
 
@@ -1203,6 +1295,7 @@ mod tests {
                 credentials: Arc::new(SameUid),
                 submissions,
                 active: Default::default(),
+                decodes: Default::default(),
             },
             ingress,
             outbox,
@@ -1242,6 +1335,7 @@ mod tests {
             credentials: Arc::new(SameUid),
             submissions,
             active: Default::default(),
+            decodes: Default::default(),
         }
     }
 
@@ -1270,6 +1364,7 @@ mod tests {
                 credentials: Arc::new(SameUid),
                 submissions,
                 active: Default::default(),
+                decodes: Default::default(),
             },
             ingress,
             outbox,
@@ -1307,6 +1402,106 @@ mod tests {
         let request = RequestId::new();
         let _first = registry.register(request.clone())?;
         assert!(registry.register(request).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn earlier_decode_error_releases_later_request_barrier() {
+        let decodes = DecodeRegistry::default();
+        let earlier = decodes.register();
+        let later = decodes.register();
+        let later_ticket = later.ticket;
+        drop(later);
+        let waiting = {
+            let decodes = decodes.clone();
+            tokio::spawn(async move { decodes.wait_for_prior(later_ticket).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(earlier);
+        waiting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_cannot_report_missing_before_earlier_connection_registers_submit() -> Result<()>
+    {
+        let request = RequestId::new();
+        let submissions = SubmissionRegistry::default();
+        let decodes = DecodeRegistry::default();
+        let submit_decode = decodes.register();
+        let resume_decode = decodes.register();
+        let hub = Arc::new(StreamHub::default());
+        let ingress = Arc::new(RaceIngress {
+            hub: hub.clone(),
+            submissions: submissions.clone(),
+            commit: true,
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            record: Mutex::new(None),
+            resolve_calls: AtomicUsize::new(0),
+        });
+        let (submit_server, mut submit_client) = UnixStream::pair()?;
+        let (resume_server, mut resume_client) = UnixStream::pair()?;
+        let mut submit_handler = race_handler(ingress.clone(), hub.clone(), submissions.clone());
+        submit_handler.decodes = decodes.clone();
+        let mut resume_handler = race_handler(ingress.clone(), hub, submissions);
+        resume_handler.decodes = decodes;
+        let submit_task = tokio::spawn(async move {
+            submit_handler
+                .handle_with_decode(submit_server, Some(submit_decode))
+                .await
+        });
+        let resume_task = tokio::spawn(async move {
+            resume_handler
+                .handle_with_decode(resume_server, Some(resume_decode))
+                .await
+        });
+
+        FrameWriter::new(&mut resume_client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::Resume {
+                request_id: request.clone(),
+            }))
+            .await?;
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                FrameReader::new(&mut resume_client).read_server_event(),
+            )
+            .await
+            .is_err(),
+            "resume reported missing before the earlier connection decoded"
+        );
+
+        let started = ingress.started.notified();
+        FrameWriter::new(&mut submit_client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::Submit {
+                request_id: request.clone(),
+                text: "hello".to_owned(),
+            }))
+            .await?;
+        started.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(ingress.resolve_calls.load(Ordering::SeqCst), 1);
+        ingress.release.notify_one();
+
+        let submit_event = FrameReader::new(&mut submit_client)
+            .read_server_event()
+            .await?;
+        let resume_event = FrameReader::new(&mut resume_client)
+            .read_server_event()
+            .await?;
+        assert!(matches!(
+            submit_event.body,
+            ServerEventBody::Accepted { .. }
+        ));
+        assert!(matches!(
+            resume_event.body,
+            ServerEventBody::Accepted { .. }
+        ));
+        drop(submit_client);
+        drop(resume_client);
+        submit_task.await??;
+        resume_task.await??;
         Ok(())
     }
 
