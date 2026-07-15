@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod ipc;
 pub mod model;
 pub mod runner;
 pub mod service;
