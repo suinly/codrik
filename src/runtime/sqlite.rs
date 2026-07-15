@@ -14,6 +14,7 @@ mod failures;
 mod ingress;
 mod local_ingress;
 mod outbox;
+pub mod recovery;
 mod retry;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");

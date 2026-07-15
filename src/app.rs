@@ -1,167 +1,218 @@
 use crate::{
-    agent::{Agent, message::UserInput},
-    auth::AuthorizedActor,
-    config::{AppConfig, codrik_dir},
-    llm::{
-        client::{AgentActivitySink, LlmStreamSink, RunContext},
-        openai::{OpenAiAttachmentContext, OpenAiClient},
-    },
-    memory::{
-        file::FileMemoryStore, in_memory::InMemoryStore, provider_files::ProviderFileStore,
-        store::MemoryStore,
+    auth::{AuthorizationStore, AuthorizedActor},
+    config::{AppConfig, RuntimePaths, codrik_dir},
+    llm::openai::OpenAiClient,
+    runtime::{
+        artifacts::ArtifactManager,
+        dispatcher::ActorDispatcher,
+        instance_lock::InstanceLock,
+        ipc::{
+            security::{create_secure_directory, validate_secure_directory},
+            server::LocalIpcServer,
+        },
+        model::{ActorId, Clock, SystemClock},
+        observability::{
+            RuntimeComponent, RuntimeLogEvent, RuntimeLogger, RuntimeRecoveryCounts,
+            RuntimeTransition, StderrRuntimeLogger,
+        },
+        outbox_worker::OutboxWorker,
+        runner::{ActorRunner, RunnerLimits},
+        signals::ActorSignals,
+        sqlite::SqliteRuntimeStore,
+        store::{LocalIngressStore, RuntimeAuthorizationStore},
+        stream_hub::StreamHub,
+        supervisor::{ServeRuntime, Supervisor},
     },
     skills::{Skill, SkillRegistry, SkillRoot, builtin_skill_root},
     tools::{FileRoot, ToolRegistry, ToolRegistryConfig},
 };
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 
 const MAX_SKILL_INDEX_CHARS: usize = 8_000;
 
-pub type AppAgent = Agent<OpenAiClient, InMemoryStore, ToolRegistry>;
-pub use session_deletion::{SessionDeletionOutcome, delete_inactive_session};
-
-pub struct AgentRunSinks<'a> {
-    pub output: &'a mut dyn LlmStreamSink,
-    pub activity: &'a mut dyn AgentActivitySink,
+pub async fn serve(config: AppConfig) -> Result<()> {
+    serve_with_logger(config, Arc::new(StderrRuntimeLogger::default())).await
 }
 
-pub fn build_agent(config: AppConfig) -> AppAgent {
-    build_agent_with_memory(config, InMemoryStore::new())
-}
+async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) -> Result<()> {
+    let home = codrik_dir()?;
+    let runtime = config.required_runtime()?.clone();
+    let paths = runtime.resolve_paths(&home)?;
+    prepare_paths(&home, &paths)?;
+    let lock = InstanceLock::acquire(&paths.lock, &paths.socket)?;
+    let store = SqliteRuntimeStore::open(&paths.database).await?;
+    let snapshot = AuthorizationStore::new(home.join("users.json"))
+        .snapshot()
+        .await?;
+    store
+        .import_legacy_authorization(snapshot, SystemClock.now())
+        .await?;
+    let actor_id = ActorId::from_string(runtime.actor_id);
+    let actor = store.load_actor(&actor_id).await?.with_context(|| {
+        format!("configured runtime actor {actor_id} does not exist; authorize an actor and set runtime.actor_id")
+    })?;
+    if !actor.enabled {
+        bail!("configured runtime actor {actor_id} is disabled");
+    }
+    validate_runtime_paths(&home, &paths)?;
+    lock.remove_stale_socket()?;
 
-fn build_agent_with_memory<M>(config: AppConfig, memory: M) -> Agent<OpenAiClient, M, ToolRegistry>
-where
-    M: MemoryStore,
-{
+    let clock = SystemClock;
+    let signals = ActorSignals::default();
+    let hub = Arc::new(StreamHub::default());
+    let outbox_owner = format!("outbox-{}", std::process::id());
+    let dispatcher_owner = format!("dispatcher-{}", std::process::id());
+    let outbox = Arc::new(OutboxWorker::new(
+        Arc::new(store.clone()),
+        hub.clone(),
+        clock.clone(),
+        outbox_owner.clone(),
+    ));
+    let server = LocalIpcServer::bind(
+        &paths.socket,
+        actor_id.clone(),
+        Arc::new(store.clone()),
+        outbox.clone(),
+        hub.clone(),
+    )?;
+    let recovery = store.recover_startup(clock.now()).await?;
+    let tools = ToolRegistry::with_allowed_tools_and_config(
+        actor.tools.clone(),
+        actor_tool_config(&AuthorizedActor {
+            id: actor.id.to_string(),
+            tools: actor.tools,
+        })?,
+    );
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
-    let tool_config = default_tool_config().expect("failed to build default tool config");
-    let instructions = agent_instructions_for_tool_config(&tool_config);
-    let tools = ToolRegistry::with_config(tool_config);
+    let artifacts = ArtifactManager::new(paths.artifacts.clone(), store.clone(), clock.clone());
+    let runner = ActorRunner::new(
+        llm,
+        tools,
+        signals.clone(),
+        hub.clone(),
+        RunnerLimits::default(),
+        artifacts,
+    );
+    let dispatcher = ActorDispatcher::new(
+        actor_id.clone(),
+        dispatcher_owner.clone(),
+        signals,
+        runner,
+        clock,
+    );
 
-    Agent::new(llm, memory, tools).set_instructions(instructions)
+    let mut startup =
+        RuntimeLogEvent::transition(RuntimeComponent::Startup, RuntimeTransition::Recovered);
+    startup.actor_id = Some(actor_id);
+    startup.database_path = Some(paths.database.clone());
+    startup.socket_path = Some(paths.socket.clone());
+    startup.schema_version = Some(2);
+    startup.recovery = Some(RuntimeRecoveryCounts {
+        expired_actor_leases: recovery.expired_actor_leases,
+        expired_bundle_claims: recovery.expired_bundle_claims,
+        orphaned_running_attempts: recovery.orphaned_running_attempts,
+    });
+    logger.log(&startup)?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut service = ServeRuntime::new(Supervisor::default());
+    service.component("ipc", server.run(shutdown_rx.clone()));
+    service.component("outbox", {
+        let outbox = outbox.clone();
+        let shutdown = shutdown_rx.clone();
+        async move { outbox.run(shutdown).await }
+    });
+    service.component("dispatcher", async move {
+        dispatcher.run_with_shutdown(shutdown_rx).await
+    });
+    let ready_logger = logger.clone();
+    let shutdown_logger = logger.clone();
+    let result = service
+        .run_until_started(
+            async move {
+                shutdown_signal().await;
+                let _ = shutdown_logger.log(&RuntimeLogEvent::transition(
+                    RuntimeComponent::Supervisor,
+                    RuntimeTransition::ShuttingDown,
+                ));
+                shutdown_tx.send_replace(true);
+            },
+            move || {
+                ready_logger.log(&RuntimeLogEvent::transition(
+                    RuntimeComponent::Startup,
+                    RuntimeTransition::Ready,
+                ))
+            },
+        )
+        .await;
+    if result.is_err() {
+        let mut event = RuntimeLogEvent::transition(
+            RuntimeComponent::Supervisor,
+            RuntimeTransition::FailedTerminal,
+        );
+        event.error_class = Some(crate::runtime::observability::RuntimeErrorClass::ComponentExit);
+        let _ = logger.log(&event);
+    }
+    let recovery = store
+        .recover_shutdown(&dispatcher_owner, &outbox_owner, SystemClock.now())
+        .await;
+    let cleanup = lock.remove_stale_socket();
+    result.and(recovery).and(cleanup)
 }
 
-fn build_agent_with_file_memory(
-    config: AppConfig,
-    memory: FileMemoryStore,
-) -> Agent<OpenAiClient, FileMemoryStore, ToolRegistry> {
-    let llm = openai_client_with_attachments(&config, &memory);
-    let mut tool_config = default_tool_config().expect("failed to build default tool config");
-    tool_config
-        .file_roots
-        .push(FileRoot::new("session", memory.session_dir()));
-    let instructions = agent_instructions_for_tool_config(&tool_config);
-    let tools = ToolRegistry::with_config(tool_config);
-
-    Agent::new(llm, memory, tools).set_instructions(instructions)
+fn prepare_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {
+    create_secure_directory(home)?;
+    for parent in required_parents(paths)? {
+        validate_secure_directory(parent)?;
+    }
+    create_secure_directory(&paths.artifacts)?;
+    Ok(())
 }
 
-pub async fn run_once(query: String) -> Result<String> {
-    let config = AppConfig::load_default()?;
-
-    run_once_with_config(query, config).await
+fn validate_runtime_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {
+    validate_secure_directory(home)?;
+    for parent in required_parents(paths)? {
+        validate_secure_directory(parent)?;
+    }
+    validate_secure_directory(&paths.artifacts)
 }
 
-pub async fn run_once_with_config(query: String, config: AppConfig) -> Result<String> {
-    let agent = build_agent(config);
-
-    agent.execute(query).await
-}
-
-pub async fn run_once_streaming(
-    query: String,
-    config: AppConfig,
-    sink: &mut dyn LlmStreamSink,
-) -> Result<String> {
-    let agent = build_agent(config);
-
-    agent.execute_streaming(query, sink).await
-}
-
-pub async fn run_once_with_session(
-    query: String,
-    config: AppConfig,
-    session_id: impl AsRef<str>,
-) -> Result<String> {
-    let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
-    let agent = build_agent_with_file_memory(config, memory);
-
-    agent.execute(query).await
-}
-
-pub async fn run_once_with_session_streaming(
-    query: String,
-    config: AppConfig,
-    session_id: impl AsRef<str>,
-    sink: &mut dyn LlmStreamSink,
-) -> Result<String> {
-    let memory = FileMemoryStore::new(codrik_dir()?.join("sessions"), session_id)?;
-    let agent = build_agent_with_file_memory(config, memory);
-
-    agent.execute_streaming(query, sink).await
-}
-
-pub async fn run_once_with_actor_session_in_root_and_context(
-    query: impl Into<UserInput>,
-    config: AppConfig,
-    actor: AuthorizedActor,
-    session_root: PathBuf,
-    session_id: impl AsRef<str>,
-    context: &RunContext,
-) -> Result<String> {
-    let memory = FileMemoryStore::new(session_root, session_id)?;
-    let agent = build_agent_for_actor(config, memory, actor)?;
-
-    agent.execute_with_context(query, context).await
-}
-
-pub async fn run_once_with_actor_session_streaming_and_activity_in_root_and_context(
-    query: impl Into<UserInput>,
-    config: AppConfig,
-    actor: AuthorizedActor,
-    session_root: PathBuf,
-    session_id: impl AsRef<str>,
-    sinks: AgentRunSinks<'_>,
-    context: &RunContext,
-) -> Result<String> {
-    let memory = FileMemoryStore::new(session_root, session_id)?;
-    let agent = build_agent_for_actor(config, memory, actor)?;
-
-    agent
-        .execute_streaming_with_context_and_activity(query, sinks.output, sinks.activity, context)
-        .await
-}
-
-fn build_agent_for_actor(
-    config: AppConfig,
-    memory: FileMemoryStore,
-    actor: AuthorizedActor,
-) -> Result<Agent<OpenAiClient, FileMemoryStore, ToolRegistry>> {
-    let llm = openai_client_with_attachments(&config, &memory);
-    let mut tool_config = actor_tool_config(&actor)?;
-    tool_config
-        .file_roots
-        .push(FileRoot::new("session", memory.session_dir()));
-    let instructions = agent_instructions_for_tool_config(&tool_config);
-    let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
-
-    Ok(Agent::new(llm, memory, tools).set_instructions(instructions))
-}
-
-fn openai_client_with_attachments(config: &AppConfig, memory: &FileMemoryStore) -> OpenAiClient {
-    OpenAiClient::new(
-        config.model.clone(),
-        config.api_key.clone(),
-        config.base_url.clone(),
-    )
-    .with_attachment_context(OpenAiAttachmentContext {
-        session_dir: memory.session_dir().to_path_buf(),
-        provider_files: ProviderFileStore::new(memory.session_dir()),
-        image_detail: config.attachments.image_detail,
+fn required_parents(paths: &RuntimePaths) -> Result<Vec<&Path>> {
+    [
+        &paths.database,
+        &paths.lock,
+        &paths.socket,
+        &paths.artifacts,
+    ]
+    .into_iter()
+    .map(|path| {
+        path.parent()
+            .with_context(|| format!("runtime path has no parent: {}", path.display()))
     })
+    .collect()
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn default_tool_config() -> Result<ToolRegistryConfig> {
@@ -421,4 +472,3 @@ mod tests {
         Ok(path)
     }
 }
-mod session_deletion;

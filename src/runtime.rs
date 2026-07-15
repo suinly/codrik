@@ -3,6 +3,7 @@ pub mod dispatcher;
 pub mod instance_lock;
 pub mod ipc;
 pub mod model;
+pub mod observability;
 pub mod outbox_worker;
 pub mod runner;
 pub mod service;
@@ -10,6 +11,7 @@ pub mod signals;
 pub mod sqlite;
 pub mod store;
 pub mod stream_hub;
+pub mod supervisor;
 
 pub use model::{
     ArtifactId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState, MAX_BUNDLE_BYTES,

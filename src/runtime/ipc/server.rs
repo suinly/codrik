@@ -248,8 +248,7 @@ impl LocalIpcServer {
 }
 
 async fn shutdown_handlers(active: &ActiveConnections, handlers: &mut tokio::task::JoinSet<()>) {
-    active.shutdown_all().await;
-    handlers.abort_all();
+    active.begin_shutdown().await;
     while handlers.join_next().await.is_some() {}
 }
 
@@ -271,6 +270,11 @@ impl ConnectionHandler {
         let (mut read, write) = tokio::io::split(stream);
         let sink = Arc::new(SocketDeliverySink::new(write));
         let _active = self.active.register(&sink);
+        if self.active.is_shutting_down() {
+            self.active.notify_sink(&sink).await;
+            sink.abort("server shutting down").await;
+            return Ok(());
+        }
         let request = {
             let mut reader = FrameReader::new(&mut read);
             match reader.read_client_request().await {
@@ -283,6 +287,11 @@ impl ConnectionHandler {
             }
         };
         sink.set_request(request_id(&request.body));
+        if self.active.is_shutting_down() {
+            self.active.notify_sink(&sink).await;
+            sink.abort("server shutting down").await;
+            return Ok(());
+        }
         match request.body {
             ClientRequestBody::Submit { request_id, text } => {
                 self.submit(request_id, text, sink, read).await
@@ -741,6 +750,7 @@ struct ActiveConnections {
 struct ActiveConnectionsInner {
     next_id: AtomicU64,
     sinks: Mutex<HashMap<u64, Weak<SocketDeliverySink>>>,
+    shutting_down: AtomicBool,
 }
 
 struct ActiveConnectionGuard {
@@ -762,7 +772,25 @@ impl ActiveConnections {
         }
     }
 
-    async fn shutdown_all(&self) {
+    fn is_shutting_down(&self) -> bool {
+        self.inner.shutting_down.load(Ordering::SeqCst)
+    }
+
+    async fn notify_sink(&self, sink: &SocketDeliverySink) {
+        let request_id = sink.request();
+        let resume_command = request_id
+            .as_ref()
+            .map(|request| format!("codrik resume {}", request.as_str()));
+        let _ = sink
+            .send_control(ServerEvent::new(ServerEventBody::ServerShuttingDown {
+                request_id,
+                resume_command,
+            }))
+            .await;
+    }
+
+    async fn begin_shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
         let sinks = self
             .inner
             .sinks
@@ -771,18 +799,10 @@ impl ActiveConnections {
             .values()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
-        futures_util::future::join_all(sinks.into_iter().map(|sink| async move {
-            let request_id = sink.request();
-            let resume_command = request_id
-                .as_ref()
-                .map(|request| format!("codrik resume {}", request.as_str()));
-            let _ = sink
-                .send_control(ServerEvent::new(ServerEventBody::ServerShuttingDown {
-                    request_id,
-                    resume_command,
-                }))
-                .await;
-            sink.abort("server shutting down").await;
+        let connections = self.clone();
+        futures_util::future::join_all(sinks.into_iter().map(move |sink| {
+            let connections = connections.clone();
+            async move { connections.notify_sink(&sink).await }
         }))
         .await;
     }
@@ -1488,8 +1508,8 @@ mod tests {
         .await?;
         assert_eq!(authenticated.load(Ordering::SeqCst), MAX_CONNECTIONS + 1);
         shutdown_tx.send(true)?;
-        task.await??;
         drop(clients);
+        task.await??;
         tokio::task::yield_now().await;
         std::fs::remove_file(socket)?;
         std::fs::remove_dir(root)?;
@@ -1577,7 +1597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_notice_includes_resume_command_then_closes() -> Result<()> {
+    async fn shutdown_notice_includes_resume_command() -> Result<()> {
         let request = RequestId::new();
         let active = ActiveConnections::default();
         let (server, client) = UnixStream::pair()?;
@@ -1585,7 +1605,7 @@ mod tests {
         let sink = Arc::new(SocketDeliverySink::new(write));
         sink.set_request(request.clone());
         let _guard = active.register(&sink);
-        active.shutdown_all().await;
+        active.begin_shutdown().await;
         let event = FrameReader::new(client).read_server_event().await?;
         assert_eq!(
             event.body,
@@ -1594,6 +1614,70 @@ mod tests {
                 resume_command: Some(format!("codrik resume {}", request.as_str())),
             }
         );
+        Ok(())
+    }
+
+    struct PausedAckOutbox {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        acked: AtomicBool,
+    }
+
+    #[async_trait]
+    impl IpcOutbox for PausedAckOutbox {
+        async fn acknowledge(&self, _ack: BundleAck) -> Result<AckOutcome> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.acked.store(true, Ordering::SeqCst);
+            Ok(AckOutcome::Delivered)
+        }
+
+        async fn replay(
+            &self,
+            _request: &RequestId,
+            _sink: Arc<dyn BundleDeliverySink>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_already_started_commits_during_shutdown_drain() -> Result<()> {
+        let outbox = Arc::new(PausedAckOutbox {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            acked: AtomicBool::new(false),
+        });
+        let mut handler = test_handler();
+        handler.outbox = outbox.clone();
+        let active = handler.active.clone();
+        let request = RequestId::new();
+        let bundle = BundleId::new();
+        let delivery = DeliveryId::new();
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::AckFinal {
+                request_id: request.clone(),
+                bundle_id: bundle.clone(),
+                delivery_ids: vec![delivery],
+            }))
+            .await?;
+        outbox.entered.notified().await;
+        active.begin_shutdown().await;
+        outbox.release.notify_one();
+
+        let mut reader = FrameReader::new(&mut client);
+        assert!(matches!(
+            reader.read_server_event().await?.body,
+            ServerEventBody::ServerShuttingDown { .. }
+        ));
+        assert!(matches!(
+            reader.read_server_event().await?.body,
+            ServerEventBody::AckAccepted { .. }
+        ));
+        task.await??;
+        assert!(outbox.acked.load(Ordering::SeqCst));
         Ok(())
     }
 

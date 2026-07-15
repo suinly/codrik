@@ -19,7 +19,7 @@ use crate::{
 pub async fn run() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
         CliCommand::Update => updater::update().await,
-        CliCommand::Serve => bail!("serve runtime composition is not available yet"),
+        CliCommand::Serve => crate::app::serve(AppConfig::load_default()?).await,
         CliCommand::Submit(prompt) => submit(prompt).await,
         CliCommand::Resume(request) => resume(request).await,
         CliCommand::Cancel(request) => cancel(request).await,

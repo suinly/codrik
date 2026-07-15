@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::watch;
 
 use crate::runtime::{
     model::{ActorId, Clock},
@@ -38,13 +39,25 @@ where
     }
 
     pub async fn run(&self) -> Result<()> {
+        self.run_with_shutdown(watch::channel(false).1).await
+    }
+
+    pub async fn run_with_shutdown(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut signal = self.signals.subscribe(&self.actor_id).await;
         let mut poll = tokio::time::interval(Duration::from_millis(500));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         poll.tick().await;
         loop {
-            self.dispatch_ready().await?;
+            self.dispatch_ready_until_shutdown(&shutdown).await?;
+            if *shutdown.borrow() {
+                return Ok(());
+            }
             tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
                 changed = signal.changed() => {
                     changed.map_err(|_| anyhow::anyhow!("actor signal channel closed"))?;
                 }
@@ -54,7 +67,15 @@ where
     }
 
     pub async fn dispatch_ready(&self) -> Result<()> {
+        self.dispatch_ready_until_shutdown(&watch::channel(false).1)
+            .await
+    }
+
+    async fn dispatch_ready_until_shutdown(&self, shutdown: &watch::Receiver<bool>) -> Result<()> {
         loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
             match self.runner.run_quantum(&self.actor_id, &self.owner).await {
                 Ok(report) => {
                     if matches!(report.outcome, crate::runtime::runner::RunOnceOutcome::Idle) {
