@@ -165,6 +165,8 @@ pub enum ImportOutcome {
 
 #[async_trait]
 pub trait RuntimeAuthorizationStore: Send + Sync {
+    async fn legacy_authorization_imported(&self) -> Result<bool>;
+
     async fn import_legacy_authorization(
         &self,
         snapshot: LegacyAuthorizationSnapshot,

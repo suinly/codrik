@@ -15,6 +15,10 @@ use crate::{
     runtime::{
         artifacts::ArtifactManager,
         model::{AttemptId, Clock, EventKind, OutboxId},
+        observability::{
+            NoopRuntimeLogger, RuntimeComponent, RuntimeErrorClass, RuntimeLogEvent, RuntimeLogger,
+            RuntimeTransition,
+        },
         signals::ActorSignals,
         store::{
             AttemptOutcome, AttemptRecovery, CheckpointRun, FailureFence, FinalizeOutcome,
@@ -68,6 +72,8 @@ pub struct ActorRunner<L, T, S, C> {
     events: Arc<dyn RuntimeEventPublisher>,
     limits: RunnerLimits,
     artifacts: ArtifactManager<S, C>,
+    system_instructions: Option<String>,
+    logger: Arc<dyn RuntimeLogger>,
 }
 
 impl<L, T, S, C> ActorRunner<L, T, S, C>
@@ -96,7 +102,22 @@ where
             events,
             limits,
             artifacts,
+            system_instructions: None,
+            logger: Arc::new(NoopRuntimeLogger),
         }
+    }
+
+    pub fn with_system_instructions(mut self, instructions: impl Into<String>) -> Self {
+        let instructions = instructions.into();
+        if !instructions.is_empty() {
+            self.system_instructions = Some(instructions);
+        }
+        self
+    }
+
+    pub fn with_logger(mut self, logger: Arc<dyn RuntimeLogger>) -> Self {
+        self.logger = logger;
+        self
     }
 
     pub async fn run_once(&self, owner: &str) -> Result<RunOnceOutcome> {
@@ -283,8 +304,12 @@ where
                     EventKind::ExternalCompletion => unreachable!(),
                 };
             }
+            let mut request_messages = messages.clone();
+            if let Some(instructions) = &self.system_instructions {
+                request_messages.insert(0, Message::system(instructions.clone()));
+            }
             let request = LlmRequest {
-                messages: messages.clone(),
+                messages: request_messages,
                 tools: self.tools.definitions(),
             };
             self.events
@@ -597,17 +622,31 @@ where
                         progress,
                     })
             }
-            Err(error) if fence.is_some() && !authority_error(&error) => self
-                .store
-                .record_failure(
-                    fence.as_ref().expect("checked above"),
-                    &error.to_string(),
-                    progress,
-                    &self.clock,
-                )
-                .await
-                .map_err(QuantumFailure::AuthorityUnavailable)
-                .and_then(|disposition| Err(QuantumFailure::RecoverableWork { disposition })),
+            Err(error) if fence.is_some() && !authority_error(&error) => {
+                let fence = fence.as_ref().expect("checked above");
+                match self
+                    .store
+                    .record_failure(fence, &error.to_string(), progress, &self.clock)
+                    .await
+                {
+                    Ok(disposition) => {
+                        if disposition == crate::runtime::store::FailureDisposition::Terminalized {
+                            let mut event = RuntimeLogEvent::transition(
+                                RuntimeComponent::Dispatcher,
+                                RuntimeTransition::FailedTerminal,
+                            );
+                            event.actor_id = Some(fence.lease.actor_id.clone());
+                            event.work_item_id = Some(fence.work_item_id.clone());
+                            event.run_id = Some(fence.run_id.clone());
+                            event.lease_generation = Some(fence.lease.generation);
+                            event.error_class = Some(RuntimeErrorClass::WorkFailure);
+                            let _ = self.logger.log(&event);
+                        }
+                        Err(QuantumFailure::RecoverableWork { disposition })
+                    }
+                    Err(error) => Err(QuantumFailure::AuthorityUnavailable(error)),
+                }
+            }
             Err(error) => Err(QuantumFailure::AuthorityUnavailable(error)),
         };
         let release = self
@@ -690,9 +729,12 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     use crate::{
-        agent::tool::{
-            FileArtifact, Tool, ToolArtifact, ToolCallContext, ToolCapabilities, ToolExecution,
-            ToolExecutor,
+        agent::{
+            message::Role,
+            tool::{
+                FileArtifact, Tool, ToolArtifact, ToolCallContext, ToolCapabilities, ToolExecution,
+                ToolExecutor,
+            },
         },
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::{
@@ -704,6 +746,7 @@ mod tests {
             dispatcher::ActorDispatcher,
             ipc::protocol::{ActivityEvent, ServerEventBody},
             model::{ActorId, AttemptId, Audience, EventKind, ManualClock, RequestId, Timestamp},
+            observability::{RuntimeLogEvent, RuntimeLogger},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
@@ -785,6 +828,25 @@ mod tests {
         responses: Arc<Mutex<VecDeque<LlmResponse>>>,
     }
 
+    #[derive(Clone)]
+    struct CapturingScriptedLlm {
+        responses: Arc<Mutex<VecDeque<LlmResponse>>>,
+        requests: Arc<Mutex<Vec<LlmRequest>>>,
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for CapturingScriptedLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.requests.lock().await.push(request);
+            Ok(self.responses.lock().await.pop_front().unwrap())
+        }
+    }
+
     #[async_trait]
     impl LlmClient for ScriptedLlm {
         async fn generate(
@@ -828,6 +890,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct ToolThenErrorLlm {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct RecordingRuntimeLogger(std::sync::Mutex<Vec<String>>);
+
+    impl RuntimeLogger for RecordingRuntimeLogger {
+        fn log(&self, event: &RuntimeLogEvent) -> Result<()> {
+            self.0.lock().unwrap().push(serde_json::to_string(event)?);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1271,6 +1343,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_instructions_are_injected_once_per_model_request_and_never_checkpointed()
+    -> Result<()> {
+        let store = store_with_text().await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            CapturingScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([
+                    LlmResponse {
+                        content: "checking".into(),
+                        tool_calls: vec![LlmToolCall {
+                            id: "call-1".into(),
+                            name: "datetime".into(),
+                            arguments: "{}".into(),
+                        }],
+                    },
+                    LlmResponse {
+                        content: "done".into(),
+                        tool_calls: Vec::new(),
+                    },
+                ]))),
+                requests: requests.clone(),
+            },
+            RecordingTools::default(),
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        )
+        .with_system_instructions("system plus skills");
+
+        assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(
+                request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == Role::System)
+                    .count(),
+                1
+            );
+            assert_eq!(request.messages[0].text(), "system plus skills");
+            assert_eq!(request.tools.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stream_overflow_never_fails_authoritative_finalization() {
         let (store, request) = store_with_local_text().await;
         let hub = StreamHub::with_limits(3, 16, 64);
@@ -1638,6 +1759,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fifth_failure_emits_typed_redacted_terminal_log_after_commit() -> Result<()> {
+        let store = store_with_text().await;
+        let work = seed_four_failures(&store).await;
+        let logger = Arc::new(RecordingRuntimeLogger::default());
+        let runner = ActorRunner::new(
+            ToolThenErrorLlm {
+                calls: Arc::new(AtomicUsize::new(1)),
+            },
+            RecordingTools::default(),
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(9_000)),
+        )
+        .with_logger(logger.clone());
+
+        assert!(matches!(
+            runner
+                .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+                .await,
+            Err(crate::runtime::store::QuantumFailure::RecoverableWork {
+                disposition: crate::runtime::store::FailureDisposition::Terminalized
+            })
+        ));
+        assert_eq!(
+            store.failure_probe_for_test(&work).await?.1,
+            "failed_terminal"
+        );
+        let lines = logger.0.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains(work.as_str()));
+        assert!(lines[0].contains("work_failure"));
+        assert!(!lines[0].contains("later model failure"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn known_tool_outcome_then_model_error_records_first_new_failure() {
         let store = store_with_text().await;
         let work = seed_four_failures(&store).await;
@@ -1990,6 +2148,37 @@ mod tests {
             recovery.run_once("worker-2").await.unwrap(),
             RunOnceOutcome::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_model_cancellation_does_not_increment_failure_and_releases_safe_lease()
+    -> Result<()> {
+        let store = store_with_text().await;
+        let started = Arc::new(Notify::new());
+        let runner = ActorRunner::new(
+            BlockingLlm {
+                started: started.clone(),
+            },
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+        let task = tokio::spawn(async move {
+            runner
+                .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+                .await
+        });
+        started.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        store
+            .recover_shutdown("worker", "outbox", Timestamp(1_001))
+            .await?;
+        assert_eq!(store.sole_work_failure_count_for_test().await?, 0);
+        assert!(store.current_lease().await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]

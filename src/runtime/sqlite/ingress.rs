@@ -18,6 +18,22 @@ use crate::{
 
 #[async_trait]
 impl RuntimeAuthorizationStore for SqliteRuntimeStore {
+    async fn legacy_authorization_imported(&self) -> Result<bool> {
+        self.connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<bool> {
+                Ok(connection
+                    .query_row(
+                        "SELECT 1 FROM runtime_metadata WHERE key = 'legacy_auth_imported'",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some())
+            })
+            .await
+            .map_err(|error| anyhow!("failed to inspect legacy authorization marker: {error}"))
+    }
+
     async fn import_legacy_authorization(
         &self,
         snapshot: LegacyAuthorizationSnapshot,
@@ -343,6 +359,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(actor.tools, vec!["*", "bash"]);
+        assert!(store.legacy_authorization_imported().await.unwrap());
     }
 
     #[tokio::test]

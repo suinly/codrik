@@ -39,6 +39,7 @@ pub enum RuntimeErrorClass {
     Protocol,
     MalformedDurableState,
     UnknownExternalOutcome,
+    WorkFailure,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -119,6 +120,15 @@ pub trait RuntimeLogger: Send + Sync {
     fn log(&self, event: &RuntimeLogEvent) -> Result<()>;
 }
 
+#[derive(Default)]
+pub struct NoopRuntimeLogger;
+
+impl RuntimeLogger for NoopRuntimeLogger {
+    fn log(&self, _event: &RuntimeLogEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub struct StderrRuntimeLogger {
     writer: Mutex<Box<dyn Write + Send>>,
 }
@@ -127,6 +137,15 @@ impl Default for StderrRuntimeLogger {
     fn default() -> Self {
         Self {
             writer: Mutex::new(Box::new(std::io::stderr())),
+        }
+    }
+}
+
+impl StderrRuntimeLogger {
+    #[cfg(test)]
+    fn with_writer(writer: Box<dyn Write + Send>) -> Self {
+        Self {
+            writer: Mutex::new(writer),
         }
     }
 }
@@ -143,10 +162,32 @@ impl RuntimeLogger for StderrRuntimeLogger {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
     use crate::runtime::{
         RequestId,
-        observability::{RuntimeComponent, RuntimeLogEvent, RuntimeTransition},
+        model::{ActorId, AttemptId, DeliveryId, OutboxId, RunId, WorkItemId},
+        observability::{
+            RuntimeComponent, RuntimeErrorClass, RuntimeLogEvent, RuntimeLogger,
+            RuntimeRecoveryCounts, RuntimeTransition, StderrRuntimeLogger,
+        },
     };
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn structured_event_contains_ids_without_payload_fields() {
@@ -160,6 +201,52 @@ mod tests {
         assert!(json.contains(request.as_str()));
         for forbidden in ["prompt", "model_text", "tool_payload", "outbox_payload"] {
             assert!(!json.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn stderr_logger_writes_one_redacted_json_line_with_all_typed_coordinates() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let logger = StderrRuntimeLogger::with_writer(Box::new(SharedWriter(bytes.clone())));
+        let mut event = RuntimeLogEvent::transition(
+            RuntimeComponent::Recovery,
+            RuntimeTransition::OutcomeUnknown,
+        );
+        event.actor_id = Some(ActorId::from_string("actor-id"));
+        event.work_item_id = Some(WorkItemId::from_string("work-id"));
+        event.run_id = Some(RunId::from_string("run-id"));
+        event.request_id = Some(RequestId::new());
+        event.attempt_id = Some(AttemptId::from_string("attempt-id"));
+        event.outbox_id = Some(OutboxId::from_string("outbox-id"));
+        event.delivery_id = Some(DeliveryId::new());
+        event.lease_generation = Some(7);
+        event.error_class = Some(RuntimeErrorClass::UnknownExternalOutcome);
+        event.recovery = Some(RuntimeRecoveryCounts {
+            expired_actor_leases: 1,
+            expired_bundle_claims: 2,
+            orphaned_running_attempts: 3,
+        });
+        logger.log(&event).unwrap();
+
+        let line = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        for value in ["actor-id", "work-id", "run-id", "attempt-id", "outbox-id"] {
+            assert!(line.contains(value));
+        }
+        assert_eq!(json["error_class"], "unknown_external_outcome");
+        assert_eq!(json["recovery"]["orphaned_running_attempts"], 3);
+        for forbidden in [
+            "secret prompt",
+            "secret model",
+            "secret tool",
+            "secret outbox",
+            "prompt",
+            "model_text",
+            "tool_payload",
+            "outbox_payload",
+        ] {
+            assert!(!line.contains(forbidden));
         }
     }
 }

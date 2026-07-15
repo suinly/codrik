@@ -37,22 +37,61 @@ use anyhow::{Context, Result, bail};
 const MAX_SKILL_INDEX_CHARS: usize = 8_000;
 
 pub async fn serve(config: AppConfig) -> Result<()> {
-    serve_with_logger(config, Arc::new(StderrRuntimeLogger::default())).await
+    let home = codrik_dir()?;
+    serve_at_until(
+        config,
+        Arc::new(StderrRuntimeLogger::default()),
+        &NoopStartupTrace,
+        home,
+        shutdown_signal(),
+    )
+    .await
 }
 
-async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) -> Result<()> {
-    let home = codrik_dir()?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupPhase {
+    PathsValidated,
+    LockAcquired,
+    Migrated,
+    AuthImported,
+    ActorVerified,
+    ParentsValidated,
+    StaleSocketRemoved,
+    SocketBound,
+    Recovered,
+    Ready,
+}
+
+trait StartupTrace: Sync {
+    fn record(&self, phase: StartupPhase);
+}
+
+struct NoopStartupTrace;
+
+impl StartupTrace for NoopStartupTrace {
+    fn record(&self, _phase: StartupPhase) {}
+}
+
+async fn serve_at_until<F>(
+    config: AppConfig,
+    logger: Arc<dyn RuntimeLogger>,
+    trace: &dyn StartupTrace,
+    home: PathBuf,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
     let runtime = config.required_runtime()?.clone();
     let paths = runtime.resolve_paths(&home)?;
     prepare_paths(&home, &paths)?;
+    trace.record(StartupPhase::PathsValidated);
     let lock = InstanceLock::acquire(&paths.lock, &paths.socket)?;
+    trace.record(StartupPhase::LockAcquired);
     let store = SqliteRuntimeStore::open(&paths.database).await?;
-    let snapshot = AuthorizationStore::new(home.join("users.json"))
-        .snapshot()
-        .await?;
-    store
-        .import_legacy_authorization(snapshot, SystemClock.now())
-        .await?;
+    trace.record(StartupPhase::Migrated);
+    import_legacy_authorization_once(&store, &home.join("users.json"), SystemClock.now()).await?;
+    trace.record(StartupPhase::AuthImported);
     let actor_id = ActorId::from_string(runtime.actor_id);
     let actor = store.load_actor(&actor_id).await?.with_context(|| {
         format!("configured runtime actor {actor_id} does not exist; authorize an actor and set runtime.actor_id")
@@ -60,8 +99,11 @@ async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) ->
     if !actor.enabled {
         bail!("configured runtime actor {actor_id} is disabled");
     }
+    trace.record(StartupPhase::ActorVerified);
     validate_runtime_paths(&home, &paths)?;
+    trace.record(StartupPhase::ParentsValidated);
     lock.remove_stale_socket()?;
+    trace.record(StartupPhase::StaleSocketRemoved);
 
     let clock = SystemClock;
     let signals = ActorSignals::default();
@@ -81,14 +123,13 @@ async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) ->
         outbox.clone(),
         hub.clone(),
     )?;
+    trace.record(StartupPhase::SocketBound);
     let recovery = store.recover_startup(clock.now()).await?;
-    let tools = ToolRegistry::with_allowed_tools_and_config(
-        actor.tools.clone(),
-        actor_tool_config(&AuthorizedActor {
-            id: actor.id.to_string(),
-            tools: actor.tools,
-        })?,
-    );
+    trace.record(StartupPhase::Recovered);
+    let tool_config =
+        tool_config_for_actor_workspace(actor_workspace_path_in(&home, actor.id.as_str())?)?;
+    let instructions = agent_instructions_for_tool_config(&tool_config);
+    let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
     let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
     let artifacts = ArtifactManager::new(paths.artifacts.clone(), store.clone(), clock.clone());
     let runner = ActorRunner::new(
@@ -98,7 +139,9 @@ async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) ->
         hub.clone(),
         RunnerLimits::default(),
         artifacts,
-    );
+    )
+    .with_system_instructions(instructions)
+    .with_logger(logger.clone());
     let dispatcher = ActorDispatcher::new(
         actor_id.clone(),
         dispatcher_owner.clone(),
@@ -119,6 +162,20 @@ async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) ->
         orphaned_running_attempts: recovery.orphaned_running_attempts,
     });
     logger.log(&startup)?;
+    for unknown in &recovery.unknown_outcomes {
+        let mut event = RuntimeLogEvent::transition(
+            RuntimeComponent::Recovery,
+            RuntimeTransition::OutcomeUnknown,
+        );
+        event.actor_id = Some(unknown.actor_id.clone());
+        event.work_item_id = Some(unknown.work_item_id.clone());
+        event.run_id = Some(unknown.run_id.clone());
+        event.attempt_id = Some(unknown.attempt_id.clone());
+        event.lease_generation = Some(unknown.lease_generation);
+        event.error_class =
+            Some(crate::runtime::observability::RuntimeErrorClass::UnknownExternalOutcome);
+        logger.log(&event)?;
+    }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut service = ServeRuntime::new(Supervisor::default());
@@ -136,7 +193,7 @@ async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) ->
     let result = service
         .run_until_started(
             async move {
-                shutdown_signal().await;
+                shutdown.await;
                 let _ = shutdown_logger.log(&RuntimeLogEvent::transition(
                     RuntimeComponent::Supervisor,
                     RuntimeTransition::ShuttingDown,
@@ -144,6 +201,7 @@ async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) ->
                 shutdown_tx.send_replace(true);
             },
             move || {
+                trace.record(StartupPhase::Ready);
                 ready_logger.log(&RuntimeLogEvent::transition(
                     RuntimeComponent::Startup,
                     RuntimeTransition::Ready,
@@ -164,6 +222,18 @@ async fn serve_with_logger(config: AppConfig, logger: Arc<dyn RuntimeLogger>) ->
         .await;
     let cleanup = lock.remove_stale_socket();
     result.and(recovery).and(cleanup)
+}
+
+async fn import_legacy_authorization_once(
+    store: &SqliteRuntimeStore,
+    users_path: &Path,
+    now: crate::runtime::model::Timestamp,
+) -> Result<crate::runtime::store::ImportOutcome> {
+    if store.legacy_authorization_imported().await? {
+        return Ok(crate::runtime::store::ImportOutcome::AlreadyImported);
+    }
+    let snapshot = AuthorizationStore::new(users_path).snapshot().await?;
+    store.import_legacy_authorization(snapshot, now).await
 }
 
 fn prepare_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {
@@ -247,6 +317,13 @@ fn default_skill_roots() -> Result<Vec<SkillRoot>> {
 }
 
 fn actor_workspace_path(actor_id: &str) -> Result<std::path::PathBuf> {
+    actor_workspace_path_in(
+        &codrik_dir().context("failed to resolve codrik directory for actor workspace")?,
+        actor_id,
+    )
+}
+
+fn actor_workspace_path_in(home: &Path, actor_id: &str) -> Result<std::path::PathBuf> {
     if actor_id.is_empty()
         || actor_id == "."
         || actor_id == ".."
@@ -256,10 +333,7 @@ fn actor_workspace_path(actor_id: &str) -> Result<std::path::PathBuf> {
         bail!("unsafe actor id for workspace path: {actor_id}");
     }
 
-    Ok(codrik_dir()
-        .context("failed to resolve codrik directory for actor workspace")?
-        .join("workspaces")
-        .join(actor_id))
+    Ok(home.join("workspaces").join(actor_id))
 }
 
 fn default_agent_instructions() -> String {
@@ -320,14 +394,27 @@ fn skill_index_section(skills: &[Skill]) -> Option<String> {
 mod tests {
     use std::{
         fs,
+        os::unix::fs::PermissionsExt,
         path::Path,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct RecordingStartupTrace(Mutex<Vec<StartupPhase>>);
+
+    impl StartupTrace for RecordingStartupTrace {
+        fn record(&self, phase: StartupPhase) {
+            self.0.lock().unwrap().push(phase);
+        }
+    }
 
     #[test]
     fn default_skill_roots_order_project_user_then_builtin() -> Result<()> {
@@ -452,6 +539,122 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn legacy_auth_marker_is_checked_before_reading_corrupt_file() -> Result<()> {
+        let root = temp_root("auth-marker")?;
+        let users = root.join("users.json");
+        fs::write(&users, r#"{"version":1,"actors":{}}"#)?;
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        assert_eq!(
+            import_legacy_authorization_once(&store, &users, crate::runtime::model::Timestamp(1))
+                .await?,
+            crate::runtime::store::ImportOutcome::Imported
+        );
+        fs::write(&users, "not json and must not be read")?;
+        assert_eq!(
+            import_legacy_authorization_once(&store, &users, crate::runtime::model::Timestamp(2))
+                .await?,
+            crate::runtime::store::ImportOutcome::AlreadyImported
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_legacy_auth_parse_does_not_set_marker() -> Result<()> {
+        let root = temp_root("auth-failure")?;
+        let users = root.join("users.json");
+        fs::write(&users, "not json")?;
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        assert!(
+            import_legacy_authorization_once(&store, &users, crate::runtime::model::Timestamp(1))
+                .await
+                .is_err()
+        );
+        assert!(!store.legacy_authorization_imported().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_startup_is_ordered_and_ready_only_after_recovery() -> Result<()> {
+        let home = short_runtime_root("order")?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+        fs::write(
+            home.join("users.json"),
+            r#"{"version":1,"actors":{"actor:local:owner":{"enabled":true,"display_name":null,"identities":[],"tools":["*"]}}}"#,
+        )?;
+        let stale = std::os::unix::net::UnixListener::bind(home.join("codrik.sock"))?;
+        drop(stale);
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: actor:local:owner\n",
+        )?;
+        let trace = RecordingStartupTrace::default();
+        serve_at_until(
+            config,
+            Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+            &trace,
+            home,
+            async {},
+        )
+        .await?;
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            vec![
+                StartupPhase::PathsValidated,
+                StartupPhase::LockAcquired,
+                StartupPhase::Migrated,
+                StartupPhase::AuthImported,
+                StartupPhase::ActorVerified,
+                StartupPhase::ParentsValidated,
+                StartupPhase::StaleSocketRemoved,
+                StartupPhase::SocketBound,
+                StartupPhase::Recovered,
+                StartupPhase::Ready,
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wrong_or_disabled_actor_fails_before_socket_cleanup() -> Result<()> {
+        for (configured, enabled) in [("actor:missing", true), ("actor:local:owner", false)] {
+            let home = short_runtime_root("actor")?;
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+            fs::write(
+                home.join("users.json"),
+                format!(
+                    r#"{{"version":1,"actors":{{"actor:local:owner":{{"enabled":{enabled},"display_name":null,"identities":[],"tools":[]}}}}}}"#
+                ),
+            )?;
+            let stale_path = home.join("codrik.sock");
+            let stale = std::os::unix::net::UnixListener::bind(&stale_path)?;
+            drop(stale);
+            let config: AppConfig = yaml_serde::from_str(&format!(
+                "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: {configured}\n"
+            ))?;
+            let trace = RecordingStartupTrace::default();
+            assert!(
+                serve_at_until(
+                    config,
+                    Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+                    &trace,
+                    home,
+                    async {},
+                )
+                .await
+                .is_err()
+            );
+            assert!(stale_path.exists());
+            assert!(
+                !trace
+                    .0
+                    .lock()
+                    .unwrap()
+                    .contains(&StartupPhase::StaleSocketRemoved)
+            );
+        }
+        Ok(())
+    }
+
     fn write_skill(root: &Path, name: &str, content: &str) -> Result<()> {
         let dir = root.join(name);
         fs::create_dir_all(&dir)?;
@@ -469,6 +672,16 @@ mod tests {
             TEMP_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
         fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    fn short_runtime_root(label: &str) -> Result<PathBuf> {
+        #[cfg(target_os = "macos")]
+        let base = Path::new("/private/tmp");
+        #[cfg(target_os = "linux")]
+        let base = Path::new("/tmp");
+        let path = base.join(format!("cs-{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path)?;
         Ok(path)
     }
 }

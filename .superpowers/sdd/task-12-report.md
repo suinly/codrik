@@ -19,6 +19,13 @@ The failing tests established named unexpected-exit propagation, sibling
 cancellation, the exact 30-second forced-stop boundary, redacted typed log shape,
 and atomic recovery of expired actor/bundle claims and orphaned running attempts.
 
+The review correction began with additional RED tests for live and stale actor
+fences, absent/expired leases, idempotent recovery, auth-marker short-circuiting,
+explicit component readiness, system-instruction injection, terminal/recovery log
+emission, safe shutdown recovery, and model-future cancellation. The recovery
+suite initially failed on the missing fence-aware fixture/probe APIs. The new
+runner and composition tests then drove the instruction, logger, and startup seams.
+
 ## GREEN implementation
 
 - `app::serve` now performs ordered startup: resolve and validate configuration
@@ -31,6 +38,9 @@ and atomic recovery of expired actor/bundle claims and orphaned running attempts
 - Production composition builds one configured `RuntimeActor`, actor-scoped
   `ToolRegistry`, `OpenAiClient`, `ArtifactManager`, streaming `ActorRunner`,
   `ActorDispatcher`, `StreamHub`, `OutboxWorker`, and `LocalIpcServer`.
+  The exact base and skill-index instructions are injected as one transient
+  system message on every model request. They are never checkpointed into the
+  durable conversation and therefore cannot accumulate between model steps.
 - `ServeRuntime` owns named component tasks. Any component return before a
   shutdown signal is fatal, names the exited component, aborts siblings, and
   returns an error for service-manager restart.
@@ -50,11 +60,21 @@ and atomic recovery of expired actor/bundle claims and orphaned running attempts
   dispatcher's persisted failure-recording path.
 - Startup recovery runs in one immediate transaction and reports counts for
   expired actor leases, expired bundle claims, and orphaned running attempts.
+  A `running` attempt is recovered only when its active run has no actor lease,
+  an expired lease at the fresh recovery timestamp, or a lease generation that
+  does not match the run fence. A live matching fence is never modified, even if
+  another process used a different instance-lock path. Typed recovered
+  actor/work/run/attempt/generation coordinates are returned for logging.
+- The durable legacy-auth marker is queried before `users.json` is opened. An
+  existing marker makes a missing or corrupt legacy file irrelevant; an absent
+  marker parses the snapshot and the import transaction rechecks the marker.
+  Parse/import failure leaves the marker absent.
 - `RuntimeLogEvent` accepts typed correlation IDs, typed component/transition
   enums, and redacted error classes. `StderrRuntimeLogger` writes one JSON object
   per line. Startup paths, schema v2, actor, recovery counts, readiness,
-  shutdown, and component-terminal state are emitted without prompt, model,
-  tool, or outbox payload fields.
+  shutdown, component-terminal state, fifth work failure, and each recovered
+  unknown outcome are emitted after their durable commits without prompt,
+  model, tool, or outbox payload fields.
 - `CliCommand::Serve` loads configuration and enters `app::serve`.
   `CliCommand::Submit` only builds `LocalIpcClient`; there is no client-side
   `Agent` construction path. Legacy Telegram polling modules/files and the
@@ -63,12 +83,16 @@ and atomic recovery of expired actor/bundle claims and orphaned running attempts
 
 ## Verification evidence
 
-- `rtk cargo test runtime::supervisor::tests` — 2 passed.
-- `rtk cargo test runtime::sqlite::recovery::tests` — 1 passed.
+- `rtk cargo test runtime::supervisor::tests` — 4 passed.
+- `rtk cargo test runtime::sqlite::recovery::tests` — 4 passed.
 - `rtk cargo test runtime::ipc::server::tests` — 25 passed.
-- `rtk cargo test app::tests` — 6 passed.
+- `rtk cargo test runtime::runner::tests` — 23 passed.
+- `rtk cargo test runtime::sqlite::failures::tests` — 8 passed.
+- `rtk cargo test runtime::outbox_worker::tests` — 18 passed.
+- `rtk cargo test runtime::observability::tests` — 2 passed.
+- `rtk cargo test app::tests` — 10 passed.
 - `rtk cargo test interfaces::cli::tests` — 6 passed.
-- `rtk cargo test` — 393 passed, 1 ignored.
+- `rtk cargo test` — 406 passed, 1 ignored.
 - `rtk cargo check` — passed; the existing crate-wide unused/dead-code warning
   baseline remains after removing the legacy production path.
 - `rtk cargo fmt --check` — passed.
@@ -82,9 +106,10 @@ and atomic recovery of expired actor/bundle claims and orphaned running attempts
   tasks, socket unlink, and shutdown recovery. Both startup and shutdown socket
   removal use `InstanceLock::remove_stale_socket`; no bare pathname unlink was
   introduced.
-- Readiness is emitted from `ServeRuntime::run_until_started` only after each
-  component future has been spawned and polled once; an immediately exiting
-  component fails before readiness.
+- Readiness uses an explicit per-component first-poll handshake. Each task sends
+  ready only after its component future returns `Pending`; a future returning
+  `Ok` or `Err` on that poll fails startup before readiness. No scheduler-yield
+  heuristic remains.
 - IPC shutdown is deliberately two phase. `ServerShuttingDown` no longer closes
   recognized connections itself, because doing so would defeat the specified
   transmission/ACK grace. Dropping the server future at the supervisor deadline
@@ -93,6 +118,10 @@ and atomic recovery of expired actor/bundle claims and orphaned running attempts
   migration or deletion was added, matching the fresh-database decision ledger.
 - Recovery strings persisted in `last_error` are fixed redacted classes
   (`interrupted_delivery`, `shutdown_before_ack`), never external payloads.
+- A real private runtime directory/socket/SQLite startup test records every
+  production phase in order through readiness. Missing/disabled actors fail
+  before stale-socket cleanup. Paused time proves the supervisor remains live at
+  29 seconds and force-drops remaining work at exactly 30 seconds.
 
 ## Concerns
 
