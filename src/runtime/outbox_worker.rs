@@ -7,7 +7,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::runtime::{
     ipc::protocol::{ServerEvent, encode_bundle},
-    model::{BundleState, Clock, RequestId},
+    model::{BundleId, BundleState, Clock, RequestId},
     store::{
         AckOutcome, BundleAck, BundleStore, ClaimRenewal, ClaimTransition, ClaimedBundle,
         ClaimedBundleLoad, ClaimedBundleRef,
@@ -29,6 +29,10 @@ enum AckWait {
 
 #[async_trait]
 pub trait BundleDeliverySink: Send + Sync {
+    fn reserve_transmission(&self, _bundle: &BundleId) -> bool {
+        true
+    }
+
     async fn send(&self, event: ServerEvent) -> Result<()>;
 
     async fn abort(&self, _error: &str) {}
@@ -37,6 +41,16 @@ pub trait BundleDeliverySink: Send + Sync {
 pub trait DeliveryRegistry: Send + Sync {
     fn subscribed_request_ids(&self) -> Vec<RequestId>;
     fn snapshot(&self, request: &RequestId) -> Vec<Arc<dyn BundleDeliverySink>>;
+    fn reserve_snapshot(
+        &self,
+        request: &RequestId,
+        bundle: &BundleId,
+    ) -> Vec<Arc<dyn BundleDeliverySink>> {
+        self.snapshot(request)
+            .into_iter()
+            .filter(|sink| sink.reserve_transmission(bundle))
+            .collect()
+    }
     fn subscribe_changes(&self) -> watch::Receiver<u64>;
 }
 
@@ -205,7 +219,9 @@ where
                 return Ok(());
             }
         };
-        let recipients = self.registry.snapshot(&claimed.bundle.request_id);
+        let recipients = self
+            .registry
+            .reserve_snapshot(&claimed.bundle.request_id, &claimed.bundle.id);
         if recipients.is_empty() {
             self.retry(claimed, "all bundle subscribers disconnected")
                 .await?;
@@ -708,6 +724,32 @@ mod tests {
         events: Mutex<Vec<ServerEvent>>,
     }
 
+    struct ReservationBarrierSink {
+        reserved: Arc<AtomicBool>,
+        all_reservations: Vec<Arc<AtomicBool>>,
+        checked: AtomicBool,
+    }
+
+    #[async_trait]
+    impl BundleDeliverySink for ReservationBarrierSink {
+        fn reserve_transmission(&self, _bundle: &BundleId) -> bool {
+            self.reserved.store(true, Ordering::SeqCst);
+            true
+        }
+
+        async fn send(&self, _event: ServerEvent) -> Result<()> {
+            if !self.checked.swap(true, Ordering::SeqCst) {
+                assert!(
+                    self.all_reservations
+                        .iter()
+                        .all(|reserved| reserved.load(Ordering::SeqCst)),
+                    "every fixed-snapshot recipient must be reserved before the first send"
+                );
+            }
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl BundleDeliverySink for SubscribeOnFirstSend {
         async fn send(&self, event: ServerEvent) -> Result<()> {
@@ -809,6 +851,40 @@ mod tests {
             events.last().unwrap().body,
             ServerEventBody::FinalEnd { .. }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_reserves_every_snapshot_recipient_before_any_frame_send() -> Result<()> {
+        let store = FakeStore::with_bundles(1);
+        let registry = Arc::new(FakeRegistry::default());
+        let request = store.bundles.lock().unwrap()[0].request_id.clone();
+        let reservations = vec![
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        for reserved in &reservations {
+            registry.add(
+                request.clone(),
+                Arc::new(ReservationBarrierSink {
+                    reserved: reserved.clone(),
+                    all_reservations: reservations.clone(),
+                    checked: AtomicBool::new(false),
+                }),
+            );
+        }
+
+        assert_eq!(
+            worker(store, registry, ManualClock::new(0))
+                .run_once()
+                .await?,
+            1
+        );
+        assert!(
+            reservations
+                .iter()
+                .all(|reserved| reserved.load(Ordering::SeqCst))
+        );
         Ok(())
     }
 

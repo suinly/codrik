@@ -37,6 +37,14 @@ security defects:
 - integrated commit/rollback races, detached duplicates, Cancel, and ACK lacked
   server-level wire coverage.
 
+A final RED cycle reproduced the retained-terminal delivery race: Resume
+connections that entered while a bundle was `Delivering` or `FailedRetryable`
+never re-read durable state, so an ACK transition to `Delivered` left excluded
+sinks hanging forever. The outbox snapshot also had no explicit per-bundle
+participation marker, so a newly included sink could not safely distinguish an
+already-started transmission from replay when another sink ACKed before its
+first frame.
+
 ## GREEN implementation
 
 - `InstanceLock::acquire(lock, socket)` requires both configured names to be
@@ -85,6 +93,15 @@ security defects:
   state. It allocates no transient queue and consumes none of Task 7's per-
   subscription or global transient byte budget. Submit retains its combined
   transient/delivery subscription.
+- Every outbox fixed snapshot now atomically reserves per-bundle transmission
+  participation on each retained connection before any frame send begins.
+  Resume polls durable state while bundles remain pending, delivering, or
+  retryable; on `Delivered`, it claims mutually exclusive replay participation.
+  Excluded late/stale-ACK connections replay read-only from `FinalBegin`, while
+  transmission-reserved connections never race a duplicate replay even if a
+  different sink ACKs before their first frame. Participation disappears with
+  the connection, and the original fixed snapshot and already-started sends
+  remain unchanged.
 - Cancel emits exact `CancelAccepted`; ACK delegates the exact `BundleAck` and
   closes after success. Integrated frame tests cover both.
 - Every accepted handler is owned by the server's `JoinSet`, including the
@@ -97,11 +114,12 @@ security defects:
 
 - `rtk cargo test runtime::instance_lock::tests` — 6 passed.
 - `rtk cargo test runtime::ipc::security::tests` — 6 passed.
-- `rtk cargo test runtime::ipc::server::tests` — 20 passed.
-- `rtk cargo test runtime::stream_hub::tests` — 10 passed.
-- `rtk cargo test runtime::outbox_worker::tests` — 17 passed.
+- `rtk cargo test runtime::ipc::server::tests` — 23 passed.
+- `rtk cargo test runtime::stream_hub::tests` — 11 passed.
+- `rtk cargo test runtime::outbox_worker::tests` — 18 passed.
+- `rtk cargo test runtime::ipc::protocol::tests` — 19 passed.
 - `rtk cargo test runtime::sqlite::local_ingress::tests` — 9 passed.
-- `rtk cargo test` — 388 passed, 1 ignored.
+- `rtk cargo test` — 393 passed, 1 ignored.
 - `rtk cargo check` — passed; the existing crate-wide unused/dead-code warning
   baseline remains until production composition in Task 12.
 - `rtk cargo fmt --check` — passed.

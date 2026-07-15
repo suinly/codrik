@@ -534,13 +534,16 @@ fn activity_event(event: AgentActivityEvent) -> ActivityEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::{
         llm::client::AgentActivityEvent,
         runtime::{
             ipc::protocol::{ServerEvent, ServerEventBody},
-            model::RequestId,
+            model::{BundleId, RequestId},
             outbox_worker::{BundleDeliverySink, DeliveryRegistry},
             stream_hub::{RuntimeEventPublisher, StreamHub},
         },
@@ -559,6 +562,23 @@ mod tests {
     impl BundleDeliverySink for RecordingDeliverySink {
         async fn send(&self, event: ServerEvent) -> Result<()> {
             self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    struct ReservableDeliverySink {
+        allow: bool,
+        reservations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BundleDeliverySink for ReservableDeliverySink {
+        fn reserve_transmission(&self, _bundle: &BundleId) -> bool {
+            self.reservations.fetch_add(1, Ordering::SeqCst);
+            self.allow
+        }
+
+        async fn send(&self, _event: ServerEvent) -> Result<()> {
             Ok(())
         }
     }
@@ -610,6 +630,32 @@ mod tests {
         assert_eq!(DeliveryRegistry::snapshot(&hub, &request).len(), 1);
         drop(delivery);
         assert!(DeliveryRegistry::snapshot(&hub, &request).is_empty());
+    }
+
+    #[test]
+    fn reserved_snapshot_contains_only_sinks_that_claim_transmission_participation() {
+        let hub = StreamHub::default();
+        let request = request();
+        let accepted = Arc::new(ReservableDeliverySink {
+            allow: true,
+            reservations: AtomicUsize::new(0),
+        });
+        let rejected = Arc::new(ReservableDeliverySink {
+            allow: false,
+            reservations: AtomicUsize::new(0),
+        });
+        let _accepted = hub
+            .subscribe_delivery(request.clone(), accepted.clone())
+            .unwrap();
+        let _rejected = hub
+            .subscribe_delivery(request.clone(), rejected.clone())
+            .unwrap();
+
+        let snapshot = hub.reserve_snapshot(&request, &BundleId::new());
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(accepted.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(rejected.reservations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

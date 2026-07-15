@@ -24,7 +24,7 @@ use crate::runtime::{
         },
         security::{AuthorizedUnixStream, OsPeerCredentials, PeerCredentials},
     },
-    model::{ActorId, BundleState, Clock, LocalRequestState, RequestId, SystemClock},
+    model::{ActorId, BundleId, BundleState, Clock, LocalRequestState, RequestId, SystemClock},
     outbox_worker::{BundleDeliverySink, OutboxWorker},
     store::{
         AckOutcome, BundleAck, BundleStore, CancelOutcome, LocalCancel, LocalIngressStore,
@@ -484,6 +484,19 @@ impl ConnectionHandler {
                 }
                 (_, _, Some(BundleState::Delivered)) => {
                     sink.open_delivery();
+                    let Some(bundle_id) = current.result_bundle_id.as_ref() else {
+                        sink.send_control(request_error(
+                            request,
+                            "invalid_request_state",
+                            "delivered request has no durable result bundle ID",
+                        ))
+                        .await?;
+                        return sink.close().await;
+                    };
+                    if !sink.reserve_replay(bundle_id) {
+                        wait_for_disconnect(read).await;
+                        return sink.close().await;
+                    }
                     if !self.outbox.replay(&request, sink.clone()).await? {
                         sink.send_control(request_error(
                             request,
@@ -504,8 +517,16 @@ impl ConnectionHandler {
                     ),
                 ) => {
                     sink.open_delivery();
-                    wait_for_disconnect(read).await;
-                    return sink.close().await;
+                    tokio::select! {
+                        _ = wait_for_disconnect(read) => return sink.close().await,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                            let Some(updated) = self.ingress.resolve_local_request(&request).await? else {
+                                sink.send_control(request_error(request, "missing_request", "request disappeared during resume")).await?;
+                                return sink.close().await;
+                            };
+                            current = updated;
+                        }
+                    }
                 }
                 (_, _, Some(BundleState::FailedTerminal)) => {
                     sink.send_control(request_error(
@@ -567,6 +588,13 @@ struct SocketDeliverySink {
     delivery_open: AtomicBool,
     delivery_ready: tokio::sync::Notify,
     request: Mutex<Option<RequestId>>,
+    bundle_participation: Mutex<HashMap<BundleId, BundleParticipation>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BundleParticipation {
+    Transmission,
+    Replay,
 }
 
 impl SocketDeliverySink {
@@ -576,6 +604,7 @@ impl SocketDeliverySink {
             delivery_open: AtomicBool::new(false),
             delivery_ready: tokio::sync::Notify::new(),
             request: Mutex::new(None),
+            bundle_participation: Mutex::new(HashMap::new()),
         }
     }
 
@@ -593,6 +622,21 @@ impl SocketDeliverySink {
             .lock()
             .expect("socket request poisoned")
             .clone()
+    }
+
+    fn reserve_replay(&self, bundle: &BundleId) -> bool {
+        let mut participation = self
+            .bundle_participation
+            .lock()
+            .expect("bundle participation poisoned");
+        match participation.get(bundle) {
+            Some(BundleParticipation::Transmission) => false,
+            Some(BundleParticipation::Replay) => true,
+            None => {
+                participation.insert(bundle.clone(), BundleParticipation::Replay);
+                true
+            }
+        }
     }
 
     async fn send_control(&self, event: ServerEvent) -> Result<()> {
@@ -640,6 +684,21 @@ impl SocketDeliverySink {
 
 #[async_trait]
 impl BundleDeliverySink for SocketDeliverySink {
+    fn reserve_transmission(&self, bundle: &BundleId) -> bool {
+        let mut participation = self
+            .bundle_participation
+            .lock()
+            .expect("bundle participation poisoned");
+        match participation.get(bundle) {
+            Some(BundleParticipation::Replay) => false,
+            Some(BundleParticipation::Transmission) => true,
+            None => {
+                participation.insert(bundle.clone(), BundleParticipation::Transmission);
+                true
+            }
+        }
+    }
+
     async fn send(&self, event: ServerEvent) -> Result<()> {
         self.wait_until_open().await;
         self.write(event).await
@@ -744,7 +803,7 @@ mod tests {
         ipc::{
             protocol::{
                 ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode,
-                ServerEvent, ServerEventBody,
+                ServerEvent, ServerEventBody, encode_bundle,
             },
             security::{PeerCredentials, bind_secure_listener, create_secure_directory},
         },
@@ -752,10 +811,11 @@ mod tests {
             ActorId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState, RequestId,
             Timestamp, WorkItemId,
         },
-        outbox_worker::BundleDeliverySink,
+        outbox_worker::{BundleDeliverySink, DeliveryRegistry},
         store::{
-            AckOutcome, BundleAck, CancelOutcome, LocalCancel, LocalIngressStore,
-            LocalRequestRecord, LocalSubmission, LocalSubmitOutcome, RuntimeActor,
+            AckOutcome, BundleAck, BundleManifest, CancelOutcome, FinalPayload, LocalCancel,
+            LocalIngressStore, LocalRequestRecord, LocalSubmission, LocalSubmitOutcome,
+            ResultBundle, RuntimeActor,
         },
         stream_hub::StreamHub,
     };
@@ -1002,6 +1062,17 @@ mod tests {
         acks: Mutex<Vec<BundleAck>>,
         replay: AtomicBool,
         replay_calls: AtomicUsize,
+        replay_events: Mutex<Vec<ServerEvent>>,
+    }
+
+    #[derive(Default)]
+    struct NoopDeliverySink;
+
+    #[async_trait]
+    impl BundleDeliverySink for NoopDeliverySink {
+        async fn send(&self, _event: ServerEvent) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1014,10 +1085,35 @@ mod tests {
         async fn replay(
             &self,
             _request: &RequestId,
-            _sink: Arc<dyn BundleDeliverySink>,
+            sink: Arc<dyn BundleDeliverySink>,
         ) -> Result<bool> {
             self.replay_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.replay.load(Ordering::SeqCst))
+            if !self.replay.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            let events = self.replay_events.lock().unwrap().clone();
+            for event in events {
+                sink.send(event).await?;
+            }
+            Ok(true)
+        }
+    }
+
+    fn result_bundle(request_id: RequestId, bundle_id: BundleId) -> ResultBundle {
+        ResultBundle {
+            id: bundle_id,
+            request_id,
+            state: BundleState::Delivered,
+            manifest: BundleManifest {
+                entries: Vec::new(),
+                sha256: String::new(),
+            },
+            deliveries: vec![(
+                DeliveryId::new(),
+                FinalPayload::Text {
+                    text: "done".to_owned(),
+                },
+            )],
         }
     }
 
@@ -1569,6 +1665,172 @@ mod tests {
         assert_eq!(outbox.replay_calls.load(Ordering::SeqCst), 0);
         drop(client);
         task.await??;
+        assert!(hub.snapshot(&request).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_resume_excluded_from_delivering_snapshot_replays_after_delivered() -> Result<()> {
+        let request = RequestId::new();
+        let bundle_id = BundleId::new();
+        let mut record = request_record(
+            request.clone(),
+            None,
+            LocalRequestState::Completed,
+            Some(bundle_id.clone()),
+        );
+        record.result_bundle_state = Some(BundleState::Delivering);
+        let (handler, ingress, outbox, hub) = test_handler_with_record(Some(record.clone()));
+        outbox.replay.store(true, Ordering::SeqCst);
+        *outbox.replay_events.lock().unwrap() =
+            encode_bundle(&result_bundle(request.clone(), bundle_id), true)?;
+        let _existing = hub.subscribe_delivery(request.clone(), Arc::new(NoopDeliverySink))?;
+        let original_snapshot = hub.reserve_snapshot(
+            &request,
+            record.result_bundle_id.as_ref().expect("bundle ID"),
+        );
+        assert_eq!(original_snapshot.len(), 1);
+
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::Resume {
+                request_id: request.clone(),
+            }))
+            .await?;
+        timeout(Duration::from_secs(1), async {
+            while hub.snapshot(&request).len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        record.result_bundle_state = Some(BundleState::Delivered);
+        *ingress.record.lock().unwrap() = Some(record);
+        let mut reader = FrameReader::new(&mut client);
+        let begin = timeout(Duration::from_millis(300), reader.read_server_event()).await??;
+        assert!(matches!(
+            begin.body,
+            ServerEventBody::FinalBegin { replay: true, .. }
+        ));
+        while !matches!(
+            reader.read_server_event().await?.body,
+            ServerEventBody::FinalEnd { .. }
+        ) {}
+        task.await??;
+        assert_eq!(outbox.replay_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_retryable_resume_replays_after_stale_ack_delivers() -> Result<()> {
+        let request = RequestId::new();
+        let bundle_id = BundleId::new();
+        let mut record = request_record(
+            request.clone(),
+            None,
+            LocalRequestState::Completed,
+            Some(bundle_id.clone()),
+        );
+        record.result_bundle_state = Some(BundleState::FailedRetryable);
+        let (handler, ingress, outbox, hub) = test_handler_with_record(Some(record.clone()));
+        outbox.replay.store(true, Ordering::SeqCst);
+        *outbox.replay_events.lock().unwrap() =
+            encode_bundle(&result_bundle(request.clone(), bundle_id), true)?;
+
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::Resume {
+                request_id: request.clone(),
+            }))
+            .await?;
+        timeout(Duration::from_secs(1), async {
+            while hub.snapshot(&request).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        record.result_bundle_state = Some(BundleState::Delivered);
+        *ingress.record.lock().unwrap() = Some(record);
+        let mut reader = FrameReader::new(&mut client);
+        let begin = timeout(Duration::from_millis(300), reader.read_server_event()).await??;
+        assert!(matches!(
+            begin.body,
+            ServerEventBody::FinalBegin { replay: true, .. }
+        ));
+        while !matches!(
+            reader.read_server_event().await?.body,
+            ServerEventBody::FinalEnd { .. }
+        ) {}
+        task.await??;
+        assert_eq!(outbox.replay_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reserved_resume_never_replays_when_another_ack_wins_before_first_frame() -> Result<()>
+    {
+        let request = RequestId::new();
+        let bundle_id = BundleId::new();
+        let mut record = request_record(
+            request.clone(),
+            None,
+            LocalRequestState::Completed,
+            Some(bundle_id.clone()),
+        );
+        record.result_bundle_state = Some(BundleState::Delivering);
+        let (handler, ingress, outbox, hub) = test_handler_with_record(Some(record.clone()));
+        outbox.replay.store(true, Ordering::SeqCst);
+        *outbox.replay_events.lock().unwrap() =
+            encode_bundle(&result_bundle(request.clone(), bundle_id.clone()), true)?;
+
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::Resume {
+                request_id: request.clone(),
+            }))
+            .await?;
+        let recipients = timeout(Duration::from_secs(1), async {
+            loop {
+                let recipients = hub.reserve_snapshot(&request, &bundle_id);
+                if !recipients.is_empty() {
+                    break recipients;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        record.result_bundle_state = Some(BundleState::Delivered);
+        *ingress.record.lock().unwrap() = Some(record);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(outbox.replay_calls.load(Ordering::SeqCst), 0);
+
+        let frames = encode_bundle(&result_bundle(request.clone(), bundle_id), false)?;
+        for frame in frames {
+            recipients[0].send(frame).await?;
+        }
+        let mut reader = FrameReader::new(&mut client);
+        let begin = reader.read_server_event().await?;
+        assert!(matches!(
+            begin.body,
+            ServerEventBody::FinalBegin { replay: false, .. }
+        ));
+        while !matches!(
+            reader.read_server_event().await?.body,
+            ServerEventBody::FinalEnd { .. }
+        ) {}
+        assert!(
+            timeout(Duration::from_millis(100), reader.read_server_event())
+                .await
+                .is_err()
+        );
+        drop(client);
+        task.await??;
+        assert_eq!(outbox.replay_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
