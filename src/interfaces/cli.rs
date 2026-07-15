@@ -1,65 +1,148 @@
+use std::{env, future::Future, io::Write};
+
 use anyhow::{Context, Result, bail};
-use std::{
-    env,
-    io::{self, Write},
-    sync::{Arc, Mutex},
-};
-use tokio::{task::JoinHandle, time::Duration};
 
 use crate::{
-    app,
-    config::AppConfig,
-    interfaces::telegram,
-    llm::client::{LlmStreamEvent, LlmStreamSink},
+    config::{AppConfig, codrik_dir},
+    interfaces::{
+        local_renderer::{LocalRenderer, RenderAction},
+        request_metadata::{RequestMetadataState, RequestMetadataStore, recovery_command},
+    },
+    runtime::{
+        RequestId,
+        ipc::client::{ClientEventStream, LocalIpcClient},
+        model::{Clock, SystemClock},
+    },
     updater,
 };
 
 pub async fn run() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
         CliCommand::Update => updater::update().await,
-        CliCommand::Gateway { name } => match name.as_str() {
-            "telegram" => {
-                let config = AppConfig::load_default()?;
-                telegram::run(config).await
+        CliCommand::Serve => bail!("serve runtime composition is not available yet"),
+        CliCommand::Submit(prompt) => submit(prompt).await,
+        CliCommand::Resume(request) => resume(request).await,
+        CliCommand::Cancel(request) => cancel(request).await,
+    }
+}
+
+async fn submit(prompt: String) -> Result<()> {
+    let (client, metadata) = local_context()?;
+    let request = RequestId::new();
+    metadata.create(&request, SystemClock.now().0, &prompt)?;
+    let stream = client.submit(request.clone(), prompt).await?;
+    metadata.set_state(&request, RequestMetadataState::SentUnconfirmed)?;
+    run_rendered(&client, &metadata, request, stream).await
+}
+
+async fn resume(request: RequestId) -> Result<()> {
+    let (client, metadata) = local_context()?;
+    let stream = client.resume(request.clone()).await?;
+    run_rendered(&client, &metadata, request, stream).await
+}
+
+async fn cancel(request: RequestId) -> Result<()> {
+    let (client, _) = local_context()?;
+    let mut stream = client.cancel(request.clone()).await?;
+    loop {
+        let Some(event) = stream.next_event().await? else {
+            bail!("daemon closed before confirming cancellation for {request}")
+        };
+        match event.body {
+            crate::runtime::ipc::protocol::ServerEventBody::CancelAccepted {
+                request_id, ..
+            } if request_id == request => return Ok(()),
+            crate::runtime::ipc::protocol::ServerEventBody::RequestError {
+                code, message, ..
+            } => bail!("daemon rejected cancellation ({code}): {message}"),
+            crate::runtime::ipc::protocol::ServerEventBody::ProtocolError { code, message } => {
+                bail!("daemon protocol error ({code:?}): {message}")
             }
-            _ => bail!("unknown gateway: {name}"),
+            _ => {}
+        }
+    }
+}
+
+fn local_context() -> Result<(LocalIpcClient, RequestMetadataStore)> {
+    let config = AppConfig::load_default()?;
+    let paths = config.required_runtime()?.resolve_paths(&codrik_dir()?)?;
+    Ok((
+        LocalIpcClient::new(paths.socket),
+        RequestMetadataStore::new(paths.client_requests),
+    ))
+}
+
+async fn run_rendered(
+    client: &LocalIpcClient,
+    metadata: &RequestMetadataStore,
+    request: RequestId,
+    stream: ClientEventStream,
+) -> Result<()> {
+    let mut renderer = LocalRenderer::stdout(request.clone());
+    let mut recovery = std::io::stderr();
+    drive_operation(
+        client,
+        &request,
+        stream,
+        metadata,
+        &mut renderer,
+        &mut recovery,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
         },
-        CliCommand::Session { session_id, query } => {
-            let config = AppConfig::load_default()?;
-            let result = app::run_once_with_session(query, config, session_id).await?;
+    )
+    .await
+}
 
-            println!("Agent: {}", result);
-
-            Ok(())
-        }
-        CliCommand::StreamingSession { session_id, query } => {
-            let config = AppConfig::load_default()?;
-            let mut renderer = StdoutStreamRenderer::start()?;
-
-            let result =
-                app::run_once_with_session_streaming(query, config, session_id, &mut renderer)
-                    .await;
-            renderer.finish()?;
-            println!();
-
-            result.map(|_| ())
-        }
-        CliCommand::OneShot { query } => {
-            let result = app::run_once(query).await?;
-
-            println!("Agent: {}", result);
-
-            Ok(())
-        }
-        CliCommand::StreamingOneShot { query } => {
-            let config = AppConfig::load_default()?;
-            let mut renderer = StdoutStreamRenderer::start()?;
-
-            let result = app::run_once_streaming(query, config, &mut renderer).await;
-            renderer.finish()?;
-            println!();
-
-            result.map(|_| ())
+async fn drive_operation<W, R, F>(
+    client: &LocalIpcClient,
+    request: &RequestId,
+    mut stream: ClientEventStream,
+    metadata: &RequestMetadataStore,
+    renderer: &mut LocalRenderer<W>,
+    recovery: &mut R,
+    interrupt: F,
+) -> Result<()>
+where
+    W: Write,
+    R: Write,
+    F: Future<Output = ()>,
+{
+    tokio::pin!(interrupt);
+    loop {
+        let event = tokio::select! {
+            _ = &mut interrupt => {
+                writeln!(recovery, "{}", recovery_command(request))?;
+                return Ok(());
+            }
+            event = stream.next_event() => event?,
+        };
+        let Some(event) = event else {
+            writeln!(recovery, "{}", recovery_command(request))?;
+            return Ok(());
+        };
+        match renderer.handle(event)? {
+            RenderAction::Continue => {}
+            RenderAction::Accepted => {
+                metadata.set_state_if_present(request, RequestMetadataState::Accepted)?;
+            }
+            RenderAction::FinalVerified {
+                request_id,
+                bundle_id,
+                delivery_ids,
+            } => {
+                client
+                    .acknowledge_final(request_id, bundle_id, delivery_ids)
+                    .await?;
+                metadata.set_state_if_present(request, RequestMetadataState::Terminal)?;
+                return Ok(());
+            }
+            RenderAction::Recover => {
+                writeln!(recovery, "{}", recovery_command(request))?;
+                return Ok(());
+            }
+            RenderAction::DaemonError(message) => bail!(message),
+            RenderAction::CancelAccepted => bail!("unexpected cancellation response"),
         }
     }
 }
@@ -67,11 +150,10 @@ pub async fn run() -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 enum CliCommand {
     Update,
-    Gateway { name: String },
-    Session { session_id: String, query: String },
-    StreamingSession { session_id: String, query: String },
-    OneShot { query: String },
-    StreamingOneShot { query: String },
+    Serve,
+    Resume(RequestId),
+    Cancel(RequestId),
+    Submit(String),
 }
 
 impl CliCommand {
@@ -83,249 +165,250 @@ impl CliCommand {
             return Ok(Self::Update);
         }
 
-        if command == "gateway" {
-            return Ok(Self::Gateway {
-                name: args.next().context("missing gateway name")?,
-            });
-        }
-
-        if command == "--session" {
-            return Ok(Self::Session {
-                session_id: args.next().context("missing session id")?,
-                query: args.next().context("missing query")?,
-            });
-        }
-
-        if command == "--stream" {
-            let next = args.next().context("missing query")?;
-
-            if next == "--session" {
-                return Ok(Self::StreamingSession {
-                    session_id: args.next().context("missing session id")?,
-                    query: args.next().context("missing query")?,
-                });
+        let parsed = match command.as_str() {
+            "serve" => Self::Serve,
+            "resume" => {
+                let request_id = args.next().context("missing request id")?;
+                Self::Resume(RequestId::parse(&request_id)?)
             }
-
-            return Ok(Self::StreamingOneShot { query: next });
-        }
-
-        Ok(Self::OneShot { query: command })
-    }
-}
-
-struct StdoutStreamRenderer {
-    state: Arc<Mutex<RenderState>>,
-    animation: JoinHandle<()>,
-}
-
-struct RenderState {
-    frame: usize,
-    spinner_visible: bool,
-    has_text: bool,
-}
-
-impl StdoutStreamRenderer {
-    fn start() -> Result<Self> {
-        write_stdout("Agent: ")?;
-
-        let state = Arc::new(Mutex::new(RenderState {
-            frame: 0,
-            spinner_visible: false,
-            has_text: false,
-        }));
-
-        {
-            let mut state = state.lock().expect("stream renderer state lock poisoned");
-            draw_spinner(&mut state)?;
-            flush_stdout()?;
-        }
-
-        let animation_state = Arc::clone(&state);
-        let animation = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(120));
-
-            loop {
-                interval.tick().await;
-
-                let Ok(mut state) = animation_state.lock() else {
-                    return;
-                };
-
-                if erase_spinner(&mut state).is_err() {
-                    return;
-                }
-                state.frame = (state.frame + 1) % SPINNER_FRAMES.len();
-                if draw_spinner(&mut state).is_err() {
-                    return;
-                }
-                if flush_stdout().is_err() {
-                    return;
-                }
+            "cancel" => {
+                let request_id = args.next().context("missing request id")?;
+                Self::Cancel(RequestId::parse(&request_id)?)
             }
-        });
-
-        Ok(Self { state, animation })
-    }
-
-    fn finish(self) -> Result<()> {
-        self.animation.abort();
-
-        {
-            let mut state = self
-                .state
-                .lock()
-                .expect("stream renderer state lock poisoned");
-            erase_spinner(&mut state)?;
-            flush_stdout()?;
-        }
-
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmStreamSink for StdoutStreamRenderer {
-    async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
-        if matches!(event, LlmStreamEvent::FileReady(_)) {
-            bail!("file output is unsupported by the CLI");
-        }
-        if let LlmStreamEvent::TextDelta(delta) = event {
-            let mut state = self
-                .state
-                .lock()
-                .expect("stream renderer state lock poisoned");
-            let delta = if state.has_text {
-                delta.as_str()
-            } else {
-                delta.trim_start_matches(['\r', '\n'])
-            };
-
-            if delta.is_empty() {
-                return Ok(());
+            "gateway" | "--session" | "--stream" => {
+                bail!("legacy local command is unsupported; use serve, resume, or cancel")
             }
-
-            erase_spinner(&mut state)?;
-            write_stdout(delta)?;
-            state.has_text = true;
-            draw_spinner(&mut state)?;
-            flush_stdout()?;
+            _ if command.starts_with('-') => bail!("unknown option: {command}"),
+            _ => Self::Submit(command),
+        };
+        if args.next().is_some() {
+            bail!("unexpected extra argument")
         }
-
-        Ok(())
+        Ok(parsed)
     }
-}
-
-const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
-
-fn draw_spinner(state: &mut RenderState) -> io::Result<()> {
-    write_stdout(SPINNER_FRAMES[state.frame])?;
-    state.spinner_visible = true;
-
-    Ok(())
-}
-
-fn erase_spinner(state: &mut RenderState) -> io::Result<()> {
-    if state.spinner_visible {
-        write_stdout("\u{8} \u{8}")?;
-        state.spinner_visible = false;
-    }
-
-    Ok(())
-}
-
-fn write_stdout(text: &str) -> io::Result<()> {
-    io::stdout().write_all(text.as_bytes())
-}
-
-fn flush_stdout() -> io::Result<()> {
-    io::stdout().flush()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{future::pending, path::PathBuf};
+
     use anyhow::Result;
+    use tokio::{io::AsyncReadExt, net::UnixListener};
 
-    use super::CliCommand;
+    use super::{CliCommand, drive_operation};
+    use crate::{
+        interfaces::{
+            local_renderer::LocalRenderer,
+            request_metadata::{RequestMetadataState, RequestMetadataStore},
+        },
+        runtime::{
+            BundleId, BundleState, DeliveryId, RequestId,
+            ipc::{
+                client::LocalIpcClient,
+                protocol::{ClientRequestBody, FrameReader, FrameWriter, encode_bundle},
+            },
+            store::{BundleManifest, FinalPayload, ResultBundle},
+        },
+    };
 
     #[test]
-    fn parses_gateway_command() -> Result<()> {
-        let command = CliCommand::parse(["gateway", "telegram"].map(String::from))?;
+    fn parses_supported_commands() -> Result<()> {
+        const UUID: &str = "0190f2ef-0000-7000-8000-000000000001";
+        let parse = |args: &[&str]| CliCommand::parse(args.iter().copied().map(String::from));
 
+        assert_eq!(parse(&["serve"])?, CliCommand::Serve);
         assert_eq!(
-            command,
-            CliCommand::Gateway {
-                name: "telegram".to_string()
-            }
+            parse(&["resume", UUID])?,
+            CliCommand::Resume(RequestId::parse(UUID)?)
         );
+        assert_eq!(
+            parse(&["cancel", UUID])?,
+            CliCommand::Cancel(RequestId::parse(UUID)?)
+        );
+        assert_eq!(parse(&["hello"])?, CliCommand::Submit("hello".into()));
+        assert!(parse(&["gateway", "telegram"]).is_err());
+        assert!(parse(&["--session", "x", "hello"]).is_err());
+        assert!(parse(&["--stream", "hello"]).is_err());
 
         Ok(())
     }
 
-    #[test]
-    fn parses_update_command() -> Result<()> {
-        let command = CliCommand::parse(["update"].map(String::from))?;
+    #[tokio::test]
+    async fn verified_final_is_acked_before_metadata_becomes_terminal() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let bundle = BundleId::new();
+        let delivery = DeliveryId::new();
+        let expected_request = request.clone();
+        let expected_bundle = bundle.clone();
+        let expected_delivery = delivery.clone();
+        let server = tokio::spawn(async move {
+            let (mut operation, _) = listener.accept().await?;
+            let request_frame = FrameReader::new(&mut operation)
+                .read_client_request()
+                .await?;
+            assert!(
+                matches!(request_frame.body, ClientRequestBody::Resume { request_id } if request_id == expected_request)
+            );
+            let events = encode_bundle(
+                &ResultBundle {
+                    id: expected_bundle.clone(),
+                    request_id: expected_request.clone(),
+                    state: BundleState::Delivered,
+                    manifest: BundleManifest {
+                        entries: vec![],
+                        sha256: String::new(),
+                    },
+                    deliveries: vec![(
+                        expected_delivery.clone(),
+                        FinalPayload::Text {
+                            text: "done".into(),
+                        },
+                    )],
+                },
+                true,
+            )?;
+            let mut writer = FrameWriter::new(&mut operation);
+            for event in events {
+                writer.write_server_event(&event).await?;
+            }
 
-        assert_eq!(command, CliCommand::Update);
+            let (mut ack, _) = listener.accept().await?;
+            let ack = FrameReader::new(&mut ack).read_client_request().await?;
+            assert!(
+                matches!(ack.body, ClientRequestBody::AckFinal { request_id, bundle_id, delivery_ids }
+                if request_id == expected_request && bundle_id == expected_bundle && delivery_ids == vec![expected_delivery])
+            );
+            anyhow::Ok(())
+        });
 
+        let metadata_root = temp_root();
+        let metadata = RequestMetadataStore::new(metadata_root.clone());
+        metadata.create(&request, 1, "secret")?;
+        metadata.set_state(&request, RequestMetadataState::Accepted)?;
+        let client = LocalIpcClient::new(socket.clone());
+        let stream = client.resume(request.clone()).await?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut recovery = Vec::new();
+        drive_operation(
+            &client,
+            &request,
+            stream,
+            &metadata,
+            &mut renderer,
+            &mut recovery,
+            pending(),
+        )
+        .await?;
+        server.await??;
+        assert_eq!(
+            metadata.load(&request)?.unwrap().state,
+            RequestMetadataState::Terminal
+        );
+        assert_eq!(String::from_utf8(renderer.into_inner())?, "done\n");
+        assert!(recovery.is_empty());
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
         Ok(())
     }
 
-    #[test]
-    fn parses_session_command() -> Result<()> {
-        let command = CliCommand::parse(["--session", "work", "hello"].map(String::from))?;
-
+    #[tokio::test]
+    async fn eof_keeps_metadata_nonterminal_and_prints_exact_resume_command() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let server = tokio::spawn(async move {
+            let (mut operation, _) = listener.accept().await?;
+            FrameReader::new(&mut operation)
+                .read_client_request()
+                .await?;
+            anyhow::Ok(())
+        });
+        let metadata_root = temp_root();
+        let metadata = RequestMetadataStore::new(metadata_root.clone());
+        metadata.create(&request, 1, "secret")?;
+        metadata.set_state(&request, RequestMetadataState::SentUnconfirmed)?;
+        let client = LocalIpcClient::new(socket.clone());
+        let stream = client.resume(request.clone()).await?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut recovery = Vec::new();
+        drive_operation(
+            &client,
+            &request,
+            stream,
+            &metadata,
+            &mut renderer,
+            &mut recovery,
+            pending(),
+        )
+        .await?;
+        server.await??;
         assert_eq!(
-            command,
-            CliCommand::Session {
-                session_id: "work".to_string(),
-                query: "hello".to_string(),
-            }
+            metadata.load(&request)?.unwrap().state,
+            RequestMetadataState::SentUnconfirmed
         );
-
+        assert_eq!(
+            String::from_utf8(recovery)?,
+            format!("codrik resume {request}\n")
+        );
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
         Ok(())
     }
 
-    #[test]
-    fn parses_streaming_session_command() -> Result<()> {
-        let command =
-            CliCommand::parse(["--stream", "--session", "work", "hello"].map(String::from))?;
-
+    #[tokio::test]
+    async fn interrupt_closes_connection_without_sending_cancel() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let server = tokio::spawn(async move {
+            let (mut operation, _) = listener.accept().await?;
+            FrameReader::new(&mut operation)
+                .read_client_request()
+                .await?;
+            let mut remainder = Vec::new();
+            operation.read_to_end(&mut remainder).await?;
+            assert!(remainder.is_empty());
+            anyhow::Ok(())
+        });
+        let metadata_root = temp_root();
+        let metadata = RequestMetadataStore::new(metadata_root.clone());
+        metadata.create(&request, 1, "secret")?;
+        metadata.set_state(&request, RequestMetadataState::Accepted)?;
+        let client = LocalIpcClient::new(socket.clone());
+        let stream = client.resume(request.clone()).await?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut recovery = Vec::new();
+        drive_operation(
+            &client,
+            &request,
+            stream,
+            &metadata,
+            &mut renderer,
+            &mut recovery,
+            async {},
+        )
+        .await?;
+        server.await??;
         assert_eq!(
-            command,
-            CliCommand::StreamingSession {
-                session_id: "work".to_string(),
-                query: "hello".to_string(),
-            }
+            metadata.load(&request)?.unwrap().state,
+            RequestMetadataState::Accepted
         );
-
+        assert_eq!(
+            String::from_utf8(recovery)?,
+            format!("codrik resume {request}\n")
+        );
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
         Ok(())
     }
 
-    #[test]
-    fn parses_one_shot_query() -> Result<()> {
-        let command = CliCommand::parse(["hello"].map(String::from))?;
-
-        assert_eq!(
-            command,
-            CliCommand::OneShot {
-                query: "hello".to_string()
-            }
-        );
-
-        Ok(())
+    fn temp_socket() -> PathBuf {
+        PathBuf::from("/tmp").join(format!("c11-cli-{}.sock", uuid::Uuid::new_v4()))
     }
 
-    #[test]
-    fn parses_streaming_one_shot_query() -> Result<()> {
-        let command = CliCommand::parse(["--stream", "hello"].map(String::from))?;
-
-        assert_eq!(
-            command,
-            CliCommand::StreamingOneShot {
-                query: "hello".to_string()
-            }
-        );
-
-        Ok(())
+    fn temp_root() -> PathBuf {
+        std::env::temp_dir().join(format!("codrik-cli-metadata-{}", uuid::Uuid::new_v4()))
     }
 }
