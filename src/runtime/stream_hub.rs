@@ -40,7 +40,8 @@ pub struct StreamHub {
 }
 
 struct HubInner {
-    subscriptions: Mutex<HashMap<RequestId, Vec<(u64, Weak<SubscriptionState>)>>>,
+    subscriptions: Mutex<StreamEntries>,
+    delivery_subscriptions: Mutex<DeliveryEntries>,
     next_subscription_id: AtomicU64,
     queued_bytes: AtomicUsize,
     event_limit: usize,
@@ -49,12 +50,21 @@ struct HubInner {
     subscription_changes: watch::Sender<u64>,
 }
 
+type StreamEntries = HashMap<RequestId, Vec<(u64, Weak<SubscriptionState>)>>;
+type DeliveryEntries = HashMap<RequestId, Vec<(u64, Weak<DeliverySubscriptionState>)>>;
+
 struct SubscriptionState {
     queue: Mutex<SubscriptionQueue>,
     notify: tokio::sync::Notify,
     hub: Weak<HubInner>,
     connected: AtomicBool,
     delivery_sink: Option<Arc<dyn BundleDeliverySink>>,
+}
+
+struct DeliverySubscriptionState {
+    hub: Weak<HubInner>,
+    connected: AtomicBool,
+    sink: Arc<dyn BundleDeliverySink>,
 }
 
 struct SubscriptionQueue {
@@ -73,6 +83,12 @@ pub struct StreamSubscription {
     request_id: RequestId,
     id: u64,
     state: Arc<SubscriptionState>,
+}
+
+pub struct DeliverySubscription {
+    request_id: RequestId,
+    id: u64,
+    state: Arc<DeliverySubscriptionState>,
 }
 
 impl Default for StreamHub {
@@ -99,6 +115,7 @@ impl StreamHub {
         Self {
             inner: Arc::new(HubInner {
                 subscriptions: Mutex::new(HashMap::new()),
+                delivery_subscriptions: Mutex::new(HashMap::new()),
                 next_subscription_id: AtomicU64::new(1),
                 queued_bytes: AtomicUsize::new(0),
                 event_limit,
@@ -119,6 +136,37 @@ impl StreamHub {
         delivery_sink: Arc<dyn BundleDeliverySink>,
     ) -> Result<StreamSubscription, Infallible> {
         self.subscribe_inner(request_id, Some(delivery_sink))
+    }
+
+    pub fn subscribe_delivery(
+        &self,
+        request_id: RequestId,
+        delivery_sink: Arc<dyn BundleDeliverySink>,
+    ) -> Result<DeliverySubscription, Infallible> {
+        let id = self
+            .inner
+            .next_subscription_id
+            .fetch_add(1, Ordering::Relaxed);
+        let state = Arc::new(DeliverySubscriptionState {
+            hub: Arc::downgrade(&self.inner),
+            connected: AtomicBool::new(true),
+            sink: delivery_sink,
+        });
+        self.inner
+            .delivery_subscriptions
+            .lock()
+            .expect("delivery subscriptions poisoned")
+            .entry(request_id.clone())
+            .or_default()
+            .push((id, Arc::downgrade(&state)));
+        self.inner
+            .subscription_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Ok(DeliverySubscription {
+            request_id,
+            id,
+            state,
+        })
     }
 
     fn subscribe_inner(
@@ -183,6 +231,30 @@ impl StreamHub {
         live
     }
 
+    fn delivery_subscribers(&self, request: &RequestId) -> Vec<Arc<DeliverySubscriptionState>> {
+        let mut subscriptions = self
+            .inner
+            .delivery_subscriptions
+            .lock()
+            .expect("delivery subscriptions poisoned");
+        let Some(entries) = subscriptions.get_mut(request) else {
+            return Vec::new();
+        };
+        let mut live = Vec::with_capacity(entries.len());
+        entries.retain(|(_, state)| {
+            if let Some(state) = state.upgrade() {
+                live.push(state);
+                true
+            } else {
+                false
+            }
+        });
+        if entries.is_empty() {
+            subscriptions.remove(request);
+        }
+        live
+    }
+
     fn publish(&self, requests: &[RequestId], body: PublishedBody<'_>) {
         for request in requests {
             for subscriber in self.subscribers(request) {
@@ -203,7 +275,7 @@ impl DeliveryRegistry for StreamHub {
             entries.retain(|(_, state)| state.strong_count() > 0);
             !entries.is_empty()
         });
-        subscriptions
+        let mut requests = subscriptions
             .iter()
             .filter_map(|(request, entries)| {
                 entries
@@ -215,11 +287,32 @@ impl DeliveryRegistry for StreamHub {
                     })
                     .then(|| request.clone())
             })
-            .collect()
+            .collect::<std::collections::HashSet<_>>();
+        let mut delivery = self
+            .inner
+            .delivery_subscriptions
+            .lock()
+            .expect("delivery subscriptions poisoned");
+        delivery.retain(|_, entries| {
+            entries.retain(|(_, state)| state.strong_count() > 0);
+            !entries.is_empty()
+        });
+        requests.extend(delivery.iter().filter_map(|(request, entries)| {
+            entries
+                .iter()
+                .any(|(_, state)| {
+                    state
+                        .upgrade()
+                        .is_some_and(|state| state.connected.load(Ordering::Acquire))
+                })
+                .then(|| request.clone())
+        }));
+        requests.into_iter().collect()
     }
 
     fn snapshot(&self, request: &RequestId) -> Vec<Arc<dyn BundleDeliverySink>> {
-        self.subscribers(request)
+        let mut sinks = self
+            .subscribers(request)
             .into_iter()
             .filter_map(|state| {
                 state
@@ -228,7 +321,18 @@ impl DeliveryRegistry for StreamHub {
                     .then(|| state.delivery_sink.clone())
                     .flatten()
             })
-            .collect()
+            .collect::<Vec<_>>();
+        sinks.extend(
+            self.delivery_subscribers(request)
+                .into_iter()
+                .filter_map(|state| {
+                    state
+                        .connected
+                        .load(Ordering::Acquire)
+                        .then(|| state.sink.clone())
+                }),
+        );
+        sinks
     }
 
     fn subscribe_changes(&self) -> watch::Receiver<u64> {
@@ -387,6 +491,23 @@ impl Drop for StreamSubscription {
     }
 }
 
+impl Drop for DeliverySubscription {
+    fn drop(&mut self) {
+        self.state.connected.store(false, Ordering::Release);
+        if let Some(hub) = self.state.hub.upgrade()
+            && let Ok(mut subscriptions) = hub.delivery_subscriptions.lock()
+            && let Some(entries) = subscriptions.get_mut(&self.request_id)
+        {
+            entries.retain(|(id, _)| *id != self.id);
+            if entries.is_empty() {
+                subscriptions.remove(&self.request_id);
+            }
+            hub.subscription_changes
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+}
+
 impl Drop for SubscriptionState {
     fn drop(&mut self) {
         let queue = self.queue.lock().expect("stream subscription poisoned");
@@ -459,6 +580,36 @@ mod tests {
             second.recv().await.unwrap().body,
             ServerEventBody::TextDelta { delta, .. } if delta == "hello"
         ));
+    }
+
+    #[test]
+    fn delivery_only_subscription_uses_no_transient_queue_budget() {
+        let hub = StreamHub::with_limits(2, 8, 8);
+        let request = request();
+        let sink = Arc::new(RecordingDeliverySink::default());
+        let _delivery = hub.subscribe_delivery(request.clone(), sink).unwrap();
+
+        hub.publish_text(std::slice::from_ref(&request), "far larger than queue");
+
+        assert_eq!(
+            hub.inner
+                .queued_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(DeliveryRegistry::snapshot(&hub, &request).len(), 1);
+    }
+
+    #[test]
+    fn dropping_delivery_only_subscription_removes_delivery_membership() {
+        let hub = StreamHub::default();
+        let request = request();
+        let delivery = hub
+            .subscribe_delivery(request.clone(), Arc::new(RecordingDeliverySink::default()))
+            .unwrap();
+        assert_eq!(DeliveryRegistry::snapshot(&hub, &request).len(), 1);
+        drop(delivery);
+        assert!(DeliveryRegistry::snapshot(&hub, &request).is_empty());
     }
 
     #[tokio::test]

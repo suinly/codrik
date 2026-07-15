@@ -293,28 +293,42 @@ impl LocalIngressStore for SqliteRuntimeStore {
             .call(move |connection| -> Result<Option<LocalRequestRecord>> {
                 connection
                     .query_row(
-                        "SELECT request_id, actor_id, work_item_id, state, result_bundle_id
-                         FROM local_requests WHERE request_id = ?1",
+                        "SELECT local_requests.request_id, local_requests.actor_id,
+                                local_requests.event_id, events.mailbox_sequence,
+                                local_requests.work_item_id, local_requests.state,
+                                local_requests.result_bundle_id, result_bundles.state
+                         FROM local_requests
+                         JOIN events ON events.id = local_requests.event_id
+                         LEFT JOIN result_bundles ON result_bundles.id = local_requests.result_bundle_id
+                         WHERE local_requests.request_id = ?1",
                         [id.as_str()],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
                                 row.get::<_, Option<String>>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                                row.get::<_, Option<String>>(7)?,
                             ))
                         },
                     )
                     .optional()?
-                    .map(|(request_id, actor_id, work_item_id, state, bundle_id)| {
+                    .map(|(request_id, actor_id, event_id, sequence, work_item_id, state, bundle_id, bundle_state)| {
                         Ok(LocalRequestRecord {
                             request_id: RequestId::parse(&request_id)?,
                             actor_id: ActorId::from_string(actor_id),
+                            event_id: EventId::from_string(event_id),
+                            sequence,
                             work_item_id: work_item_id.map(WorkItemId::from_string),
                             state: decode_local_request_state(&state)?,
                             result_bundle_id: bundle_id
                                 .map(|id| BundleId::parse(&id))
+                                .transpose()?,
+                            result_bundle_state: bundle_state
+                                .map(|state| decode_bundle_state(&state))
                                 .transpose()?,
                         })
                     })
@@ -402,6 +416,18 @@ fn decode_local_request_state(value: &str) -> Result<LocalRequestState> {
         "cancelled" => Ok(LocalRequestState::Cancelled),
         "failed_terminal" => Ok(LocalRequestState::FailedTerminal),
         other => bail!("unknown local request state: {other}"),
+    }
+}
+
+fn decode_bundle_state(value: &str) -> Result<crate::runtime::model::BundleState> {
+    use crate::runtime::model::BundleState;
+    match value {
+        "pending" => Ok(BundleState::Pending),
+        "delivering" => Ok(BundleState::Delivering),
+        "delivered" => Ok(BundleState::Delivered),
+        "failed_retryable" => Ok(BundleState::FailedRetryable),
+        "failed_terminal" => Ok(BundleState::FailedTerminal),
+        other => bail!("unknown result bundle state: {other}"),
     }
 }
 

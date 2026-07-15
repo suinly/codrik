@@ -286,9 +286,12 @@ pub struct CancelOutcome {
 pub struct LocalRequestRecord {
     pub request_id: RequestId,
     pub actor_id: ActorId,
+    pub event_id: EventId,
+    pub sequence: i64,
     pub work_item_id: Option<WorkItemId>,
     pub state: LocalRequestState,
     pub result_bundle_id: Option<BundleId>,
+    pub result_bundle_state: Option<BundleState>,
 }
 
 #[async_trait]

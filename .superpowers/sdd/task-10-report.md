@@ -24,24 +24,43 @@ Slow/incomplete-frame tests subsequently exposed that protocol errors were
 incorrectly waiting behind the delivery gate; the fix routes protocol errors
 through the control-write boundary.
 
+Post-review RED regressions then reproduced the remaining lifecycle and
+security defects:
+
+- active Resume timed out without `Accepted`, pending terminal Resume returned
+  `missing_result`, and detached active requests never observed durable rebind;
+- Resume allocated a transient queue and consumed the global byte budget;
+- the accept loop returned while a handler was blocked between accept and
+  connection registration;
+- nested writable/symlink ancestors passed path validation;
+- stale cleanup followed the configured pathname after its parent was renamed;
+- integrated commit/rollback races, detached duplicates, Cancel, and ACK lacked
+  server-level wire coverage.
+
 ## GREEN implementation
 
-- `InstanceLock` opens the lock with `O_NOFOLLOW | O_CLOEXEC`, validates the
-  direct parent and opened file using `symlink_metadata`/`fstat` ownership and
-  permission data, and uses `fs2::FileExt::try_lock_exclusive`. Its stale-path
-  API is available only while holding the lock and removes only an actual Unix
-  socket, never a regular file, directory, or symlink.
-- Security helpers create mode-`0700` directories, reject symlinks,
-  wrong-effective-UID ownership, and group/world-writable directories. Socket
-  binding is performed under a serialized `0077` umask window, then explicitly
-  set and verified as owner-mode `0600` before conversion to a Tokio listener.
+- `InstanceLock::acquire(lock, socket)` requires both configured names to be
+  direct children of one effective-UID-owned mode-`0700` runtime directory.
+  It holds that directory fd, opens the exact mode-`0600` lock through
+  `openat(O_NOFOLLOW)`, and uses `fs2::FileExt::try_lock_exclusive`. Cleanup has
+  no caller-supplied path: it validates the bound socket name with
+  `fstatat(AT_SYMLINK_NOFOLLOW)` and removes it with `unlinkat` on the held fd.
+  An unrelated same-UID socket or replacement parent pathname is never removed.
+- Security helpers atomically request mode `0700` through `DirBuilderExt` under
+  a serialized `0077` umask and require an existing managed runtime directory
+  to have exact mode `0700`. Validation walks every normalized absolute path
+  component with `symlink_metadata`, rejecting nested symlinks, unsafe owners,
+  and writable ancestors; root-owned sticky system temp ancestry is the sole
+  explicit writable exception. Socket binding runs under the same restrictive
+  umask and verifies owner-mode `0600` before Tokio can accept.
 - `PeerCredentials` is injectable. Production reads Linux `SO_PEERCRED` or
   macOS `getpeereid`; `AuthorizedUnixStream` compares the peer UID with
   `geteuid` before any frame bytes are read.
 - `LocalIpcServer` acquires one of exactly 64 permits before `accept` and before
   spawning a handler. The 65th connection remains unhandled until a permit is
-  released. Each handler decodes exactly one operation and monitors the read
-  half for EOF or a second operation so abandoned clients release permits.
+  released, and proceeds after an earlier connection closes. Each handler
+  decodes exactly one operation and monitors the read half for EOF or a second
+  operation so abandoned clients release permits.
 - The existing protocol reader/writer supplies 5-second header, 30-second body,
   and 30-second write deadlines. Malformed, incomplete, and slow frames receive
   a typed protocol error when possible and then cross the explicit close/abort
@@ -56,22 +75,33 @@ through the control-write boundary.
   concurrent duplicate Submit joins the first registration before performing
   its idempotent durable ingress call. Resume joins the same watch entry before
   durable lookup.
-- Submit installs stream and delivery subscriptions before ingress, writes
-  `Accepted` first for new/attached durable work, then forwards transient and
-  final events. Resume installs only a delivery sink and wakes the Task 9 worker
-  through the existing registry change notification. Terminal Resume uses the
-  Task 9 read-only replay path. Cancel emits `CancelAccepted`; ACK delegates the
-  exact `BundleAck` and closes after success.
-- Active connections are tracked without persistence dependencies. Server
-  shutdown stops accepting, sends `ServerShuttingDown` with a typed request ID
-  and resume command when known, and explicitly aborts the socket sink.
+- `LocalRequestRecord` now carries its durable event ID, mailbox sequence, and
+  joined bundle state. Active Resume emits `Accepted` with the real work item
+  and sequence. Detached active Resume/duplicate Submit poll durable state until
+  a real rebind can be announced or terminal delivery becomes available.
+  Pending, delivering, and retryable terminal requests retain a delivery-only
+  connection for the worker; only delivered bundles use read-only replay.
+- `StreamHub::subscribe_delivery` stores only sink membership and notification
+  state. It allocates no transient queue and consumes none of Task 7's per-
+  subscription or global transient byte budget. Submit retains its combined
+  transient/delivery subscription.
+- Cancel emits exact `CancelAccepted`; ACK delegates the exact `BundleAck` and
+  closes after success. Integrated frame tests cover both.
+- Every accepted handler is owned by the server's `JoinSet`, including the
+  accept-to-registration window. Shutdown stops acceptance, broadcasts
+  `ServerShuttingDown` to registered sinks, aborts full handler futures (read
+  and write halves), drains all tasks, and returns only after permits and
+  subscriptions are released.
 
 ## Verification
 
-- `rtk cargo test runtime::instance_lock::tests` — 3 passed.
-- `rtk cargo test runtime::ipc::security::tests` — 3 passed.
-- `rtk cargo test runtime::ipc::server::tests` — 9 passed.
-- `rtk cargo test` — 369 passed, 1 ignored.
+- `rtk cargo test runtime::instance_lock::tests` — 6 passed.
+- `rtk cargo test runtime::ipc::security::tests` — 6 passed.
+- `rtk cargo test runtime::ipc::server::tests` — 20 passed.
+- `rtk cargo test runtime::stream_hub::tests` — 10 passed.
+- `rtk cargo test runtime::outbox_worker::tests` — 17 passed.
+- `rtk cargo test runtime::sqlite::local_ingress::tests` — 9 passed.
+- `rtk cargo test` — 388 passed, 1 ignored.
 - `rtk cargo check` — passed; the existing crate-wide unused/dead-code warning
   baseline remains until production composition in Task 12.
 - `rtk cargo fmt --check` — passed.
@@ -89,11 +119,14 @@ through the control-write boundary.
 - Final delivery and transient events share one serialized writer. Task 9
   snapshot/ACK semantics are unchanged: ACK uses a separate one-operation
   connection, and a first ACK does not cancel already-started snapshot sends.
-- Resume intentionally does not replay transient events. An active Resume holds
-  only a delivery subscription until client EOF; a terminal Resume delegates
-  retained replay to `OutboxWorker`.
-- Submit duplicate rows whose detached work item is no longer present take the
-  durable replay path directly. Protocol v1 has no duplicate event and its
-  `Accepted` shape requires a work item ID, so no identifier is fabricated.
+- Resume intentionally does not replay transient events. It owns only a
+  delivery subscription; active work receives a real durable `Accepted`, while
+  terminal pending work remains registered until worker delivery or EOF.
+- No work item ID is fabricated for detached requests. The connection observes
+  durable rebind and emits `Accepted` only when a real ID exists, or transitions
+  to pending/replay delivery according to joined bundle state.
+- Commit and rollback races assert that Resume never queries durable state while
+  a matching Submit transaction is in flight. Commit produces matching exact
+  `Accepted` frames; rollback produces `missing_request` only after completion.
 - Grace-period coordination, component lease shutdown, production composition,
   CLI behavior, and signal ownership remain Task 12/11 scope and were not added.
