@@ -49,7 +49,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                                     row.get::<_, String>(0)?,
                                     row.get::<_, String>(1)?,
                                     row.get::<_, String>(2)?,
-                                    row.get::<_, String>(3)?,
+                                    row.get::<_, Option<String>>(3)?,
                                     row.get::<_, i64>(4)?,
                                 ))
                             },
@@ -59,7 +59,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                     if stored_actor == actor.as_str() && prompt_sha256 == command.prompt_sha256 {
                         return Ok(LocalSubmitOutcome::Duplicate {
                             event_id: EventId::from_string(event_id),
-                            work_item_id: WorkItemId::from_string(work_item_id),
+                            work_item_id: work_item_id.map(WorkItemId::from_string),
                             sequence,
                         });
                     }
@@ -184,7 +184,7 @@ impl LocalIngressStore for SqliteRuntimeStore {
                         "SELECT work_item_id, state FROM local_requests
                          WHERE request_id = ?1 AND actor_id = ?2",
                         params![command.request_id.as_str(), actor.as_str()],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
                     )
                     .optional()?
                     .ok_or_else(|| anyhow!("local request was not found for actor"))?;
@@ -195,6 +195,35 @@ impl LocalIngressStore for SqliteRuntimeStore {
                         already_terminal: true,
                     });
                 }
+                let work_item_id = match work_item_id {
+                    Some(work_item_id) => work_item_id,
+                    None => {
+                        let work_item_id = WorkItemId::new().to_string();
+                        transaction.execute(
+                            "INSERT INTO work_items(
+                                id, actor_id, kind, audience_kind, audience_address,
+                                state, created_at, updated_at
+                             ) VALUES (?1, ?2, 'interactive', 'actor_private', NULL,
+                                       'ready', ?3, ?3)",
+                            params![work_item_id, actor.as_str(), now.0],
+                        )?;
+                        transaction.execute(
+                            "UPDATE events SET work_item_id = ?2, updated_at = ?3
+                             WHERE id = (SELECT event_id FROM local_requests WHERE request_id = ?1)
+                               AND work_item_id IS NULL AND state = 'pending'",
+                            params![command.request_id.as_str(), work_item_id, now.0],
+                        )?;
+                        let changed = transaction.execute(
+                            "UPDATE local_requests SET work_item_id = ?2, updated_at = ?3
+                             WHERE request_id = ?1 AND work_item_id IS NULL AND state = 'active'",
+                            params![command.request_id.as_str(), work_item_id, now.0],
+                        )?;
+                        if changed != 1 {
+                            bail!("detached local request changed during cancellation");
+                        }
+                        work_item_id
+                    }
+                };
                 transaction.execute(
                     "UPDATE work_items
                      SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?2),
@@ -378,6 +407,27 @@ fn decode_local_request_state(value: &str) -> Result<LocalRequestState> {
 
 #[cfg(test)]
 impl SqliteRuntimeStore {
+    async fn detach_local_request_for_test(&self, request_id: &RequestId) -> Result<()> {
+        let request_id = request_id.clone();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "UPDATE events SET work_item_id = NULL, run_id = NULL
+                     WHERE id = (SELECT event_id FROM local_requests WHERE request_id = ?1)",
+                    [request_id.as_str()],
+                )?;
+                transaction.execute(
+                    "UPDATE local_requests SET work_item_id = NULL WHERE request_id = ?1",
+                    [request_id.as_str()],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
     async fn actor_event_sequence_counts(&self, actor: &ActorId) -> Result<(i64, i64)> {
         let actor = actor.clone();
         self.connection
@@ -544,7 +594,7 @@ mod tests {
                 .await?,
             LocalSubmitOutcome::Duplicate {
                 event_id: crate::runtime::model::EventId::from_string(event_id),
-                work_item_id: crate::runtime::model::WorkItemId::from_string(work_item_id),
+                work_item_id: Some(crate::runtime::model::WorkItemId::from_string(work_item_id)),
                 sequence,
             }
         );
@@ -554,6 +604,70 @@ mod tests {
                 .await?,
             LocalSubmitOutcome::Conflict
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_submit_remains_idempotent_while_request_is_detached() -> Result<()> {
+        let (store, actor) = store_with_actor(true).await?;
+        let request = RequestId::new();
+        let (event_id, _, sequence) = accepted(
+            store
+                .submit_for_actor(
+                    &actor,
+                    submission(request.clone(), "detached", 'd'),
+                    Timestamp(1),
+                )
+                .await?,
+        );
+        store.detach_local_request_for_test(&request).await?;
+
+        assert_eq!(
+            store
+                .submit_for_actor(&actor, submission(request, "detached", 'd'), Timestamp(2),)
+                .await?,
+            LocalSubmitOutcome::Duplicate {
+                event_id: crate::runtime::model::EventId::from_string(event_id),
+                work_item_id: None,
+                sequence,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_rebinds_an_active_detached_request() -> Result<()> {
+        let (store, actor) = store_with_actor(true).await?;
+        let request = RequestId::new();
+        let (_, old_work, _) = accepted(
+            store
+                .submit_for_actor(
+                    &actor,
+                    submission(request.clone(), "detached", 'e'),
+                    Timestamp(1),
+                )
+                .await?,
+        );
+        store.detach_local_request_for_test(&request).await?;
+
+        let outcome = store
+            .cancel_for_actor(
+                &actor,
+                LocalCancel {
+                    cancel_id: CancelId::new(),
+                    request_id: request.clone(),
+                },
+                Timestamp(2),
+            )
+            .await?;
+        assert_eq!(outcome.affected_request_ids, vec![request.clone()]);
+        let rebound = store
+            .resolve_local_request(&request)
+            .await?
+            .unwrap()
+            .work_item_id
+            .unwrap();
+        assert_ne!(rebound.to_string(), old_work);
         Ok(())
     }
 

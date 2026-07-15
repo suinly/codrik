@@ -804,7 +804,7 @@ mod tests {
     use crate::{
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         runtime::{
-            model::{ActorId, Audience, CancelId, RequestId, Timestamp},
+            model::{ActorId, Audience, CancelId, ManualClock, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
                 ControlStore, DispatchStore, FailureFence, FailureStore, IngressStore, LocalCancel,
@@ -919,7 +919,12 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .record_failure(&FailureFence::from(&run), "retry", Timestamp(12))
+            .record_failure(
+                &FailureFence::from(&run),
+                "retry",
+                crate::runtime::store::QuantumProgress::None,
+                &ManualClock::new(12),
+            )
             .await
             .unwrap();
         store.release_lease(&lease).await.unwrap();

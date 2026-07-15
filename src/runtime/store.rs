@@ -49,14 +49,15 @@ pub enum FailureDisposition {
 
 #[async_trait]
 pub trait FailureStore: Send + Sync {
-    async fn record_failure(
+    async fn record_failure<C: Clock>(
         &self,
         fence: &FailureFence,
         error: &str,
-        now: Timestamp,
+        progress: QuantumProgress,
+        clock: &C,
     ) -> Result<FailureDisposition>;
 
-    async fn record_progress(&self, fence: &FailureFence, now: Timestamp) -> Result<()>;
+    async fn record_progress<C: Clock>(&self, fence: &FailureFence, clock: &C) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -267,7 +268,7 @@ pub enum LocalSubmitOutcome {
     },
     Duplicate {
         event_id: EventId,
-        work_item_id: WorkItemId,
+        work_item_id: Option<WorkItemId>,
         sequence: i64,
     },
     Conflict,

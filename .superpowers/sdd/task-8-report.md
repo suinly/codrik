@@ -122,3 +122,54 @@ Correction verification:
 - `rtk cargo fmt --check` — passed.
 - `rtk cargo clippy --all-targets --all-features` — 0 errors; existing warnings remain.
 - `rtk git diff --check` — passed.
+
+## Second Review Correction
+
+The second review correction preserves the explicit fresh-database policy for
+this unreleased single-user branch. Historical migration files define the final
+fresh schema; existing development databases and sessions will be deleted
+manually. No schema v3 or forward compatibility migration was added.
+
+Progress is now monotonic within a runner quantum. If a model checkpoint or
+known tool outcome commits and a later step fails, the runner passes that
+progress into the failure transition. One lease-fenced immediate transaction
+then resets the earlier failure history and records the new error as failure
+one, avoiding a separately committed reset and its crash gap. Production tests
+cover both model-checkpoint followed by tool-start failure and known-tool
+outcome followed by a later model failure after four seeded failures; both
+persist a one-second retry with no terminal bundle.
+
+Failure fences now compare actor ID, owner, generation, and the exact stored
+lease expiry token, plus run/work identity, lease generation, and compatible
+current states. The clock is sampled independently inside every busy-retry
+attempt. Same-owner renewal/reacquisition tests reject old expiry tokens, and
+real SQLite contention tests prove that progress and fifth-failure writes become
+stale when retry delay crosses lease expiry. Runner heartbeat renewal refreshes
+the in-memory run and failure fence before further bookkeeping.
+
+Detached local requests are a fully supported durable state. Duplicate submit
+decodes and returns an optional work ID. Cancellation of an active detached
+request atomically creates a fresh ready work item, rebinds the original event
+and local request, freezes the cancellation targets, and attaches the cancel
+event to that work. Direct duplicate, cancellation, resolution, and subsequent
+dispatch-rebind paths are covered.
+
+The tool-step limit now applies to both newly prepared calls and recovered
+prepared attempts. Completed outcomes are checkpointed before a budget yield;
+unexecuted attempts retain their original durable IDs for later quanta. Tests
+cover a zero budget across recovery and three calls resumed one per quantum,
+with no over-execution or duplicate attempt IDs.
+
+Second-correction verification:
+
+- `rtk cargo test runtime::sqlite::failures::tests` — 7 passed.
+- `rtk cargo test runtime::runner::tests` — 18 passed.
+- `rtk cargo test runtime::sqlite::local_ingress::tests` — 9 passed.
+- `rtk cargo test runtime::sqlite::dispatch::tests` — 9 passed.
+- `rtk cargo test runtime::sqlite::checkpoint::tests` — 13 passed.
+- `rtk cargo test runtime::sqlite::retry::tests` — 5 passed.
+- `rtk cargo test` — 327 passed, 1 ignored.
+- `rtk cargo check` — passed with existing crate-wide warnings.
+- `rtk cargo fmt --check` — passed.
+- `rtk cargo clippy --all-targets --all-features` — 0 errors; warnings remain.
+- `rtk git diff --check` — passed.

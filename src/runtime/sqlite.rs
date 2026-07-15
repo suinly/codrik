@@ -22,6 +22,8 @@ const SERVE_MIGRATION: &str = include_str!("migrations/0002_serve.sql");
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
     connection: Connection,
+    #[cfg(test)]
+    fail_next_tool_start: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn map_call_error(error: tokio_rusqlite::Error<anyhow::Error>) -> anyhow::Error {
@@ -83,7 +85,17 @@ impl SqliteRuntimeStore {
             .map_err(map_call_error)
             .context("failed to initialize runtime database")?;
 
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            #[cfg(test)]
+            fail_next_tool_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_tool_start_for_test(&self) {
+        self.fail_next_tool_start
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]

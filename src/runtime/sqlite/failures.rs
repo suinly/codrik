@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 
 use crate::runtime::{
-    model::{ActorId, Audience, LocalRequestState, OutboxId, RequestId, RunId, Timestamp},
+    model::{ActorId, Audience, Clock, LocalRequestState, OutboxId, RequestId, RunId, Timestamp},
     sqlite::{
         SqliteRuntimeStore,
         checkpoint::{TerminalBundleContext, create_terminal_bundles},
@@ -11,36 +11,46 @@ use crate::runtime::{
         retry::call_with_busy_retry,
     },
     store::{
-        FailureDisposition, FailureFence, FailureStore, NewOutboxIntent, OutboxPayload, StaleLease,
+        FailureDisposition, FailureFence, FailureStore, NewOutboxIntent, OutboxPayload,
+        QuantumProgress, StaleLease,
     },
 };
 
 #[async_trait]
 impl FailureStore for SqliteRuntimeStore {
-    async fn record_failure(
+    async fn record_failure<C: Clock>(
         &self,
         fence: &FailureFence,
         error: &str,
-        now: Timestamp,
+        progress: QuantumProgress,
+        clock: &C,
     ) -> Result<FailureDisposition> {
         let store = self.clone();
         let fence = fence.clone();
         let error = error.to_owned();
+        let clock = clock.clone();
         call_with_busy_retry(move || {
             let store = store.clone();
             let fence = fence.clone();
             let error = error.clone();
+            let clock = clock.clone();
             async move {
+                let now = clock.now();
                 store.connection.call(move |connection| -> Result<FailureDisposition> {
                     let transaction = connection.transaction_with_behavior(
                         tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                     )?;
                     ensure_failure_fence(&transaction, &fence, now, true)?;
-                    let failure_count = transaction.query_row(
+                    let prior_failure_count = transaction.query_row(
                         "SELECT failure_count FROM work_items WHERE id = ?1 AND state = 'ready'",
                         [fence.work_item_id.as_str()],
                         |row| row.get::<_, i64>(0),
-                    ).optional()?.ok_or_else(|| anyhow!("work item does not exist"))? + 1;
+                    ).optional()?.ok_or_else(|| anyhow!("work item does not exist"))?;
+                    let failure_count = if progress == QuantumProgress::None {
+                        prior_failure_count + 1
+                    } else {
+                        1
+                    };
                     if failure_count < 5 {
                         let delay = 1_i64 << (failure_count - 1);
                         let retry_at = now.plus_millis(delay * 1_000);
@@ -140,13 +150,16 @@ impl FailureStore for SqliteRuntimeStore {
         }).await
     }
 
-    async fn record_progress(&self, fence: &FailureFence, now: Timestamp) -> Result<()> {
+    async fn record_progress<C: Clock>(&self, fence: &FailureFence, clock: &C) -> Result<()> {
         let store = self.clone();
         let fence = fence.clone();
+        let clock = clock.clone();
         call_with_busy_retry(move || {
             let store = store.clone();
             let fence = fence.clone();
+            let clock = clock.clone();
             async move {
+                let now = clock.now();
                 store.connection.call(move |connection| -> Result<()> {
                     let transaction = connection.transaction_with_behavior(
                         tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
@@ -176,10 +189,15 @@ fn ensure_failure_fence(
            JOIN runs ON runs.actor_id = actor_leases.actor_id
            JOIN work_items ON work_items.id = runs.work_item_id
            WHERE actor_leases.actor_id = ?1 AND actor_leases.owner_id = ?2
-             AND actor_leases.generation = ?3 AND actor_leases.expires_at > ?4
+             AND actor_leases.generation = ?3 AND actor_leases.expires_at = ?8
+             AND actor_leases.expires_at > ?4
              AND runs.id = ?5 AND runs.work_item_id = ?6
              AND runs.lease_generation = ?3
-             AND (?7 = 0 OR (runs.state = 'active' AND work_items.state = 'ready'))
+             AND (
+               (runs.state = 'active' AND work_items.state = 'ready')
+               OR (?7 = 0 AND runs.state = work_items.state
+                   AND runs.state IN ('completed', 'cancelled'))
+             )
          )",
         params![
             fence.lease.actor_id.as_str(),
@@ -189,6 +207,7 @@ fn ensure_failure_fence(
             fence.run_id.as_str(),
             fence.work_item_id.as_str(),
             require_active,
+            fence.lease.expires_at.0,
         ],
         |row| row.get(0),
     )?;
@@ -209,6 +228,30 @@ fn decode_audience(kind: &str, address: Option<String>) -> Result<Audience> {
 
 #[cfg(test)]
 impl SqliteRuntimeStore {
+    pub(crate) async fn failure_probe_for_test(
+        &self,
+        work: &crate::runtime::model::WorkItemId,
+    ) -> Result<(i64, String, Option<i64>, i64)> {
+        let work = work.clone();
+        self.connection
+            .call(
+                move |connection| -> Result<(i64, String, Option<i64>, i64)> {
+                    Ok(connection.query_row(
+                        "SELECT failure_count, state, next_attempt_at,
+                            (SELECT count(*) FROM result_bundles
+                             WHERE request_id IN (
+                               SELECT request_id FROM local_requests WHERE work_item_id = ?1
+                             ))
+                     FROM work_items WHERE id = ?1",
+                        [work.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?)
+                },
+            )
+            .await
+            .map_err(map_call_error)
+    }
+
     async fn work_state_for_test(
         &self,
         work: &crate::runtime::model::WorkItemId,
@@ -229,20 +272,90 @@ impl SqliteRuntimeStore {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use anyhow::Result;
+
     use crate::{
         auth::{LegacyActor, LegacyAuthorizationSnapshot},
         runtime::{
-            model::{ActorId, LocalRequestState, RequestId, Timestamp},
+            model::{ActorId, LocalRequestState, ManualClock, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
                 BundleStore, CheckpointRun, CheckpointStore, DispatchStore, FailureDisposition,
                 FailureFence, FailureStore, FinalizeRun, LocalIngressStore, LocalSubmission,
-                NewOutboxIntent, OutboxPayload, RuntimeAuthorizationStore,
+                NewOutboxIntent, OutboxPayload, QuantumProgress, RuntimeAuthorizationStore,
             },
         },
     };
 
     fn requires_failure_store<T: FailureStore>() {}
+
+    async fn locked_failure_fixture(
+        name: &str,
+    ) -> (
+        SqliteRuntimeStore,
+        tokio_rusqlite::Connection,
+        FailureFence,
+        ManualClock,
+    ) {
+        let path =
+            std::env::temp_dir().join(format!("codrik-{name}-{}.sqlite3", uuid::Uuid::new_v4()));
+        let store = SqliteRuntimeStore::open(&path).await.unwrap();
+        let actor = ActorId::from_string(format!("actor:{name}"));
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: actor.to_string(),
+                        enabled: true,
+                        tools: vec!["*".into()],
+                        identities: vec![],
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: RequestId::new(),
+                    text: "hello".into(),
+                    prompt_sha256: "c".repeat(64),
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(100))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        let locker = tokio_rusqlite::Connection::open(path).await.unwrap();
+        locker
+            .call(|connection| -> Result<()> {
+                connection.busy_timeout(Duration::ZERO)?;
+                connection.execute_batch("BEGIN IMMEDIATE")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (
+            store,
+            locker,
+            FailureFence::from(&run),
+            ManualClock::new(50),
+        )
+    }
 
     #[test]
     fn sqlite_store_implements_failure_store() {
@@ -310,7 +423,12 @@ mod tests {
         for (index, delay) in [1_000, 2_000, 4_000, 8_000].into_iter().enumerate() {
             assert_eq!(
                 store
-                    .record_failure(&fence, "transient", Timestamp(100))
+                    .record_failure(
+                        &fence,
+                        "transient",
+                        QuantumProgress::None,
+                        &ManualClock::new(100),
+                    )
                     .await
                     .unwrap(),
                 FailureDisposition::RetryAt(Timestamp(100 + delay)),
@@ -318,10 +436,14 @@ mod tests {
                 index + 1,
             );
         }
-        store.record_progress(&fence, Timestamp(150)).await.unwrap();
         assert_eq!(
             store
-                .record_failure(&fence, "after-progress", Timestamp(160))
+                .record_failure(
+                    &fence,
+                    "after-progress",
+                    QuantumProgress::ModelCheckpoint,
+                    &ManualClock::new(160),
+                )
                 .await
                 .unwrap(),
             FailureDisposition::RetryAt(Timestamp(1_160)),
@@ -329,13 +451,23 @@ mod tests {
         // Restore the fourth consecutive failure before exercising the fifth-failure policy.
         for now in [161, 162, 163] {
             let _ = store
-                .record_failure(&fence, "transient", Timestamp(now))
+                .record_failure(
+                    &fence,
+                    "transient",
+                    QuantumProgress::None,
+                    &ManualClock::new(now),
+                )
                 .await
                 .unwrap();
         }
         assert_eq!(
             store
-                .record_failure(&fence, "terminal", Timestamp(200))
+                .record_failure(
+                    &fence,
+                    "terminal",
+                    QuantumProgress::None,
+                    &ManualClock::new(200),
+                )
                 .await
                 .unwrap(),
             FailureDisposition::Terminalized,
@@ -416,7 +548,12 @@ mod tests {
         let fence = FailureFence::from(&run);
         for attempt in 0..5 {
             let _ = store
-                .record_failure(&fence, "failed", Timestamp(20 + attempt))
+                .record_failure(
+                    &fence,
+                    "failed",
+                    QuantumProgress::None,
+                    &ManualClock::new(20 + attempt),
+                )
                 .await
                 .unwrap();
         }
@@ -523,7 +660,12 @@ mod tests {
         let old_fence = FailureFence::from(&old_run);
         for attempt in 0..4 {
             let _ = store
-                .record_failure(&old_fence, "failed", Timestamp(13 + attempt))
+                .record_failure(
+                    &old_fence,
+                    "failed",
+                    QuantumProgress::None,
+                    &ManualClock::new(13 + attempt),
+                )
                 .await
                 .unwrap();
         }
@@ -540,7 +682,7 @@ mod tests {
             .unwrap();
         let new_fence = FailureFence::from(&new_run);
         store
-            .record_progress(&new_fence, Timestamp(9_002))
+            .record_progress(&new_fence, &ManualClock::new(9_002))
             .await
             .unwrap();
         store
@@ -565,13 +707,18 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .record_progress(&old_fence, Timestamp(9_004))
+                .record_progress(&old_fence, &ManualClock::new(9_004))
                 .await
                 .is_err()
         );
         assert!(
             store
-                .record_failure(&old_fence, "stale fifth", Timestamp(9_004))
+                .record_failure(
+                    &old_fence,
+                    "stale fifth",
+                    QuantumProgress::None,
+                    &ManualClock::new(9_004),
+                )
                 .await
                 .is_err()
         );
@@ -590,6 +737,170 @@ mod tests {
                 .unwrap()
                 .state,
             LocalRequestState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn same_owner_renewal_invalidates_the_previous_expiry_token() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let actor = ActorId::from_string("actor:renewed-fence");
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: actor.to_string(),
+                        enabled: true,
+                        tools: vec!["*".into()],
+                        identities: vec![],
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: RequestId::new(),
+                    text: "hello".into(),
+                    prompt_sha256: "b".repeat(64),
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("same-owner", Timestamp(10), Timestamp(100))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_fence = FailureFence::from(&run);
+        let renewed = store
+            .renew_lease(&lease, Timestamp(20), Timestamp(200))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .record_progress(&stale_fence, &ManualClock::new(21))
+                .await
+                .is_err()
+        );
+        run.lease = renewed;
+        let renewed_fence = FailureFence::from(&run);
+        store
+            .record_progress(&renewed_fence, &ManualClock::new(21))
+            .await
+            .unwrap();
+
+        let reacquired = store
+            .acquire_ready_actor("same-owner", Timestamp(201), Timestamp(300))
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = store
+            .attach_next_run(&reacquired, 8, Timestamp(202))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .record_progress(&renewed_fence, &ManualClock::new(202))
+                .await
+                .is_err()
+        );
+        store
+            .record_progress(&FailureFence::from(&replacement), &ManualClock::new(202))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_retry_that_crosses_expiry_rejects_progress() {
+        let (store, locker, fence, clock) = locked_failure_fixture("busy-progress-expiry").await;
+        let advance_clock = clock.clone();
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            advance_clock.advance(51);
+            locker
+                .call(|connection| -> Result<()> {
+                    connection.execute_batch("ROLLBACK")?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(store.record_progress(&fence, &clock), release);
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .failure_probe_for_test(&fence.work_item_id)
+                .await
+                .unwrap()
+                .0,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_retry_that_crosses_expiry_cannot_apply_fifth_failure() {
+        let (store, locker, fence, clock) = locked_failure_fixture("busy-fifth-expiry").await;
+        // Release the lock temporarily to seed four failures under the exact fence.
+        locker
+            .call(|connection| -> Result<()> {
+                connection.execute_batch("ROLLBACK")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for now in 50..54 {
+            store
+                .record_failure(
+                    &fence,
+                    "seed",
+                    QuantumProgress::None,
+                    &ManualClock::new(now),
+                )
+                .await
+                .unwrap();
+        }
+        locker
+            .call(|connection| -> Result<()> {
+                connection.execute_batch("BEGIN IMMEDIATE")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let advance_clock = clock.clone();
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            advance_clock.advance(51);
+            locker
+                .call(|connection| -> Result<()> {
+                    connection.execute_batch("ROLLBACK")?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            store.record_failure(&fence, "fifth", QuantumProgress::None, &clock),
+            release
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .failure_probe_for_test(&fence.work_item_id)
+                .await
+                .unwrap(),
+            (4, "ready".into(), Some(8_053), 0)
         );
     }
 }

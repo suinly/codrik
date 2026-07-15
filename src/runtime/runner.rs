@@ -162,10 +162,15 @@ where
             .await?;
 
         let context = RunContext::new();
+        let mut tool_steps = 0;
         for attempt in self.store.unresolved_attempts(&run).await? {
             let recovery = self.store.recover_attempt(&attempt.id).await?;
             let outcome = match recovery {
                 AttemptRecovery::MayInvoke => {
+                    if tool_steps >= self.limits.max_tool_steps {
+                        return Ok(RunOnceOutcome::Yielded);
+                    }
+                    tool_steps += 1;
                     self.store
                         .mark_attempt_running(&run, &attempt.id, self.clock.now())
                         .await?;
@@ -254,11 +259,10 @@ where
                     self.clock.now(),
                 )
                 .await?;
-            *progress = QuantumProgress::KnownToolOutcome;
+            advance_progress(progress, QuantumProgress::KnownToolOutcome);
             messages.extend(recovered_messages);
         }
         let mut signal_receiver = self.signals.subscribe(&lease.actor_id).await;
-        let mut tool_steps = 0;
         for _ in 0..self.limits.max_model_steps {
             if let Some(control) = self
                 .store
@@ -270,7 +274,7 @@ where
                         self.store
                             .cancel_run(&run, &control, self.clock.now())
                             .await?;
-                        *progress = QuantumProgress::Finalized;
+                        advance_progress(progress, QuantumProgress::Finalized);
                         self.events
                             .publish_activity(&run.request_ids, AgentActivityEvent::Cancelled);
                         Ok(RunOnceOutcome::Cancelled)
@@ -305,6 +309,8 @@ where
                                     now.plus_millis(duration_millis(self.limits.lease_duration)?),
                                 )
                                 .await?;
+                            run.lease = current_lease.clone();
+                            *failure_fence = Some(FailureFence::from(&run));
                         }
                         changed = signal_receiver.changed() => {
                             if changed.is_err() {
@@ -318,7 +324,7 @@ where
                                 return match control.kind {
                                     EventKind::CancelRequested => {
                                         self.store.cancel_run(&run, &control, self.clock.now()).await?;
-                                        *progress = QuantumProgress::Finalized;
+                                        advance_progress(progress, QuantumProgress::Finalized);
                                         self.events.publish_activity(
                                             &run.request_ids,
                                             AgentActivityEvent::Cancelled,
@@ -357,7 +363,7 @@ where
                     .await?
                 {
                     FinalizeOutcome::Completed => {
-                        *progress = QuantumProgress::Finalized;
+                        advance_progress(progress, QuantumProgress::Finalized);
                         self.events
                             .publish_activity(&run.request_ids, AgentActivityEvent::Completed);
                         return Ok(RunOnceOutcome::Completed);
@@ -365,7 +371,11 @@ where
                     FinalizeOutcome::Preempted { .. } => {
                         run = self
                             .store
-                            .attach_next_run(lease, self.limits.max_events, self.clock.now())
+                            .attach_next_run(
+                                &current_lease,
+                                self.limits.max_events,
+                                self.clock.now(),
+                            )
                             .await?
                             .ok_or_else(|| anyhow::anyhow!("preempted run was not resumable"))?;
                         *failure_fence = Some(FailureFence::from(&run));
@@ -436,14 +446,16 @@ where
                     self.clock.now(),
                 )
                 .await?;
-            *progress = QuantumProgress::ModelCheckpoint;
+            advance_progress(progress, QuantumProgress::ModelCheckpoint);
             messages.push(assistant);
 
             let mut checkpoint_messages = Vec::new();
             let mut checkpointed_attempt_ids = Vec::new();
+            let mut budget_exhausted = false;
             for (tool_call, attempt) in prepared {
                 if tool_steps >= self.limits.max_tool_steps {
-                    return Ok(RunOnceOutcome::Yielded);
+                    budget_exhausted = true;
+                    break;
                 }
                 tool_steps += 1;
                 self.store
@@ -510,19 +522,24 @@ where
                 checkpointed_attempt_ids.push(attempt.id);
                 checkpoint_messages.push(Message::tool_result(tool_call.id, observation));
             }
-            self.store
-                .checkpoint_run(
-                    CheckpointRun {
-                        run: run.clone(),
-                        incorporated_event_ids: Vec::new(),
-                        checkpointed_attempt_ids,
-                        messages: checkpoint_messages.clone(),
-                    },
-                    self.clock.now(),
-                )
-                .await?;
-            *progress = QuantumProgress::KnownToolOutcome;
-            messages.extend(checkpoint_messages);
+            if !checkpointed_attempt_ids.is_empty() {
+                self.store
+                    .checkpoint_run(
+                        CheckpointRun {
+                            run: run.clone(),
+                            incorporated_event_ids: Vec::new(),
+                            checkpointed_attempt_ids,
+                            messages: checkpoint_messages.clone(),
+                        },
+                        self.clock.now(),
+                    )
+                    .await?;
+                advance_progress(progress, QuantumProgress::KnownToolOutcome);
+                messages.extend(checkpoint_messages);
+            }
+            if budget_exhausted {
+                return Ok(RunOnceOutcome::Yielded);
+            }
         }
         Ok(RunOnceOutcome::Yielded)
     }
@@ -565,7 +582,7 @@ where
             Ok(outcome) => {
                 let bookkeeping = if progress != QuantumProgress::None {
                     if let Some(fence) = fence.as_ref() {
-                        self.store.record_progress(fence, self.clock.now()).await
+                        self.store.record_progress(fence, &self.clock).await
                     } else {
                         Ok(())
                     }
@@ -585,7 +602,8 @@ where
                 .record_failure(
                     fence.as_ref().expect("checked above"),
                     &error.to_string(),
-                    self.clock.now(),
+                    progress,
+                    &self.clock,
                 )
                 .await
                 .map_err(QuantumFailure::AuthorityUnavailable)
@@ -607,6 +625,20 @@ where
 
 fn authority_error(error: &anyhow::Error) -> bool {
     crate::runtime::sqlite::is_authority_failure(error)
+}
+
+fn advance_progress(current: &mut QuantumProgress, committed: QuantumProgress) {
+    fn rank(progress: QuantumProgress) -> u8 {
+        match progress {
+            QuantumProgress::None => 0,
+            QuantumProgress::ModelCheckpoint => 1,
+            QuantumProgress::KnownToolOutcome => 2,
+            QuantumProgress::Finalized => 3,
+        }
+    }
+    if rank(committed) > rank(*current) {
+        *current = committed;
+    }
 }
 
 struct RuntimeLlmSink<'a> {
@@ -675,9 +707,9 @@ mod tests {
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
             store::{
-                AttemptOutcome, AttemptRecovery, DispatchStore, IngressStore, LocalIngressStore,
-                LocalSubmission, NewInboundEvent, OutboxPayload, QuantumProgress, QuantumRunner,
-                RuntimeAuthorizationStore, ToolAttemptStore,
+                AttemptOutcome, AttemptRecovery, CheckpointStore, DispatchStore, FailureStore,
+                IngressStore, LocalIngressStore, LocalSubmission, NewInboundEvent, OutboxPayload,
+                QuantumProgress, QuantumRunner, RuntimeAuthorizationStore, ToolAttemptStore,
             },
             stream_hub::{NoopRuntimeEventPublisher, StreamHub},
         },
@@ -789,6 +821,45 @@ mod tests {
     struct InjectingLlm {
         store: SqliteRuntimeStore,
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct ToolThenErrorLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolThenErrorLlm {
+        async fn generate(
+            &self,
+            _request: LlmRequest,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(LlmResponse {
+                    content: "tool first".into(),
+                    tool_calls: vec![LlmToolCall {
+                        id: "known-before-error".into(),
+                        name: "datetime".into(),
+                        arguments: "{}".into(),
+                    }],
+                })
+            } else {
+                anyhow::bail!("later model failure")
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for ToolThenErrorLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.generate(request, context).await
+        }
     }
 
     #[derive(Clone)]
@@ -1372,6 +1443,225 @@ mod tests {
         let replay = runner.run_quantum(&actor, "worker-2").await.unwrap();
         assert_eq!(initial.progress, QuantumProgress::None);
         assert_eq!(replay.progress, QuantumProgress::None);
+    }
+
+    #[tokio::test]
+    async fn zero_tool_budget_never_executes_prepared_calls_during_recovery() {
+        let store = store_with_text().await;
+        let tools = RecordingTools::default();
+        let attempts = tools.attempts.clone();
+        let mut initial_limits = RunnerLimits::default();
+        initial_limits.max_model_steps = 1;
+        initial_limits.max_tool_steps = 0;
+        let initial = ActorRunner::new(
+            ScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                    content: "queued".into(),
+                    tool_calls: vec![LlmToolCall {
+                        id: "zero-budget".into(),
+                        name: "datetime".into(),
+                        arguments: "{}".into(),
+                    }],
+                }]))),
+            },
+            tools.clone(),
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            initial_limits,
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+        initial
+            .run_quantum(&ActorId::from_string("actor:local:1"), "worker-1")
+            .await
+            .unwrap();
+
+        let mut recovery_limits = RunnerLimits::default();
+        recovery_limits.max_model_steps = 0;
+        recovery_limits.max_tool_steps = 0;
+        let recovery = ActorRunner::new(
+            FinalLlm,
+            tools,
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            recovery_limits,
+            test_artifacts(&store, ManualClock::new(1_001)),
+        );
+        recovery
+            .run_quantum(&ActorId::from_string("actor:local:1"), "worker-2")
+            .await
+            .unwrap();
+
+        assert!(attempts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_calls_resume_one_per_quantum_with_stable_attempt_ids() {
+        let store = store_with_text().await;
+        let tools = RecordingTools::default();
+        let attempts = tools.attempts.clone();
+        let mut initial_limits = RunnerLimits::default();
+        initial_limits.max_model_steps = 1;
+        initial_limits.max_tool_steps = 1;
+        let initial = ActorRunner::new(
+            ScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                    content: "three calls".into(),
+                    tool_calls: (0..3)
+                        .map(|index| LlmToolCall {
+                            id: format!("budget-{index}"),
+                            name: "datetime".into(),
+                            arguments: "{}".into(),
+                        })
+                        .collect(),
+                }]))),
+            },
+            tools.clone(),
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            initial_limits,
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+        initial
+            .run_quantum(&ActorId::from_string("actor:local:1"), "worker-1")
+            .await
+            .unwrap();
+        assert_eq!(attempts.lock().await.len(), 1);
+
+        for (quantum, expected) in [(2, 2), (3, 3), (4, 3)] {
+            let mut limits = RunnerLimits::default();
+            limits.max_model_steps = 0;
+            limits.max_tool_steps = 1;
+            let recovery = ActorRunner::new(
+                FinalLlm,
+                tools.clone(),
+                ActorSignals::default(),
+                Arc::new(NoopRuntimeEventPublisher),
+                limits,
+                test_artifacts(&store, ManualClock::new(1_000 + quantum)),
+            );
+            recovery
+                .run_quantum(
+                    &ActorId::from_string("actor:local:1"),
+                    &format!("worker-{quantum}"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(attempts.lock().await.len(), expected);
+        }
+        let attempts = attempts.lock().await;
+        assert_eq!(
+            attempts
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    async fn seed_four_failures(store: &SqliteRuntimeStore) -> crate::runtime::model::WorkItemId {
+        let lease = store
+            .acquire_ready_actor("seed", Timestamp(10), Timestamp(1_000))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .checkpoint_run(
+                crate::runtime::store::CheckpointRun {
+                    run: run.clone(),
+                    incorporated_event_ids: run.source_event_ids.clone(),
+                    checkpointed_attempt_ids: vec![],
+                    messages: vec![],
+                },
+                Timestamp(12),
+            )
+            .await
+            .unwrap();
+        for now in 100..104 {
+            store
+                .record_failure(
+                    &crate::runtime::store::FailureFence::from(&run),
+                    "seed failure",
+                    QuantumProgress::None,
+                    &ManualClock::new(now),
+                )
+                .await
+                .unwrap();
+        }
+        store.release_lease(&lease).await.unwrap();
+        run.work_item_id
+    }
+
+    #[tokio::test]
+    async fn model_checkpoint_then_tool_start_error_records_first_new_failure() {
+        let store = store_with_text().await;
+        let work = seed_four_failures(&store).await;
+        store.fail_next_tool_start_for_test();
+        let mut limits = RunnerLimits::default();
+        limits.max_model_steps = 1;
+        let runner = ActorRunner::new(
+            ScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                    content: "start tool".into(),
+                    tool_calls: vec![LlmToolCall {
+                        id: "tool-start-fails".into(),
+                        name: "datetime".into(),
+                        arguments: "{}".into(),
+                    }],
+                }]))),
+            },
+            RecordingTools::default(),
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            limits,
+            test_artifacts(&store, ManualClock::new(9_000)),
+        );
+
+        let failure = runner
+            .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            crate::runtime::store::QuantumFailure::RecoverableWork { .. }
+        ));
+        assert_eq!(
+            store.failure_probe_for_test(&work).await.unwrap(),
+            (1, "ready".into(), Some(10_000), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn known_tool_outcome_then_model_error_records_first_new_failure() {
+        let store = store_with_text().await;
+        let work = seed_four_failures(&store).await;
+        let mut limits = RunnerLimits::default();
+        limits.max_model_steps = 2;
+        let runner = ActorRunner::new(
+            ToolThenErrorLlm::default(),
+            RecordingTools::default(),
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            limits,
+            test_artifacts(&store, ManualClock::new(9_000)),
+        );
+
+        let failure = runner
+            .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            crate::runtime::store::QuantumFailure::RecoverableWork { .. }
+        ));
+        assert_eq!(
+            store.failure_probe_for_test(&work).await.unwrap(),
+            (1, "ready".into(), Some(10_000), 0)
+        );
     }
 
     #[tokio::test]

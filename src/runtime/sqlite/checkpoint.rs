@@ -285,6 +285,13 @@ impl ToolAttemptStore for SqliteRuntimeStore {
         id: &AttemptId,
         now: Timestamp,
     ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_tool_start
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("injected tool-start failure");
+        }
         transition_attempt(self, run, id, "prepared", "running", None, now).await
     }
 
