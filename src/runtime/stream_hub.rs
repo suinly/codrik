@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -12,8 +12,10 @@ use crate::{
     runtime::{
         ipc::protocol::{ActivityEvent, ServerEvent, ServerEventBody},
         model::RequestId,
+        outbox_worker::{BundleDeliverySink, DeliveryRegistry},
     },
 };
+use tokio::sync::watch;
 
 const DEFAULT_EVENTS_PER_SUBSCRIPTION: usize = 256;
 const DEFAULT_BYTES_PER_SUBSCRIPTION: usize = 512 * 1024;
@@ -44,12 +46,15 @@ struct HubInner {
     event_limit: usize,
     byte_limit: usize,
     global_byte_limit: usize,
+    subscription_changes: watch::Sender<u64>,
 }
 
 struct SubscriptionState {
     queue: Mutex<SubscriptionQueue>,
     notify: tokio::sync::Notify,
     hub: Weak<HubInner>,
+    connected: AtomicBool,
+    delivery_sink: Option<Arc<dyn BundleDeliverySink>>,
 }
 
 struct SubscriptionQueue {
@@ -99,11 +104,28 @@ impl StreamHub {
                 event_limit,
                 byte_limit,
                 global_byte_limit,
+                subscription_changes: watch::channel(0).0,
             }),
         }
     }
 
     pub fn subscribe(&self, request_id: RequestId) -> Result<StreamSubscription, Infallible> {
+        self.subscribe_inner(request_id, None)
+    }
+
+    pub fn subscribe_with_delivery_sink(
+        &self,
+        request_id: RequestId,
+        delivery_sink: Arc<dyn BundleDeliverySink>,
+    ) -> Result<StreamSubscription, Infallible> {
+        self.subscribe_inner(request_id, Some(delivery_sink))
+    }
+
+    fn subscribe_inner(
+        &self,
+        request_id: RequestId,
+        delivery_sink: Option<Arc<dyn BundleDeliverySink>>,
+    ) -> Result<StreamSubscription, Infallible> {
         let id = self
             .inner
             .next_subscription_id
@@ -117,6 +139,8 @@ impl StreamHub {
             }),
             notify: tokio::sync::Notify::new(),
             hub: Arc::downgrade(&self.inner),
+            connected: AtomicBool::new(true),
+            delivery_sink,
         });
         self.inner
             .subscriptions
@@ -125,6 +149,9 @@ impl StreamHub {
             .entry(request_id.clone())
             .or_default()
             .push((id, Arc::downgrade(&state)));
+        self.inner
+            .subscription_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(StreamSubscription {
             request_id,
             id,
@@ -162,6 +189,42 @@ impl StreamHub {
                 subscriber.enqueue(&self.inner, request, &body);
             }
         }
+    }
+}
+
+impl DeliveryRegistry for StreamHub {
+    fn subscribed_request_ids(&self) -> Vec<RequestId> {
+        let mut subscriptions = self
+            .inner
+            .subscriptions
+            .lock()
+            .expect("stream hub subscriptions poisoned");
+        subscriptions.retain(|_, entries| {
+            entries.retain(|(_, state)| {
+                state.upgrade().is_some_and(|state| {
+                    state.connected.load(Ordering::Acquire) && state.delivery_sink.is_some()
+                })
+            });
+            !entries.is_empty()
+        });
+        subscriptions.keys().cloned().collect()
+    }
+
+    fn snapshot(&self, request: &RequestId) -> Vec<Arc<dyn BundleDeliverySink>> {
+        self.subscribers(request)
+            .into_iter()
+            .filter_map(|state| {
+                state
+                    .connected
+                    .load(Ordering::Acquire)
+                    .then(|| state.delivery_sink.clone())
+                    .flatten()
+            })
+            .collect()
+    }
+
+    fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.inner.subscription_changes.subscribe()
     }
 }
 
@@ -215,6 +278,9 @@ impl PublishedBody<'_> {
 impl SubscriptionState {
     fn enqueue(&self, hub: &HubInner, request: &RequestId, body: &PublishedBody<'_>) {
         let mut queue = self.queue.lock().expect("stream subscription poisoned");
+        if !self.connected.load(Ordering::Acquire) {
+            return;
+        }
         if body.is_text() && queue.suppress_text {
             return;
         }
@@ -259,6 +325,10 @@ fn reserve_global_bytes(hub: &HubInner, bytes: usize) -> bool {
 }
 
 impl StreamSubscription {
+    pub fn delivery_sink(&self) -> Option<Arc<dyn BundleDeliverySink>> {
+        self.state.delivery_sink.clone()
+    }
+
     pub async fn recv(&mut self) -> Option<ServerEvent> {
         loop {
             let state = Arc::clone(&self.state);
@@ -287,6 +357,14 @@ impl StreamSubscription {
 
 impl Drop for StreamSubscription {
     fn drop(&mut self) {
+        {
+            let _queue = self
+                .state
+                .queue
+                .lock()
+                .expect("stream subscription poisoned");
+            self.state.connected.store(false, Ordering::Release);
+        }
         if let Some(hub) = self.state.hub.upgrade()
             && let Ok(mut subscriptions) = hub.subscriptions.lock()
             && let Some(entries) = subscriptions.get_mut(&self.request_id)
@@ -295,6 +373,8 @@ impl Drop for StreamSubscription {
             if entries.is_empty() {
                 subscriptions.remove(&self.request_id);
             }
+            hub.subscription_changes
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
     }
 }
@@ -325,17 +405,33 @@ fn activity_event(event: AgentActivityEvent) -> ActivityEvent {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use crate::{
         llm::client::AgentActivityEvent,
         runtime::{
-            ipc::protocol::ServerEventBody,
+            ipc::protocol::{ServerEvent, ServerEventBody},
             model::RequestId,
+            outbox_worker::{BundleDeliverySink, DeliveryRegistry},
             stream_hub::{RuntimeEventPublisher, StreamHub},
         },
     };
+    use anyhow::Result;
+    use async_trait::async_trait;
 
     fn request() -> RequestId {
         RequestId::new()
+    }
+
+    #[derive(Default)]
+    struct RecordingDeliverySink(Mutex<Vec<ServerEvent>>);
+
+    #[async_trait]
+    impl BundleDeliverySink for RecordingDeliverySink {
+        async fn send(&self, event: ServerEvent) -> Result<()> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -477,5 +573,39 @@ mod tests {
             subscription.recv().await.unwrap().body,
             ServerEventBody::StreamGap { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn delivery_registry_tracks_subscription_lifetime_and_preserves_terminal_events() {
+        let hub = StreamHub::with_limits(8, 4_096, 4_096);
+        let request = request();
+        let mut changes = hub.subscribe_changes();
+        let delivery = Arc::new(RecordingDeliverySink::default());
+        let subscription = hub
+            .subscribe_with_delivery_sink(request.clone(), delivery.clone())
+            .unwrap();
+        changes.changed().await.unwrap();
+
+        assert_eq!(hub.subscribed_request_ids(), vec![request.clone()]);
+        let sinks = hub.snapshot(&request);
+        assert_eq!(sinks.len(), 1);
+        sinks[0]
+            .send(ServerEvent::new(ServerEventBody::FinalEnd {
+                request_id: request.clone(),
+                bundle_id: crate::runtime::model::BundleId::new(),
+                manifest_sha256: "hash".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            delivery.0.lock().unwrap()[0].body,
+            ServerEventBody::FinalEnd { .. }
+        ));
+        assert!(subscription.delivery_sink().is_some());
+
+        drop(subscription);
+        changes.changed().await.unwrap();
+        assert!(hub.subscribed_request_ids().is_empty());
+        assert!(hub.snapshot(&request).is_empty());
     }
 }

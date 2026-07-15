@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod dispatcher;
 pub mod ipc;
 pub mod model;
+pub mod outbox_worker;
 pub mod runner;
 pub mod service;
 pub mod signals;

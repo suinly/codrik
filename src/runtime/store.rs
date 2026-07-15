@@ -466,6 +466,20 @@ pub struct BundleClaim {
 pub struct ClaimedBundle {
     pub claim: BundleClaim,
     pub bundle: ResultBundle,
+    pub attempt_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedBundleRef {
+    pub claim: BundleClaim,
+    pub request_id: RequestId,
+    pub attempt_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimedBundleLoad {
+    Loaded(ResultBundle),
+    FailedTerminal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -483,6 +497,14 @@ pub enum AckOutcome {
 
 #[async_trait]
 pub trait BundleStore: Send + Sync {
+    async fn claim_ready_bundle_refs(
+        &self,
+        owner: &str,
+        request_ids: &[RequestId],
+        now: Timestamp,
+        until: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<ClaimedBundleRef>>;
     async fn claim_ready_bundles(
         &self,
         owner: &str,
@@ -497,6 +519,11 @@ pub trait BundleStore: Send + Sync {
         now: Timestamp,
         until: Timestamp,
     ) -> Result<BundleClaim>;
+    async fn load_claimed_bundle(
+        &self,
+        claim: &BundleClaim,
+        now: Timestamp,
+    ) -> Result<ClaimedBundleLoad>;
     async fn load_bundle(&self, id: &BundleId) -> Result<ResultBundle>;
     async fn acknowledge_bundle(&self, ack: BundleAck, now: Timestamp) -> Result<AckOutcome>;
     async fn fail_bundle_retryable(
@@ -504,6 +531,12 @@ pub trait BundleStore: Send + Sync {
         claim: &BundleClaim,
         error: &str,
         next_attempt: Timestamp,
+        now: Timestamp,
+    ) -> Result<()>;
+    async fn fail_bundle_terminal(
+        &self,
+        claim: &BundleClaim,
+        error: &str,
         now: Timestamp,
     ) -> Result<()>;
     async fn replay_bundle(&self, request: &RequestId) -> Result<Option<ResultBundle>>;

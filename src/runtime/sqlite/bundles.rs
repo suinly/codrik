@@ -13,20 +13,21 @@ use crate::runtime::{
     sqlite::{SqliteRuntimeStore, map_call_error},
     store::{
         AckOutcome, BundleAck, BundleClaim, BundleManifest, BundleManifestEntry, BundleStore,
-        ClaimedBundle, FinalPayload, ManagedArtifact, OutboxPayload, ResultBundle,
+        ClaimedBundle, ClaimedBundleLoad, ClaimedBundleRef, FinalPayload, ManagedArtifact,
+        OutboxPayload, ResultBundle,
     },
 };
 
 #[async_trait]
 impl BundleStore for SqliteRuntimeStore {
-    async fn claim_ready_bundles(
+    async fn claim_ready_bundle_refs(
         &self,
         owner: &str,
         request_ids: &[RequestId],
         now: Timestamp,
         until: Timestamp,
         limit: usize,
-    ) -> Result<Vec<ClaimedBundle>> {
+    ) -> Result<Vec<ClaimedBundleRef>> {
         if owner.trim().is_empty() || until <= now {
             bail!("bundle claim requires an owner and a future expiry");
         }
@@ -37,7 +38,7 @@ impl BundleStore for SqliteRuntimeStore {
             .collect::<HashSet<_>>();
         let limit = limit.min(32);
         self.connection
-            .call(move |connection| -> Result<Vec<ClaimedBundle>> {
+            .call(move |connection| -> Result<Vec<ClaimedBundleRef>> {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
@@ -83,31 +84,54 @@ impl BundleStore for SqliteRuntimeStore {
                     if changed != 1 {
                         continue;
                     }
-                    match load_bundle_row(&transaction, &bundle_id) {
-                        Ok(bundle) => claimed.push(ClaimedBundle {
-                            claim: BundleClaim {
-                                bundle_id: bundle.id.clone(),
-                                owner: owner.clone(),
-                                expires_at: until,
-                            },
-                            bundle,
-                        }),
-                        Err(error) => {
-                            transaction.execute(
-                                "UPDATE result_bundles
-                                 SET state = 'failed_terminal', claim_owner = NULL,
-                                     claim_expires_at = NULL, last_error = ?2, updated_at = ?3
-                                 WHERE id = ?1",
-                                params![bundle_id, error.to_string(), now.0],
-                            )?;
-                        }
-                    }
+                    let attempt_count = transaction.query_row(
+                        "SELECT attempt_count FROM result_bundles WHERE id = ?1",
+                        [&bundle_id],
+                        |row| row.get(0),
+                    )?;
+                    claimed.push(ClaimedBundleRef {
+                        claim: BundleClaim {
+                            bundle_id: BundleId::parse(&bundle_id)?,
+                            owner: owner.clone(),
+                            expires_at: until,
+                        },
+                        request_id: RequestId::parse(&request_id)?,
+                        attempt_count,
+                    });
                 }
                 transaction.commit()?;
                 Ok(claimed)
             })
             .await
             .map_err(map_call_error)
+    }
+
+    async fn claim_ready_bundles(
+        &self,
+        owner: &str,
+        request_ids: &[RequestId],
+        now: Timestamp,
+        until: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<ClaimedBundle>> {
+        let claims = self
+            .claim_ready_bundle_refs(owner, request_ids, now, until, limit)
+            .await?;
+        let mut bundles = Vec::with_capacity(claims.len());
+        for claimed in claims {
+            match self.load_bundle(&claimed.claim.bundle_id).await {
+                Ok(bundle) => bundles.push(ClaimedBundle {
+                    claim: claimed.claim,
+                    bundle,
+                    attempt_count: claimed.attempt_count,
+                }),
+                Err(error) => {
+                    self.fail_bundle_terminal(&claimed.claim, &error.to_string(), now)
+                        .await?;
+                }
+            }
+        }
+        Ok(bundles)
     }
 
     async fn renew_bundle(
@@ -141,6 +165,54 @@ impl BundleStore for SqliteRuntimeStore {
                     expires_at: until,
                     ..claim
                 })
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn load_claimed_bundle(
+        &self,
+        claim: &BundleClaim,
+        now: Timestamp,
+    ) -> Result<ClaimedBundleLoad> {
+        let claim = claim.clone();
+        self.connection
+            .call(move |connection| -> Result<ClaimedBundleLoad> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                match load_bundle_row(&transaction, claim.bundle_id.as_str()) {
+                    Ok(bundle) => Ok(ClaimedBundleLoad::Loaded(bundle)),
+                    Err(error)
+                        if error
+                            .chain()
+                            .any(|cause| cause.is::<tokio_rusqlite::rusqlite::Error>()) =>
+                    {
+                        Err(error)
+                    }
+                    Err(error) => {
+                        let changed = transaction.execute(
+                            "UPDATE result_bundles
+                             SET state = 'failed_terminal', claim_owner = NULL,
+                                 claim_expires_at = NULL, next_attempt_at = NULL,
+                                 last_error = ?4, updated_at = ?3
+                             WHERE id = ?1 AND state = 'delivering' AND claim_owner = ?2
+                               AND claim_expires_at = ?5 AND claim_expires_at > ?3",
+                            params![
+                                claim.bundle_id.as_str(),
+                                claim.owner,
+                                now.0,
+                                error.to_string(),
+                                claim.expires_at.0
+                            ],
+                        )?;
+                        if changed != 1 {
+                            bail!("bundle claim is stale");
+                        }
+                        transaction.commit()?;
+                        Ok(ClaimedBundleLoad::FailedTerminal)
+                    }
+                }
             })
             .await
             .map_err(map_call_error)
@@ -301,6 +373,40 @@ impl BundleStore for SqliteRuntimeStore {
                 bundle_id
                     .map(|id| load_bundle_row(connection, &id))
                     .transpose()
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn fail_bundle_terminal(
+        &self,
+        claim: &BundleClaim,
+        error: &str,
+        now: Timestamp,
+    ) -> Result<()> {
+        let claim = claim.clone();
+        let error = error.to_owned();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                let changed = connection.execute(
+                    "UPDATE result_bundles
+                     SET state = 'failed_terminal', claim_owner = NULL,
+                         claim_expires_at = NULL, next_attempt_at = NULL,
+                         last_error = ?4, updated_at = ?3
+                     WHERE id = ?1 AND state = 'delivering' AND claim_owner = ?2
+                       AND claim_expires_at = ?5 AND claim_expires_at > ?3",
+                    params![
+                        claim.bundle_id.as_str(),
+                        claim.owner,
+                        now.0,
+                        error,
+                        claim.expires_at.0
+                    ],
+                )?;
+                if changed != 1 {
+                    bail!("bundle claim is stale");
+                }
+                Ok(())
             })
             .await
             .map_err(map_call_error)
