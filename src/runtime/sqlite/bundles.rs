@@ -13,8 +13,8 @@ use crate::runtime::{
     sqlite::{SqliteRuntimeStore, map_call_error},
     store::{
         AckOutcome, BundleAck, BundleClaim, BundleManifest, BundleManifestEntry, BundleStore,
-        ClaimedBundle, ClaimedBundleLoad, ClaimedBundleRef, FinalPayload, ManagedArtifact,
-        OutboxPayload, ResultBundle,
+        ClaimRenewal, ClaimTransition, ClaimedBundle, ClaimedBundleLoad, ClaimedBundleRef,
+        FinalPayload, ManagedArtifact, OutboxPayload, ResultBundle,
     },
 };
 
@@ -119,16 +119,15 @@ impl BundleStore for SqliteRuntimeStore {
             .await?;
         let mut bundles = Vec::with_capacity(claims.len());
         for claimed in claims {
-            match self.load_bundle(&claimed.claim.bundle_id).await {
-                Ok(bundle) => bundles.push(ClaimedBundle {
+            match self.load_claimed_bundle(&claimed.claim, now).await? {
+                ClaimedBundleLoad::Loaded(bundle) => bundles.push(ClaimedBundle {
                     claim: claimed.claim,
                     bundle,
                     attempt_count: claimed.attempt_count,
                 }),
-                Err(error) => {
-                    self.fail_bundle_terminal(&claimed.claim, &error.to_string(), now)
-                        .await?;
-                }
+                ClaimedBundleLoad::FailedTerminal
+                | ClaimedBundleLoad::Delivered
+                | ClaimedBundleLoad::Fenced => {}
             }
         }
         Ok(bundles)
@@ -139,13 +138,13 @@ impl BundleStore for SqliteRuntimeStore {
         claim: &BundleClaim,
         now: Timestamp,
         until: Timestamp,
-    ) -> Result<BundleClaim> {
+    ) -> Result<ClaimRenewal> {
         if until <= now {
             bail!("renewed bundle expiry must be in the future");
         }
         let claim = claim.clone();
         self.connection
-            .call(move |connection| -> Result<BundleClaim> {
+            .call(move |connection| -> Result<ClaimRenewal> {
                 let changed = connection.execute(
                     "UPDATE result_bundles SET claim_expires_at = ?4, updated_at = ?3
                      WHERE id = ?1 AND state = 'delivering' AND claim_owner = ?2
@@ -159,12 +158,12 @@ impl BundleStore for SqliteRuntimeStore {
                     ],
                 )?;
                 if changed != 1 {
-                    bail!("bundle claim is stale");
+                    return Ok(ClaimRenewal::Fenced);
                 }
-                Ok(BundleClaim {
+                Ok(ClaimRenewal::Renewed(BundleClaim {
                     expires_at: until,
                     ..claim
-                })
+                }))
             })
             .await
             .map_err(map_call_error)
@@ -181,6 +180,54 @@ impl BundleStore for SqliteRuntimeStore {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
+                let ownership = transaction
+                    .query_row(
+                        "SELECT result_bundles.state, result_bundles.claim_owner,
+                                result_bundles.claim_expires_at, result_bundles.request_id,
+                                local_requests.result_bundle_id
+                         FROM result_bundles
+                         LEFT JOIN local_requests
+                           ON local_requests.request_id = result_bundles.request_id
+                         WHERE result_bundles.id = ?1",
+                        [claim.bundle_id.as_str()],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<i64>>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((state, owner, expires_at, _request_id, reciprocal_bundle_id)) = ownership
+                else {
+                    return Ok(ClaimedBundleLoad::Fenced);
+                };
+                if state == "delivered" {
+                    return Ok(ClaimedBundleLoad::Delivered);
+                }
+                if state != "delivering"
+                    || owner.as_deref() != Some(claim.owner.as_str())
+                    || expires_at != Some(claim.expires_at.0)
+                    || expires_at.is_some_and(|expires_at| expires_at <= now.0)
+                {
+                    return Ok(ClaimedBundleLoad::Fenced);
+                }
+                if reciprocal_bundle_id.as_deref() != Some(claim.bundle_id.as_str()) {
+                    transaction.execute(
+                        "UPDATE result_bundles
+                         SET state = 'failed_terminal', claim_owner = NULL,
+                             claim_expires_at = NULL, next_attempt_at = NULL,
+                             last_error = 'request does not reciprocally own claimed bundle',
+                             updated_at = ?2
+                         WHERE id = ?1",
+                        params![claim.bundle_id.as_str(), now.0],
+                    )?;
+                    transaction.commit()?;
+                    return Ok(ClaimedBundleLoad::FailedTerminal);
+                }
                 match load_bundle_row(&transaction, claim.bundle_id.as_str()) {
                     Ok(bundle) => Ok(ClaimedBundleLoad::Loaded(bundle)),
                     Err(error)
@@ -328,11 +375,11 @@ impl BundleStore for SqliteRuntimeStore {
         error: &str,
         next_attempt: Timestamp,
         now: Timestamp,
-    ) -> Result<()> {
+    ) -> Result<ClaimTransition> {
         let claim = claim.clone();
         let error = error.to_owned();
         self.connection
-            .call(move |connection| -> Result<()> {
+            .call(move |connection| -> Result<ClaimTransition> {
                 let changed = connection.execute(
                     "UPDATE result_bundles
                      SET state = 'failed_retryable', claim_owner = NULL,
@@ -350,9 +397,9 @@ impl BundleStore for SqliteRuntimeStore {
                     ],
                 )?;
                 if changed != 1 {
-                    bail!("bundle claim is stale");
+                    return Ok(ClaimTransition::Fenced);
                 }
-                Ok(())
+                Ok(ClaimTransition::Applied)
             })
             .await
             .map_err(map_call_error)
@@ -577,9 +624,20 @@ fn validate_manifest_bytes(bytes: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+
     use crate::runtime::{
-        model::MAX_BUNDLE_DELIVERIES,
-        store::{AckOutcome, BundleAck, BundleStore, FinalPayload},
+        ipc::protocol::ServerEvent,
+        model::{MAX_BUNDLE_DELIVERIES, ManualClock},
+        outbox_worker::{BundleDeliverySink, OutboxWorker},
+        store::{
+            AckOutcome, BundleAck, BundleStore, ClaimRenewal, ClaimTransition, ClaimedBundleLoad,
+            FinalPayload,
+        },
+        stream_hub::StreamHub,
     };
 
     use super::*;
@@ -700,34 +758,239 @@ mod tests {
             .claim;
         let mut wrong_owner = claim.clone();
         wrong_owner.owner = "other-worker".into();
-        assert!(
+        assert_eq!(
             store
                 .renew_bundle(&wrong_owner, Timestamp(3), Timestamp(40))
                 .await
-                .is_err()
+                .unwrap(),
+            ClaimRenewal::Fenced
         );
         let mut wrong_expiry = claim.clone();
         wrong_expiry.expires_at = Timestamp(29);
-        assert!(
+        assert_eq!(
             store
                 .fail_bundle_retryable(&wrong_expiry, "stale", Timestamp(10), Timestamp(3))
                 .await
-                .is_err()
+                .unwrap(),
+            ClaimTransition::Fenced
         );
-        let renewed = store
+        let ClaimRenewal::Renewed(renewed) = store
             .renew_bundle(&claim, Timestamp(3), Timestamp(40))
             .await
-            .unwrap();
-        assert!(
+            .unwrap()
+        else {
+            panic!("live claim was fenced");
+        };
+        assert_eq!(
             store
                 .fail_bundle_retryable(&claim, "old fence", Timestamp(10), Timestamp(4))
                 .await
-                .is_err()
+                .unwrap(),
+            ClaimTransition::Fenced
         );
+        assert_eq!(
+            store
+                .fail_bundle_retryable(&renewed, "disconnect", Timestamp(10), Timestamp(4))
+                .await
+                .unwrap(),
+            ClaimTransition::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_returns_typed_fence_for_stale_owner() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "pending", 1, false).await.unwrap();
+        let claim = store
+            .claim_ready_bundle_refs(
+                "worker",
+                std::slice::from_ref(&seeded.request_id),
+                Timestamp(2),
+                Timestamp(30),
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .claim;
+        let mut stale = claim;
+        stale.owner = "other".into();
+        assert_eq!(
+            store
+                .renew_bundle(&stale, Timestamp(3), Timestamp(40))
+                .await
+                .unwrap(),
+            ClaimRenewal::Fenced
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_schema_failure_propagates_instead_of_returning_fenced() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "pending", 1, false).await.unwrap();
+        let claim = store
+            .claim_ready_bundle_refs(
+                "worker",
+                std::slice::from_ref(&seeded.request_id),
+                Timestamp(2),
+                Timestamp(30),
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .claim;
         store
-            .fail_bundle_retryable(&renewed, "disconnect", Timestamp(10), Timestamp(4))
+            .connection
+            .call(|connection| {
+                connection.execute_batch(
+                    "ALTER TABLE result_bundles RENAME TO unavailable_result_bundles",
+                )
+            })
             .await
             .unwrap();
+
+        assert!(
+            store
+                .renew_bundle(&claim, Timestamp(3), Timestamp(40))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_schema_failure_propagates_instead_of_returning_fenced() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "pending", 1, false).await.unwrap();
+        let claim = store
+            .claim_ready_bundle_refs(
+                "worker",
+                std::slice::from_ref(&seeded.request_id),
+                Timestamp(2),
+                Timestamp(30),
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .claim;
+        store
+            .connection
+            .call(|connection| {
+                connection.execute_batch(
+                    "ALTER TABLE result_bundles RENAME TO unavailable_result_bundles",
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .fail_bundle_retryable(&claim, "disconnect", Timestamp(10), Timestamp(3),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_load_requires_exact_live_claim_and_observes_ack_race() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "pending", 1, false).await.unwrap();
+        let claim = store
+            .claim_ready_bundle_refs(
+                "worker",
+                std::slice::from_ref(&seeded.request_id),
+                Timestamp(2),
+                Timestamp(30),
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .claim;
+        let mut wrong_owner = claim.clone();
+        wrong_owner.owner = "other".into();
+        assert_eq!(
+            store
+                .load_claimed_bundle(&wrong_owner, Timestamp(3))
+                .await
+                .unwrap(),
+            ClaimedBundleLoad::Fenced
+        );
+        let mut wrong_expiry = claim.clone();
+        wrong_expiry.expires_at = Timestamp(29);
+        assert_eq!(
+            store
+                .load_claimed_bundle(&wrong_expiry, Timestamp(3))
+                .await
+                .unwrap(),
+            ClaimedBundleLoad::Fenced
+        );
+        assert_eq!(
+            store
+                .load_claimed_bundle(&claim, Timestamp(30))
+                .await
+                .unwrap(),
+            ClaimedBundleLoad::Fenced
+        );
+        store
+            .acknowledge_bundle(seeded.ack(), Timestamp(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_claimed_bundle(&claim, Timestamp(4))
+                .await
+                .unwrap(),
+            ClaimedBundleLoad::Delivered
+        );
+    }
+
+    #[derive(Default)]
+    struct NoopDeliverySink;
+
+    #[async_trait]
+    impl BundleDeliverySink for NoopDeliverySink {
+        async fn send(&self, _event: ServerEvent) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_terminalizes_malformed_claimed_bundle_in_sqlite() {
+        let store = Arc::new(SqliteRuntimeStore::open_in_memory().await.unwrap());
+        let seeded = seed_bundle(&store, "pending", 2, false).await.unwrap();
+        let bundle_id = seeded.bundle_id.to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection
+                    .execute_batch("DROP TRIGGER outbox_deliveries_are_immutable_on_update;")?;
+                connection.execute(
+                    "UPDATE outbox_deliveries SET ordinal = 3
+                     WHERE bundle_id = ?1 AND ordinal = 1",
+                    [bundle_id],
+                )
+            })
+            .await
+            .unwrap();
+        let hub = Arc::new(StreamHub::default());
+        let _subscription = hub
+            .subscribe_with_delivery_sink(seeded.request_id.clone(), Arc::new(NoopDeliverySink))
+            .unwrap();
+
+        OutboxWorker::new(store.clone(), hub, ManualClock::new(10), "worker")
+            .run_once()
+            .await
+            .unwrap();
+        assert_eq!(
+            bundle_state(&store, &seeded.bundle_id).await,
+            "failed_terminal"
+        );
     }
 
     #[tokio::test]
@@ -766,17 +1029,19 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].bundle.id, expired.bundle_id);
         assert_eq!(claimed[0].claim.owner, "replacement");
-        assert!(
+        assert_eq!(
             store
                 .renew_bundle(&old_claim, Timestamp(32), Timestamp(70))
                 .await
-                .is_err()
+                .unwrap(),
+            ClaimRenewal::Fenced
         );
-        assert!(
+        assert_eq!(
             store
                 .fail_bundle_retryable(&old_claim, "stale worker", Timestamp(40), Timestamp(32))
                 .await
-                .is_err()
+                .unwrap(),
+            ClaimTransition::Fenced
         );
         assert_eq!(
             store.load_bundle(&live.bundle_id).await.unwrap().state,

@@ -9,7 +9,8 @@ use crate::runtime::{
     ipc::protocol::{ServerEvent, encode_bundle},
     model::{BundleState, Clock, RequestId},
     store::{
-        AckOutcome, BundleAck, BundleStore, ClaimedBundle, ClaimedBundleLoad, ClaimedBundleRef,
+        AckOutcome, BundleAck, BundleStore, ClaimRenewal, ClaimTransition, ClaimedBundle,
+        ClaimedBundleLoad, ClaimedBundleRef,
     },
 };
 
@@ -156,13 +157,9 @@ where
                         now,
                         now.plus_millis(CLAIM_MILLIS),
                     ).await {
-                        Ok(renewed) => claimed.claim = renewed,
-                        Err(_) => {
-                            match self.store.load_bundle(&claimed.claim.bundle_id).await {
-                                Ok(_) => return Ok(()),
-                                Err(error) => return Err(error),
-                            }
-                        }
+                        Ok(ClaimRenewal::Renewed(renewed)) => claimed.claim = renewed,
+                        Ok(ClaimRenewal::Fenced) => return Ok(()),
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -173,14 +170,9 @@ where
             .renew_bundle(&claimed.claim, now, now.plus_millis(CLAIM_MILLIS))
             .await
         {
-            Ok(claim) => claim,
-            Err(_) => {
-                return match self.store.load_bundle(&claimed.claim.bundle_id).await {
-                    Ok(bundle) if bundle.state == BundleState::Delivered => Ok(()),
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(error),
-                };
-            }
+            Ok(ClaimRenewal::Renewed(claim)) => claim,
+            Ok(ClaimRenewal::Fenced) => return Ok(()),
+            Err(error) => return Err(error),
         };
         let bundle = match self
             .store
@@ -188,7 +180,9 @@ where
             .await?
         {
             ClaimedBundleLoad::Loaded(bundle) => bundle,
-            ClaimedBundleLoad::FailedTerminal => return Ok(()),
+            ClaimedBundleLoad::FailedTerminal
+            | ClaimedBundleLoad::Delivered
+            | ClaimedBundleLoad::Fenced => return Ok(()),
         };
         let result = self
             .transmit(ClaimedBundle {
@@ -239,8 +233,8 @@ where
                 _ = renewal.tick() => {
                     let now = self.clock.now();
                     match self.store.renew_bundle(&claim, now, now.plus_millis(CLAIM_MILLIS)).await {
-                        Ok(renewed) => claim = renewed,
-                        Err(_) => {
+                        Ok(ClaimRenewal::Renewed(renewed)) => claim = renewed,
+                        Ok(ClaimRenewal::Fenced) => {
                             match self.store.load_bundle(&claim.bundle_id).await {
                                 Ok(bundle) if bundle.state == BundleState::Delivered => {}
                                 Ok(_) => {
@@ -250,6 +244,7 @@ where
                                 Err(error) => return Err(error),
                             }
                         }
+                        Err(error) => return Err(error),
                     }
                     continue;
                 }
@@ -319,14 +314,15 @@ where
                 _ = renewal.tick() => {
                     let now = self.clock.now();
                     match self.store.renew_bundle(&claim, now, now.plus_millis(CLAIM_MILLIS)).await {
-                        Ok(renewed) => claim = renewed,
-                        Err(_) => {
+                        Ok(ClaimRenewal::Renewed(renewed)) => claim = renewed,
+                        Ok(ClaimRenewal::Fenced) => {
                             return match self.store.load_bundle(&claim.bundle_id).await {
                                 Ok(bundle) if bundle.state == BundleState::Delivered => Ok(AckWait::Delivered),
                                 Ok(_) => Ok(AckWait::Fenced),
                                 Err(error) => Err(error),
                             };
                         }
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -336,9 +332,19 @@ where
     async fn retry(&self, claimed: ClaimedBundle, error: &str) -> Result<()> {
         let now = self.clock.now();
         let delay = retry_delay_seconds(claimed.attempt_count);
-        self.store
+        match self
+            .store
             .fail_bundle_retryable(&claimed.claim, error, now.plus_millis(delay * 1_000), now)
-            .await
+            .await?
+        {
+            ClaimTransition::Applied => Ok(()),
+            ClaimTransition::Fenced => match self.store.load_bundle(&claimed.claim.bundle_id).await
+            {
+                Ok(bundle) if bundle.state == BundleState::Delivered => Ok(()),
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            },
+        }
     }
 }
 
@@ -375,8 +381,9 @@ mod tests {
         ipc::protocol::{ServerEvent, ServerEventBody},
         model::{BundleId, BundleState, DeliveryId, ManualClock, RequestId, Timestamp},
         store::{
-            AckOutcome, BundleAck, BundleClaim, BundleManifest, BundleStore, ClaimedBundle,
-            ClaimedBundleLoad, ClaimedBundleRef, FinalPayload, ResultBundle,
+            AckOutcome, BundleAck, BundleClaim, BundleManifest, BundleStore, ClaimRenewal,
+            ClaimTransition, ClaimedBundle, ClaimedBundleLoad, ClaimedBundleRef, FinalPayload,
+            ResultBundle,
         },
     };
 
@@ -393,6 +400,11 @@ mod tests {
         replay_calls: AtomicUsize,
         acks: Mutex<Vec<BundleAck>>,
         auto_ack_on_load: AtomicBool,
+        active_claims: Mutex<HashMap<BundleId, BundleClaim>>,
+        renew_authority_error: AtomicBool,
+        retry_authority_error: AtomicBool,
+        ack_before_retry: AtomicBool,
+        ack_before_claimed_load: AtomicBool,
     }
 
     impl FakeStore {
@@ -414,6 +426,7 @@ mod tests {
             {
                 bundle.state = BundleState::Delivered;
             }
+            self.active_claims.lock().unwrap().remove(id);
         }
     }
 
@@ -443,7 +456,7 @@ mod tests {
             &self,
             owner: &str,
             request_ids: &[RequestId],
-            _now: Timestamp,
+            now: Timestamp,
             until: Timestamp,
             limit: usize,
         ) -> Result<Vec<ClaimedBundle>> {
@@ -467,6 +480,11 @@ mod tests {
                         bundle: bundle.clone(),
                         attempt_count: 1,
                     });
+                    let claim = claims.last().unwrap().claim.clone();
+                    self.active_claims
+                        .lock()
+                        .unwrap()
+                        .insert(claim.bundle_id.clone(), claim);
                 }
             }
             Ok(claims)
@@ -475,9 +493,12 @@ mod tests {
         async fn renew_bundle(
             &self,
             claim: &BundleClaim,
-            _now: Timestamp,
+            now: Timestamp,
             until: Timestamp,
-        ) -> Result<BundleClaim> {
+        ) -> Result<ClaimRenewal> {
+            if self.renew_authority_error.load(Ordering::SeqCst) {
+                bail!("simulated renewal authority failure");
+            }
             self.renewals.fetch_add(1, Ordering::SeqCst);
             *self
                 .renewals_by_bundle
@@ -485,24 +506,47 @@ mod tests {
                 .unwrap()
                 .entry(claim.bundle_id.clone())
                 .or_default() += 1;
-            if self.bundles.lock().unwrap().iter().any(|bundle| {
-                bundle.id == claim.bundle_id && bundle.state == BundleState::Delivered
-            }) {
-                bail!("bundle already delivered");
+            let mut claims = self.active_claims.lock().unwrap();
+            if claims.get(&claim.bundle_id) != Some(claim) || claim.expires_at <= now {
+                return Ok(ClaimRenewal::Fenced);
             }
-            Ok(BundleClaim {
+            let renewed = BundleClaim {
                 expires_at: until,
                 ..claim.clone()
-            })
+            };
+            claims.insert(claim.bundle_id.clone(), renewed.clone());
+            Ok(ClaimRenewal::Renewed(renewed))
         }
 
         async fn load_claimed_bundle(
             &self,
             claim: &BundleClaim,
-            _now: Timestamp,
+            now: Timestamp,
         ) -> Result<ClaimedBundleLoad> {
+            if self.ack_before_claimed_load.swap(false, Ordering::SeqCst) {
+                self.set_delivered(&claim.bundle_id);
+            }
+            if self.active_claims.lock().unwrap().get(&claim.bundle_id) != Some(claim)
+                || claim.expires_at <= now
+            {
+                return Ok(
+                    if self.bundles.lock().unwrap().iter().any(|bundle| {
+                        bundle.id == claim.bundle_id && bundle.state == BundleState::Delivered
+                    }) {
+                        ClaimedBundleLoad::Delivered
+                    } else {
+                        ClaimedBundleLoad::Fenced
+                    },
+                );
+            }
             Ok(ClaimedBundleLoad::Loaded(
-                self.load_bundle(&claim.bundle_id).await?,
+                self.bundles
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|bundle| bundle.id == claim.bundle_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing bundle"))?,
             ))
         }
 
@@ -512,12 +556,17 @@ mod tests {
                 .iter_mut()
                 .find(|bundle| &bundle.id == id)
                 .ok_or_else(|| anyhow::anyhow!("missing bundle"))?;
-            if self.auto_ack_on_load.load(Ordering::SeqCst)
-                && bundle.state == BundleState::Delivering
-            {
+            let auto_ack = self.auto_ack_on_load.load(Ordering::SeqCst)
+                && bundle.state == BundleState::Delivering;
+            if auto_ack {
                 bundle.state = BundleState::Delivered;
             }
-            Ok(bundle.clone())
+            let bundle = bundle.clone();
+            drop(bundles);
+            if auto_ack {
+                self.active_claims.lock().unwrap().remove(id);
+            }
+            Ok(bundle)
         }
 
         async fn acknowledge_bundle(&self, ack: BundleAck, _now: Timestamp) -> Result<AckOutcome> {
@@ -532,7 +581,18 @@ mod tests {
             _error: &str,
             next_attempt: Timestamp,
             now: Timestamp,
-        ) -> Result<()> {
+        ) -> Result<ClaimTransition> {
+            if self.retry_authority_error.load(Ordering::SeqCst) {
+                bail!("simulated retry authority failure");
+            }
+            if self.ack_before_retry.swap(false, Ordering::SeqCst) {
+                self.set_delivered(&claim.bundle_id);
+            }
+            let mut active = self.active_claims.lock().unwrap();
+            if active.get(&claim.bundle_id) != Some(claim) || claim.expires_at <= now {
+                return Ok(ClaimTransition::Fenced);
+            }
+            active.remove(&claim.bundle_id);
             self.retry_delays
                 .lock()
                 .unwrap()
@@ -546,7 +606,7 @@ mod tests {
             {
                 bundle.state = BundleState::FailedRetryable;
             }
-            Ok(())
+            Ok(ClaimTransition::Applied)
         }
 
         async fn fail_bundle_terminal(
@@ -962,6 +1022,124 @@ mod tests {
         result?;
         assert!(store.renewals.load(Ordering::SeqCst) >= 2);
         assert_eq!(*store.retry_delays.lock().unwrap(), vec![1_000]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn renewal_authority_failure_propagates_instead_of_becoming_a_fence() {
+        let store = FakeStore::with_bundles(1);
+        store.renew_authority_error.store(true, Ordering::SeqCst);
+        let registry = Arc::new(FakeRegistry::default());
+        registry.add(
+            store.bundles.lock().unwrap()[0].request_id.clone(),
+            Arc::new(RecordingSink::default()),
+        );
+
+        let error = worker(store, registry, ManualClock::new(0))
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("renewal authority failure"));
+    }
+
+    #[tokio::test]
+    async fn retry_authority_failure_propagates_instead_of_becoming_a_fence() {
+        let store = FakeStore::with_bundles(1);
+        store.retry_authority_error.store(true, Ordering::SeqCst);
+        let registry = Arc::new(FakeRegistry::default());
+        registry.add(
+            store.bundles.lock().unwrap()[0].request_id.clone(),
+            Arc::new(RecordingSink {
+                fail: AtomicBool::new(true),
+                ..Default::default()
+            }),
+        );
+
+        let error = worker(store, registry, ManualClock::new(0))
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retry authority failure"));
+    }
+
+    #[tokio::test]
+    async fn ack_winning_retry_transition_keeps_worker_alive() -> Result<()> {
+        let store = FakeStore::with_bundles(1);
+        store.ack_before_retry.store(true, Ordering::SeqCst);
+        let registry = Arc::new(FakeRegistry::default());
+        registry.add(
+            store.bundles.lock().unwrap()[0].request_id.clone(),
+            Arc::new(RecordingSink {
+                fail: AtomicBool::new(true),
+                ..Default::default()
+            }),
+        );
+
+        worker(store.clone(), registry, ManualClock::new(0))
+            .run_once()
+            .await?;
+        assert_eq!(
+            store.bundles.lock().unwrap()[0].state,
+            BundleState::Delivered
+        );
+        assert!(store.retry_delays.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_between_prepermit_renew_and_claimed_load_starts_no_send() -> Result<()> {
+        let store = FakeStore::with_bundles(1);
+        store.ack_before_claimed_load.store(true, Ordering::SeqCst);
+        let registry = Arc::new(FakeRegistry::default());
+        let sink = Arc::new(RecordingSink::default());
+        registry.add(
+            store.bundles.lock().unwrap()[0].request_id.clone(),
+            sink.clone(),
+        );
+
+        worker(store.clone(), registry, ManualClock::new(0))
+            .run_once()
+            .await?;
+        assert_eq!(
+            store.bundles.lock().unwrap()[0].state,
+            BundleState::Delivered
+        );
+        assert!(sink.events.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fake_store_fences_wrong_owner_expiry_and_expired_time() -> Result<()> {
+        let store = FakeStore::with_bundles(1);
+        let request = store.bundles.lock().unwrap()[0].request_id.clone();
+        let claim = store
+            .claim_ready_bundle_refs("worker", &[request], Timestamp(1), Timestamp(30), 1)
+            .await?
+            .pop()
+            .unwrap()
+            .claim;
+        let mut wrong_owner = claim.clone();
+        wrong_owner.owner = "other".into();
+        assert_eq!(
+            store
+                .renew_bundle(&wrong_owner, Timestamp(2), Timestamp(40))
+                .await?,
+            ClaimRenewal::Fenced
+        );
+        let mut wrong_expiry = claim.clone();
+        wrong_expiry.expires_at = Timestamp(29);
+        assert_eq!(
+            store
+                .renew_bundle(&wrong_expiry, Timestamp(2), Timestamp(40))
+                .await?,
+            ClaimRenewal::Fenced
+        );
+        assert_eq!(
+            store
+                .renew_bundle(&claim, Timestamp(30), Timestamp(60))
+                .await?,
+            ClaimRenewal::Fenced
+        );
         Ok(())
     }
 }

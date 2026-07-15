@@ -480,6 +480,20 @@ pub struct ClaimedBundleRef {
 pub enum ClaimedBundleLoad {
     Loaded(ResultBundle),
     FailedTerminal,
+    Delivered,
+    Fenced,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimRenewal {
+    Renewed(BundleClaim),
+    Fenced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimTransition {
+    Applied,
+    Fenced,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -518,7 +532,7 @@ pub trait BundleStore: Send + Sync {
         claim: &BundleClaim,
         now: Timestamp,
         until: Timestamp,
-    ) -> Result<BundleClaim>;
+    ) -> Result<ClaimRenewal>;
     async fn load_claimed_bundle(
         &self,
         claim: &BundleClaim,
@@ -532,7 +546,7 @@ pub trait BundleStore: Send + Sync {
         error: &str,
         next_attempt: Timestamp,
         now: Timestamp,
-    ) -> Result<()>;
+    ) -> Result<ClaimTransition>;
     async fn fail_bundle_terminal(
         &self,
         claim: &BundleClaim,

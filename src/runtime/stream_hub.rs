@@ -200,14 +200,22 @@ impl DeliveryRegistry for StreamHub {
             .lock()
             .expect("stream hub subscriptions poisoned");
         subscriptions.retain(|_, entries| {
-            entries.retain(|(_, state)| {
-                state.upgrade().is_some_and(|state| {
-                    state.connected.load(Ordering::Acquire) && state.delivery_sink.is_some()
-                })
-            });
+            entries.retain(|(_, state)| state.strong_count() > 0);
             !entries.is_empty()
         });
-        subscriptions.keys().cloned().collect()
+        subscriptions
+            .iter()
+            .filter_map(|(request, entries)| {
+                entries
+                    .iter()
+                    .any(|(_, state)| {
+                        state.upgrade().is_some_and(|state| {
+                            state.connected.load(Ordering::Acquire) && state.delivery_sink.is_some()
+                        })
+                    })
+                    .then(|| request.clone())
+            })
+            .collect()
     }
 
     fn snapshot(&self, request: &RequestId) -> Vec<Arc<dyn BundleDeliverySink>> {
@@ -607,5 +615,29 @@ mod tests {
         changes.changed().await.unwrap();
         assert!(hub.subscribed_request_ids().is_empty());
         assert!(hub.snapshot(&request).is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivery_registry_poll_never_removes_transient_only_subscription() {
+        let hub = StreamHub::with_limits(8, 128, 256);
+        let request = request();
+        let mut transient = hub.subscribe(request.clone()).unwrap();
+
+        assert!(hub.subscribed_request_ids().is_empty());
+        assert!(hub.subscribed_request_ids().is_empty());
+        hub.publish_text(std::slice::from_ref(&request), "still-live");
+        hub.publish_activity(
+            std::slice::from_ref(&request),
+            AgentActivityEvent::Completed,
+        );
+
+        assert!(matches!(
+            transient.recv().await.unwrap().body,
+            ServerEventBody::TextDelta { delta, .. } if delta == "still-live"
+        ));
+        assert!(matches!(
+            transient.recv().await.unwrap().body,
+            ServerEventBody::Activity { .. }
+        ));
     }
 }

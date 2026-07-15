@@ -69,3 +69,42 @@ coordinates durable ACK, bounded retry, terminal failure, and read-only replay.
 - Existing crate-wide warnings are unchanged in policy; Task 9 adds no clippy
   errors. Connection write failure relies on client resume/replay, matching
   at-least-once delivery.
+
+## Post-review correction
+
+An additional independent review found four race/interface defects after the
+initial Task 9 commit. The correction used test-first regressions:
+
+- RED: polling `DeliveryRegistry::subscribed_request_ids` removed a live
+  transient-only subscription, so its subsequent text/activity receive hung.
+- RED: the typed-renewal regression failed to compile because `ClaimRenewal`
+  did not exist and fencing was represented by an undifferentiated error.
+
+The correction now:
+
+- prunes only dead weak references during delivery-registry polling and filters
+  durable sink membership without mutating transient observer retention;
+- uses typed `ClaimRenewal::{Renewed,Fenced}` and
+  `ClaimTransition::{Applied,Fenced}`, while SQLite/schema/authority errors
+  propagate and stop the worker;
+- resolves an exact-claim retry loss as a successful ACK race when durable state
+  is already `delivered`, rather than killing the worker;
+- validates delivering state, owner, exact expiry, live time, and reciprocal
+  request ownership inside the claimed-load SQLite transaction; an ACK committed
+  before that load returns `Delivered` and starts no non-replay send;
+- makes worker fakes enforce exact claim owner/expiry/time and adds real SQLite
+  malformed-bundle-to-worker terminalization coverage.
+
+Fresh correction verification:
+
+- `rtk cargo test runtime::outbox_worker::tests` — 17 passed.
+- `rtk cargo test runtime::sqlite::bundles::tests` — 16 passed.
+- `rtk cargo test runtime::stream_hub::tests` — 8 passed.
+- `rtk cargo test` — 354 passed, 1 ignored.
+- `rtk cargo check` — passed.
+- `rtk cargo fmt --check` — passed.
+- `rtk cargo clippy --all-targets --all-features` — 0 errors; existing warning
+  baseline remains.
+- `rtk git diff --check` — passed.
+- Final independent correction review: approved with no remaining critical or
+  important findings.
