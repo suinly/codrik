@@ -701,15 +701,17 @@ mod tests {
         },
         runtime::{
             artifacts::{ArtifactManager, TestPause},
+            dispatcher::ActorDispatcher,
             ipc::protocol::{ActivityEvent, ServerEventBody},
             model::{ActorId, AttemptId, Audience, EventKind, ManualClock, RequestId, Timestamp},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
             store::{
-                AttemptOutcome, AttemptRecovery, CheckpointStore, DispatchStore, FailureStore,
-                IngressStore, LocalIngressStore, LocalSubmission, NewInboundEvent, OutboxPayload,
-                QuantumProgress, QuantumRunner, RuntimeAuthorizationStore, ToolAttemptStore,
+                AttemptOutcome, AttemptRecovery, CheckpointStore, DispatchStore,
+                DurableToolExecution, FailureFence, FailureStore, IngressStore, LocalIngressStore,
+                LocalSubmission, NewInboundEvent, NewToolAttempt, OutboxPayload, QuantumProgress,
+                QuantumRunner, RuntimeAuthorizationStore, ToolAttemptStore,
             },
             stream_hub::{NoopRuntimeEventPublisher, StreamHub},
         },
@@ -1662,6 +1664,149 @@ mod tests {
             store.failure_probe_for_test(&work).await.unwrap(),
             (1, "ready".into(), Some(10_000), 0)
         );
+    }
+
+    async fn mixed_known_and_unknown_recovery_fixture()
+    -> (SqliteRuntimeStore, crate::runtime::model::WorkItemId) {
+        let store = store_with_text().await;
+        let lease = store
+            .acquire_ready_actor("seed", Timestamp(10), Timestamp(1_000))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .checkpoint_run(
+                crate::runtime::store::CheckpointRun {
+                    run: run.clone(),
+                    incorporated_event_ids: run.source_event_ids.clone(),
+                    checkpointed_attempt_ids: vec![],
+                    messages: vec![],
+                },
+                Timestamp(12),
+            )
+            .await
+            .unwrap();
+        let known = store
+            .prepare_attempt(
+                &run,
+                NewToolAttempt {
+                    id: AttemptId::new(),
+                    tool_call_id: "known-first".into(),
+                    tool_name: "datetime".into(),
+                    arguments_json: "{}".into(),
+                    capabilities: ToolCapabilities::read_only(),
+                },
+                Timestamp(20),
+            )
+            .await
+            .unwrap();
+        store
+            .mark_attempt_running(&run, &known.id, Timestamp(21))
+            .await
+            .unwrap();
+        store
+            .finish_attempt(
+                &run,
+                &known.id,
+                AttemptOutcome::Succeeded {
+                    execution: DurableToolExecution {
+                        observation: "known result".into(),
+                        artifacts: vec![],
+                    },
+                },
+                Timestamp(22),
+            )
+            .await
+            .unwrap();
+        let unknown = store
+            .prepare_attempt(
+                &run,
+                NewToolAttempt {
+                    id: AttemptId::new(),
+                    tool_call_id: "unknown-second".into(),
+                    tool_name: "datetime".into(),
+                    arguments_json: "{}".into(),
+                    capabilities: ToolCapabilities::read_only(),
+                },
+                Timestamp(30),
+            )
+            .await
+            .unwrap();
+        store
+            .mark_attempt_running(&run, &unknown.id, Timestamp(31))
+            .await
+            .unwrap();
+        for now in 100..104 {
+            store
+                .record_failure(
+                    &FailureFence::from(&run),
+                    "prior",
+                    QuantumProgress::None,
+                    &ManualClock::new(now),
+                )
+                .await
+                .unwrap();
+        }
+        store.release_lease(&lease).await.unwrap();
+        (store, run.work_item_id)
+    }
+
+    #[tokio::test]
+    async fn mixed_recovery_reports_known_progress_before_waiting_for_decision() {
+        let (store, work) = mixed_known_and_unknown_recovery_fixture().await;
+        let runner = ActorRunner::new(
+            FinalLlm,
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(9_000)),
+        );
+
+        let report = runner
+            .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+            .await
+            .unwrap();
+        assert_eq!(report.outcome, RunOnceOutcome::WaitingForDecision);
+        assert_eq!(report.progress, QuantumProgress::KnownToolOutcome);
+        assert_eq!(
+            store.failure_probe_for_test(&work).await.unwrap(),
+            (0, "waiting_for_decision".into(), None, 0)
+        );
+        assert!(store.current_lease().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_treats_mixed_recovery_wait_as_successful_progress() {
+        let (store, work) = mixed_known_and_unknown_recovery_fixture().await;
+        let clock = ManualClock::new(9_000);
+        let runner = ActorRunner::new(
+            FinalLlm,
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, clock.clone()),
+        );
+        let dispatcher = ActorDispatcher::new(
+            ActorId::from_string("actor:local:1"),
+            "worker",
+            ActorSignals::default(),
+            runner,
+            clock,
+        );
+
+        dispatcher.dispatch_ready().await.unwrap();
+        assert_eq!(
+            store.failure_probe_for_test(&work).await.unwrap(),
+            (0, "waiting_for_decision".into(), None, 0)
+        );
+        assert!(store.current_lease().await.unwrap().is_none());
     }
 
     #[tokio::test]

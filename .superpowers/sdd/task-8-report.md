@@ -173,3 +173,39 @@ Second-correction verification:
 - `rtk cargo fmt --check` — passed.
 - `rtk cargo clippy --all-targets --all-features` — 0 errors; warnings remain.
 - `rtk git diff --check` — passed.
+
+## Final Focused Correction
+
+Mixed recovery can commit a known earlier tool outcome and then discover a
+later outcome-unknown attempt in the same active run. Blocking that later
+attempt truthfully leaves the run `active`, the work `waiting_for_decision`, and
+at least one attempt `waiting_for_decision`. Because the quantum already made
+known durable progress, failure history must still reset before the lease is
+released.
+
+The progress fence predicate now accepts precisely that state combination for
+the exact actor owner/generation/expiry and run/work identity. It continues to
+reject `blocked_unknown_outcome`, `blocked_malformed`, failed-terminal, expired,
+renewed, and otherwise stale combinations. Failure recording remains restricted
+to active/ready work, while completed and cancelled finalization pairs retain
+their existing progress path.
+
+A direct store predicate test captured the prior stale-lease failure and now
+proves the waiting-for-decision pair resets failure count without admitting the
+invalid blocked or terminal states. Production runner and dispatcher regressions
+build a realistic active run containing an uncheckpointed known outcome followed
+by a running attempt. Recovery checkpoints the known result, blocks the unknown
+attempt, returns `WaitingForDecision`, resets four prior failures, and releases
+the lease without an authority error.
+
+Final-focused verification:
+
+- `rtk cargo test runtime::sqlite::failures::tests` — 8 passed.
+- `rtk cargo test runtime::runner::tests` — 20 passed.
+- `rtk cargo test runtime::dispatcher::tests` — 3 passed.
+- `rtk cargo test runtime::sqlite::checkpoint::tests` — 13 passed.
+- `rtk cargo test` — 330 passed, 1 ignored.
+- `rtk cargo check` — passed with existing crate-wide warnings.
+- `rtk cargo fmt --check` — passed.
+- `rtk cargo clippy --all-targets --all-features` — 0 errors; warnings remain.
+- `rtk git diff --check` — passed.

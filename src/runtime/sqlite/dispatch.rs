@@ -709,7 +709,7 @@ impl SqliteRuntimeStore {
             .map_err(|error| anyhow!("failed to count pending group events: {error}"))
     }
 
-    async fn current_lease(&self) -> Result<Option<ActorLease>> {
+    pub(crate) async fn current_lease(&self) -> Result<Option<ActorLease>> {
         self.connection
             .call(|connection| -> tokio_rusqlite::rusqlite::Result<Option<ActorLease>> {
                 connection

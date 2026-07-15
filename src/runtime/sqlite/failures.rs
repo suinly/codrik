@@ -195,6 +195,13 @@ fn ensure_failure_fence(
              AND runs.lease_generation = ?3
              AND (
                (runs.state = 'active' AND work_items.state = 'ready')
+               OR (?7 = 0 AND runs.state = 'active'
+                   AND work_items.state = 'waiting_for_decision'
+                   AND EXISTS (
+                     SELECT 1 FROM tool_attempts
+                     WHERE tool_attempts.run_id = runs.id
+                       AND tool_attempts.state = 'waiting_for_decision'
+                   ))
                OR (?7 = 0 AND runs.state = work_items.state
                    AND runs.state IN ('completed', 'cancelled'))
              )
@@ -228,6 +235,25 @@ fn decode_audience(kind: &str, address: Option<String>) -> Result<Audience> {
 
 #[cfg(test)]
 impl SqliteRuntimeStore {
+    async fn set_work_state_for_test(
+        &self,
+        work: &crate::runtime::model::WorkItemId,
+        state: &str,
+    ) -> Result<()> {
+        let work = work.clone();
+        let state = state.to_owned();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                connection.execute(
+                    "UPDATE work_items SET state = ?2 WHERE id = ?1",
+                    params![work.as_str(), state],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
     pub(crate) async fn failure_probe_for_test(
         &self,
         work: &crate::runtime::model::WorkItemId,
@@ -277,14 +303,16 @@ mod tests {
     use anyhow::Result;
 
     use crate::{
+        agent::tool::ToolCapabilities,
         auth::{LegacyActor, LegacyAuthorizationSnapshot},
         runtime::{
-            model::{ActorId, LocalRequestState, ManualClock, RequestId, Timestamp},
+            model::{ActorId, AttemptId, LocalRequestState, ManualClock, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                BundleStore, CheckpointRun, CheckpointStore, DispatchStore, FailureDisposition,
-                FailureFence, FailureStore, FinalizeRun, LocalIngressStore, LocalSubmission,
-                NewOutboxIntent, OutboxPayload, QuantumProgress, RuntimeAuthorizationStore,
+                AttemptRecovery, BundleStore, CheckpointRun, CheckpointStore, DispatchStore,
+                FailureDisposition, FailureFence, FailureStore, FinalizeRun, LocalIngressStore,
+                LocalSubmission, NewOutboxIntent, NewToolAttempt, OutboxPayload, QuantumProgress,
+                RuntimeAuthorizationStore, ToolAttemptStore,
             },
         },
     };
@@ -902,5 +930,115 @@ mod tests {
                 .unwrap(),
             (4, "ready".into(), Some(8_053), 0)
         );
+    }
+
+    #[tokio::test]
+    async fn progress_accepts_only_exact_waiting_for_decision_blocked_pair() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let actor = ActorId::from_string("actor:waiting-progress");
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: actor.to_string(),
+                        enabled: true,
+                        tools: vec!["*".into()],
+                        identities: vec![],
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: RequestId::new(),
+                    text: "hello".into(),
+                    prompt_sha256: "d".repeat(64),
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(1_000))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        let fence = FailureFence::from(&run);
+        store
+            .record_failure(
+                &fence,
+                "prior",
+                QuantumProgress::None,
+                &ManualClock::new(12),
+            )
+            .await
+            .unwrap();
+        let blocked_attempt = store
+            .prepare_attempt(
+                &run,
+                NewToolAttempt {
+                    id: AttemptId::new(),
+                    tool_call_id: "unknown".into(),
+                    tool_name: "datetime".into(),
+                    arguments_json: "{}".into(),
+                    capabilities: ToolCapabilities::read_only(),
+                },
+                Timestamp(12),
+            )
+            .await
+            .unwrap();
+        store
+            .mark_attempt_running(&run, &blocked_attempt.id, Timestamp(12))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recover_attempt(&blocked_attempt.id).await.unwrap(),
+            AttemptRecovery::OutcomeUnknown
+        );
+        store
+            .block_unknown_attempt(&run, &blocked_attempt.id, Timestamp(12))
+            .await
+            .unwrap();
+
+        store
+            .record_progress(&fence, &ManualClock::new(13))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .failure_probe_for_test(&run.work_item_id)
+                .await
+                .unwrap()
+                .0,
+            0
+        );
+
+        for invalid in [
+            "blocked_unknown_outcome",
+            "blocked_malformed",
+            "failed_terminal",
+        ] {
+            store
+                .set_work_state_for_test(&run.work_item_id, invalid)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .record_progress(&fence, &ManualClock::new(14))
+                    .await
+                    .is_err(),
+                "unexpectedly accepted {invalid}"
+            );
+        }
     }
 }
