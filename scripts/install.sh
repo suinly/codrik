@@ -7,6 +7,7 @@ DEFAULT_BASE_URL="https://api.openai.com/v1"
 DEFAULT_MODEL="gpt-4.1-mini"
 CONFIGURED_CONFIG_FILE=""
 CONFIGURED_RUNTIME_READY=0
+CLEAN_INTERACTIVE_INSTALL=0
 if [ -n "${HOME:-}" ]; then
   DEFAULT_INSTALL_DIR="$HOME/.local/bin"
   DEFAULT_CONFIG_DIR="$HOME/.codrik"
@@ -377,6 +378,7 @@ authorization_has_actors() {
 
 bootstrap_or_select_actor() {
   runtime_dir="$1"
+  allow_owner_bootstrap="${2:-0}"
   users_file="$runtime_dir/users.json"
 
   mkdir -p "$runtime_dir"
@@ -390,6 +392,14 @@ bootstrap_or_select_actor() {
     done
     printf '%s\n' "$actor_id"
     return
+  fi
+
+  if [ "$allow_owner_bootstrap" != "1" ]; then
+    cat >&2 <<'GUIDANCE'
+Existing installation has no usable authorization actors. Codrik did not grant tools: ["*"] during upgrade.
+Create or restore users.json with an explicit actor, then configure runtime.actor_id. Codrik service was not started.
+GUIDANCE
+    return 1
   fi
 
   umask 077
@@ -410,13 +420,66 @@ USERS
   printf '%s\n' "actor:local:owner"
 }
 
-config_has_runtime_actor() {
+runtime_actor_from_config() {
   config_file="$1"
-  sed -n '/^[[:space:]]*runtime:[[:space:]]*$/,/^[^[:space:]]/p' "$config_file" \
-    | sed -n '/^[[:space:]]*actor_id:[[:space:]]*[^[:space:]]/p' \
-    | sed -n '1p' \
-    | tr -d '\n' \
-    | sed 's/.*/yes/'
+  raw="$(sed -n '/^[[:space:]]*runtime:[[:space:]]*\(#.*\)\{0,1\}$/,/^[^[:space:]]/ {
+    /^[[:space:]]*actor_id[[:space:]]*:/ {
+      s/^[[:space:]]*actor_id[[:space:]]*:[[:space:]]*//
+      p
+      q
+    }
+  }' "$config_file")"
+  raw="$(printf '%s' "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$raw" ] || return 1
+
+  case "$raw" in
+    \"*)
+      value="$(printf '%s' "$raw" | sed -n 's/^"\([^"]*\)"[[:space:]]*\(#.*\)\{0,1\}$/\1/p')"
+      ;;
+    \'*)
+      value="$(printf '%s' "$raw" | sed -n "s/^'\([^']*\)'[[:space:]]*\(#.*\)\{0,1\}$/\1/p")"
+      ;;
+    *)
+      value="$(printf '%s' "$raw" | sed 's/[[:space:]]#.*$//;s/[[:space:]]*$//')"
+      case "$value" in
+        \#* | *'['* | *']'* | *'{'* | *'}'*) return 1 ;;
+      esac
+      ;;
+  esac
+  value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$value" ] || return 1
+  lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in null | '~') return 1 ;; esac
+  printf '%s\n' "$value"
+}
+
+config_has_runtime_actor() {
+  runtime_actor_from_config "$1" >/dev/null 2>&1
+}
+
+capture_install_state() {
+  config_dir="$1"
+  runtime_dir="$2"
+  config_file="$config_dir/config.yml"
+  legacy_config_file="$config_dir/codrik.config.yml"
+  users_file="$runtime_dir/users.json"
+  service_present=0
+  case "$(uname -s)" in
+    Linux)
+      [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/codrik.service" ] && service_present=1
+      [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/codrik-telegram.service" ] && service_present=1
+      ;;
+    Darwin)
+      [ -f "$HOME/Library/LaunchAgents/com.suinly.codrik.plist" ] && service_present=1
+      [ -f "$HOME/Library/LaunchAgents/com.suinly.codrik.telegram.plist" ] && service_present=1
+      ;;
+  esac
+  if [ ! -f "$config_file" ] && [ ! -f "$legacy_config_file" ] \
+    && [ "$service_present" = "0" ] && ! authorization_has_actors "$users_file"; then
+    CLEAN_INTERACTIVE_INSTALL=1
+  else
+    CLEAN_INTERACTIVE_INSTALL=0
+  fi
 }
 
 print_missing_runtime_actor() {
@@ -455,10 +518,17 @@ configure_codrik() {
 
   if [ -f "$config_file" ] && ! ask_yes_no "$config_file already exists. Overwrite it?" "n"; then
     echo "Keeping existing config: $config_file"
-    if [ "$(config_has_runtime_actor "$config_file")" = "yes" ]; then
+    if config_has_runtime_actor "$config_file" && authorization_has_actors "$runtime_dir/users.json"; then
       CONFIGURED_RUNTIME_READY=1
     else
-      print_missing_runtime_actor
+      if ! config_has_runtime_actor "$config_file"; then
+        print_missing_runtime_actor
+      else
+        cat >&2 <<'GUIDANCE'
+Existing config names runtime.actor_id, but users.json has no usable authorization actors.
+Create or restore users.json explicitly. Codrik service was not started.
+GUIDANCE
+      fi
     fi
     return
   fi
@@ -473,12 +543,23 @@ configure_codrik() {
 
   base_url="$(ask "OpenAI-compatible base URL" "$DEFAULT_BASE_URL")"
   model="$(ask "Model" "$DEFAULT_MODEL")"
-  actor_id="$(bootstrap_or_select_actor "$runtime_dir")"
+  if ! actor_id="$(bootstrap_or_select_actor "$runtime_dir" "$CLEAN_INTERACTIVE_INSTALL")"; then
+    return
+  fi
 
   mkdir -p "$config_dir"
   write_config "$config_file" "$api_key" "$base_url" "$model" "$actor_id"
   CONFIGURED_RUNTIME_READY=1
   echo "Wrote config to $config_file"
+}
+
+maybe_install_serve_service() {
+  bin_path="$1"
+  if [ "${CODRIK_SKIP_SERVICE:-0}" != "1" ] && [ "$CONFIGURED_RUNTIME_READY" = "1" ]; then
+    if is_interactive && ask_yes_no "Install and start the Codrik service?" "y"; then
+      install_serve_service "$bin_path" "$CONFIGURED_CONFIG_FILE" "$runtime_dir"
+    fi
+  fi
 }
 
 if [ "${CODRIK_INSTALL_LIBRARY_ONLY:-0}" = "1" ]; then
@@ -509,6 +590,8 @@ target="${CODRIK_TARGET:-$(detect_target)}"
 install_dir="${CODRIK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 config_dir="${CODRIK_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"
 runtime_dir="${CODRIK_HOME:-$config_dir}"
+
+capture_install_state "$config_dir" "$runtime_dir"
 
 [ -n "$install_dir" ] || die "could not determine install directory; set CODRIK_INSTALL_DIR"
 
@@ -544,11 +627,7 @@ if [ "${CODRIK_SKIP_CONFIG:-0}" != "1" ]; then
   configure_codrik "$config_dir" "$runtime_dir"
 fi
 
-if [ "${CODRIK_SKIP_SERVICE:-0}" != "1" ] && [ "$CONFIGURED_RUNTIME_READY" = "1" ]; then
-  if is_interactive && ask_yes_no "Install and start the Codrik service?" "y"; then
-    install_serve_service "$install_dir/$BIN_NAME" "$CONFIGURED_CONFIG_FILE" "$runtime_dir"
-  fi
-fi
+maybe_install_serve_service "$install_dir/$BIN_NAME"
 
 case ":$PATH:" in
   *":$install_dir:"*) ;;

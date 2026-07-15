@@ -113,11 +113,9 @@ impl Clock for SystemClock {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone)]
 pub struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicI64>);
 
-#[cfg(test)]
 impl ManualClock {
     pub fn new(now: i64) -> Self {
         Self(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(now)))
@@ -129,7 +127,6 @@ impl ManualClock {
     }
 }
 
-#[cfg(test)]
 impl Clock for ManualClock {
     fn now(&self) -> Timestamp {
         Timestamp(self.0.load(std::sync::atomic::Ordering::SeqCst))

@@ -1,7 +1,7 @@
 use crate::{
     auth::{AuthorizationStore, AuthorizedActor},
     config::{AppConfig, RuntimePaths, codrik_dir},
-    llm::openai::OpenAiClient,
+    llm::{client::LlmStreamClient, openai::OpenAiClient},
     runtime::{
         artifacts::ArtifactManager,
         dispatcher::ActorDispatcher,
@@ -38,12 +38,43 @@ const MAX_SKILL_INDEX_CHARS: usize = 8_000;
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     let home = codrik_dir()?;
+    let llm = OpenAiClient::new(
+        config.model.clone(),
+        config.api_key.clone(),
+        config.base_url.clone(),
+    );
     serve_at_until(
         config,
         Arc::new(StderrRuntimeLogger::default()),
         &NoopStartupTrace,
         home,
+        SystemClock,
+        llm,
         shutdown_signal(),
+    )
+    .await
+}
+
+pub async fn serve_with_dependencies<C, L, F>(
+    config: AppConfig,
+    home: PathBuf,
+    clock: C,
+    llm: L,
+    shutdown: F,
+) -> Result<()>
+where
+    C: Clock,
+    L: LlmStreamClient + Send + Sync + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    serve_at_until(
+        config,
+        Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+        &NoopStartupTrace,
+        home,
+        clock,
+        llm,
+        shutdown,
     )
     .await
 }
@@ -72,14 +103,18 @@ impl StartupTrace for NoopStartupTrace {
     fn record(&self, _phase: StartupPhase) {}
 }
 
-async fn serve_at_until<F>(
+async fn serve_at_until<C, L, F>(
     config: AppConfig,
     logger: Arc<dyn RuntimeLogger>,
     trace: &dyn StartupTrace,
     home: PathBuf,
+    clock: C,
+    llm: L,
     shutdown: F,
 ) -> Result<()>
 where
+    C: Clock,
+    L: LlmStreamClient + Send + Sync + 'static,
     F: std::future::Future<Output = ()>,
 {
     let runtime = config.required_runtime()?.clone();
@@ -90,7 +125,7 @@ where
     trace.record(StartupPhase::LockAcquired);
     let store = SqliteRuntimeStore::open(&paths.database).await?;
     trace.record(StartupPhase::Migrated);
-    import_legacy_authorization_once(&store, &home.join("users.json"), SystemClock.now()).await?;
+    import_legacy_authorization_once(&store, &home.join("users.json"), clock.now()).await?;
     trace.record(StartupPhase::AuthImported);
     let actor_id = ActorId::from_string(runtime.actor_id);
     let actor = store.load_actor(&actor_id).await?.with_context(|| {
@@ -105,7 +140,6 @@ where
     lock.remove_stale_socket()?;
     trace.record(StartupPhase::StaleSocketRemoved);
 
-    let clock = SystemClock;
     let signals = ActorSignals::default();
     let hub = Arc::new(StreamHub::default());
     let outbox_owner = format!("outbox-{}", std::process::id());
@@ -130,7 +164,6 @@ where
         tool_config_for_actor_workspace(actor_workspace_path_in(&home, actor.id.as_str())?)?;
     let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
-    let llm = OpenAiClient::new(config.model, config.api_key, config.base_url);
     let artifacts = ArtifactManager::new(paths.artifacts.clone(), store.clone(), clock.clone());
     let runner = ActorRunner::new(
         llm,
@@ -147,7 +180,7 @@ where
         dispatcher_owner.clone(),
         signals,
         runner,
-        clock,
+        clock.clone(),
     );
 
     let mut startup =
@@ -218,7 +251,7 @@ where
         let _ = logger.log(&event);
     }
     let recovery = store
-        .recover_shutdown(&dispatcher_owner, &outbox_owner, SystemClock.now())
+        .recover_shutdown(&dispatcher_owner, &outbox_owner, clock.now())
         .await;
     let cleanup = lock.remove_stale_socket();
     result.and(recovery).and(cleanup)
@@ -575,6 +608,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_dependency_seam_uses_injected_clock_for_runtime_state() -> Result<()> {
+        let home = short_runtime_root("injected-clock")?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+        fs::write(
+            home.join("users.json"),
+            r#"{"version":1,"actors":{"actor:local:owner":{"enabled":true,"display_name":null,"identities":[],"tools":["*"]}}}"#,
+        )?;
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: actor:local:owner\n",
+        )?;
+        let database = home.join("runtime.sqlite");
+        serve_with_dependencies(
+            config.clone(),
+            home,
+            crate::runtime::model::ManualClock::new(12_345),
+            OpenAiClient::new(config.model, config.api_key, config.base_url),
+            async {},
+        )
+        .await?;
+        let connection = tokio_rusqlite::Connection::open(database).await?;
+        let created_at: i64 = connection
+            .call(|db| {
+                db.query_row(
+                    "SELECT created_at FROM actors WHERE id='actor:local:owner'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        assert_eq!(created_at, 12_345);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn production_startup_is_ordered_and_ready_only_after_recovery() -> Result<()> {
         let home = short_runtime_root("order")?;
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
@@ -593,6 +660,8 @@ mod tests {
             Arc::new(crate::runtime::observability::NoopRuntimeLogger),
             &trace,
             home,
+            SystemClock,
+            OpenAiClient::new("test", "key", "https://example.test/v1"),
             async {},
         )
         .await?;
@@ -638,6 +707,8 @@ mod tests {
                     Arc::new(crate::runtime::observability::NoopRuntimeLogger),
                     &trace,
                     home,
+                    SystemClock,
+                    OpenAiClient::new("test", "key", "https://example.test/v1"),
                     async {},
                 )
                 .await

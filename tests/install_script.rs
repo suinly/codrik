@@ -125,7 +125,7 @@ fn clean_and_empty_authorization_create_private_local_owner() {
         }
         let selected = root.join("selected");
         let output = run_library(
-            "bootstrap_or_select_actor \"$2\" >\"$3\"",
+            "bootstrap_or_select_actor \"$2\" 1 >\"$3\"",
             &[&root, &selected],
         );
         assert!(
@@ -184,4 +184,181 @@ fn missing_runtime_actor_message_is_exact() {
         String::from_utf8(output.stderr).unwrap(),
         "Existing config is missing runtime.actor_id. Add exactly:\nruntime:\n  actor_id: <existing-actor-id>\nCodrik service was not started.\n"
     );
+}
+
+#[test]
+fn upgrade_with_empty_authorization_never_bootstraps_owner_or_starts_service() {
+    let root = temp_dir();
+    let config_dir = root.join("config");
+    let runtime_dir = root.join("runtime");
+    let service = root.join("service-started");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::write(
+        config_dir.join("config.yml"),
+        "api_key: old\nruntime:\n  actor_id: actor:existing:7\n",
+    )
+    .unwrap();
+    fs::write(runtime_dir.join("users.json"), b"").unwrap();
+    let output = run_library(
+        r#"
+is_interactive() { return 0; }
+ask_yes_no() { case "$1" in *Overwrite*) return 1 ;; *) return 0 ;; esac; }
+SERVICE_MARKER="$4"
+install_serve_service() { touch "$SERVICE_MARKER"; }
+capture_install_state "$2" "$3"
+configure_codrik "$2" "$3"
+maybe_install_serve_service /opt/codrik "$4"
+printf 'clean=%s ready=%s\n' "$CLEAN_INTERACTIVE_INSTALL" "$CONFIGURED_RUNTIME_READY"
+"#,
+        &[&config_dir, &runtime_dir, &service],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(runtime_dir.join("users.json")).unwrap(), b"");
+    assert!(!service.exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("clean=0 ready=0"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("authorization"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn true_clean_flow_bootstraps_owner_and_reaches_service_decision() {
+    let root = temp_dir();
+    let config_dir = root.join("config");
+    let runtime_dir = root.join("runtime");
+    let service = root.join("service-started");
+    let output = run_library(
+        r#"
+is_interactive() { return 0; }
+ask_yes_no() { return 0; }
+ask_secret() { printf '%s\n' test-key; }
+ask() { printf '%s\n' "$2"; }
+SERVICE_MARKER="$4"
+install_serve_service() { touch "$SERVICE_MARKER"; }
+capture_install_state "$2" "$3"
+configure_codrik "$2" "$3"
+maybe_install_serve_service /opt/codrik "$4"
+printf 'clean=%s ready=%s\n' "$CLEAN_INTERACTIVE_INSTALL" "$CONFIGURED_RUNTIME_READY"
+"#,
+        &[&config_dir, &runtime_dir, &service],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(service.exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("clean=1 ready=1"));
+    let users: serde_json::Value =
+        serde_json::from_slice(&fs::read(runtime_dir.join("users.json")).unwrap()).unwrap();
+    assert_eq!(
+        users["actors"]["actor:local:owner"]["tools"],
+        serde_json::json!(["*"])
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn runtime_actor_parser_matches_valid_and_broken_yaml_scalars() {
+    let root = temp_dir();
+    let config = root.join("config.yml");
+    for (yaml, expected) in [
+        ("runtime:\n  actor_id: actor:one\n", "actor:one"),
+        ("runtime:\n  actor_id: \"actor:two\"\n", "actor:two"),
+        ("runtime:\n  actor_id: 'actor:three'\n", "actor:three"),
+    ] {
+        fs::write(&config, yaml).unwrap();
+        let output = run_library("runtime_actor_from_config \"$2\"", &[&config]);
+        assert!(output.status.success(), "{yaml}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
+    for yaml in [
+        "runtime:\n  actor_id:\n",
+        "runtime:\n  actor_id: \"   \"\n",
+        "runtime:\n  actor_id: null\n",
+        "runtime:\n  actor_id: ~\n",
+        "runtime:\n  actor_id: # only a comment\n",
+        "runtime:\n  actor_id: [actor:bad]\n",
+        "runtime:\n  actor_id: \"unterminated\n",
+    ] {
+        fs::write(&config, yaml).unwrap();
+        let output = run_library("runtime_actor_from_config \"$2\"", &[&config]);
+        assert!(!output.status.success(), "accepted invalid YAML: {yaml}");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn keeping_semantically_invalid_actor_config_preserves_bytes_and_refuses_service() {
+    let root = temp_dir();
+    let config_dir = root.join("config");
+    let runtime_dir = root.join("runtime");
+    let service = root.join("service-started");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let original = b"api_key: old\nruntime:\n  actor_id: \"   \"\n";
+    fs::write(config_dir.join("config.yml"), original).unwrap();
+    fs::write(
+        runtime_dir.join("users.json"),
+        br#"{"version":1,"actors":{"actor:existing:7":{"enabled":true}}}"#,
+    )
+    .unwrap();
+    let output = run_library(
+        r#"
+is_interactive() { return 0; }
+ask_yes_no() { case "$1" in *Overwrite*) return 1 ;; *) return 0 ;; esac; }
+SERVICE_MARKER="$4"
+install_serve_service() { touch "$SERVICE_MARKER"; }
+capture_install_state "$2" "$3"
+configure_codrik "$2" "$3"
+maybe_install_serve_service /opt/codrik "$4"
+printf 'ready=%s\n' "$CONFIGURED_RUNTIME_READY"
+"#,
+        &[&config_dir, &runtime_dir, &service],
+    );
+    assert!(output.status.success());
+    assert_eq!(fs::read(config_dir.join("config.yml")).unwrap(), original);
+    assert!(!service.exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ready=0"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn keeping_valid_upgrade_config_preserves_authorization_and_allows_service() {
+    let root = temp_dir();
+    let config_dir = root.join("config");
+    let runtime_dir = root.join("runtime");
+    let service = root.join("service-started");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let config = b"api_key: old\nruntime:\n  actor_id: 'actor:existing:7'\n";
+    let users = br#"{ "version": 1, "actors": { "actor:existing:7": {"enabled":true,"tools":[]} } }
+"#;
+    fs::write(config_dir.join("config.yml"), config).unwrap();
+    fs::write(runtime_dir.join("users.json"), users).unwrap();
+    let output = run_library(
+        r#"
+is_interactive() { return 0; }
+ask_yes_no() { case "$1" in *Overwrite*) return 1 ;; *) return 0 ;; esac; }
+SERVICE_MARKER="$4"
+install_serve_service() { touch "$SERVICE_MARKER"; }
+capture_install_state "$2" "$3"
+configure_codrik "$2" "$3"
+maybe_install_serve_service /opt/codrik
+"#,
+        &[&config_dir, &runtime_dir, &service],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(config_dir.join("config.yml")).unwrap(), config);
+    assert_eq!(fs::read(runtime_dir.join("users.json")).unwrap(), users);
+    assert!(service.exists());
+    fs::remove_dir_all(root).unwrap();
 }

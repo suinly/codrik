@@ -16,10 +16,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::{Notify, oneshot},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -37,7 +42,6 @@ fn serialize_acceptance() -> std::sync::MutexGuard<'static, ()> {
 enum ProviderReply {
     Text { text: String, pause_ms: u64 },
     Files(usize),
-    HttpError,
 }
 
 struct ScriptedProvider {
@@ -112,15 +116,6 @@ impl ScriptedProvider {
                         }
                     };
                     match reply {
-                        ProviderReply::HttpError => {
-                            let body = br#"{"error":{"message":"scripted failure","type":"server_error"}}"#;
-                            let response = format!(
-                                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = socket.write_all(response.as_bytes()).await;
-                            let _ = socket.write_all(body).await;
-                        }
                         ProviderReply::Text { text, pause_ms } => {
                             let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
                             if socket.write_all(headers.as_bytes()).await.is_err() {
@@ -198,6 +193,7 @@ impl Drop for ScriptedProvider {
 }
 
 struct RuntimeHarness {
+    test_roots: PathBuf,
     root: PathBuf,
     config: PathBuf,
     socket: PathBuf,
@@ -231,6 +227,7 @@ impl RuntimeHarness {
             .context("secure users")?;
         fs::write(&config, format!("api_key: test\nbase_url: {}\nmodel: scripted\nruntime:\n  actor_id: {ACTOR}\n  database_path: {}\n  socket_path: {}\n  lock_path: {}\n  artifact_path: {}\n", provider.endpoint, database.display(), socket.display(), root.join("k").display(), root.join("a").display())).context("write config")?;
         let mut harness = Self {
+            test_roots,
             root,
             config,
             socket,
@@ -326,12 +323,6 @@ impl RuntimeHarness {
         self.kill()
     }
 
-    fn restart(&mut self) -> Result<()> {
-        self.kill()?;
-        self.spawn()?;
-        self.wait_ready(Duration::from_secs(12))
-    }
-
     async fn count(&self, table: &'static str) -> Result<i64> {
         let connection = tokio_rusqlite::Connection::open(&self.database).await?;
         connection
@@ -345,11 +336,30 @@ impl RuntimeHarness {
     }
 
     async fn scalar(&self, sql: &'static str) -> Result<String> {
+        self.scalar_owned(sql.to_owned()).await
+    }
+
+    async fn scalar_owned(&self, sql: String) -> Result<String> {
         let connection = tokio_rusqlite::Connection::open(&self.database).await?;
         connection
-            .call(move |db| db.query_row(sql, [], |row| row.get(0)))
+            .call(move |db| db.query_row(&sql, [], |row| row.get(0)))
             .await
             .map_err(Into::into)
+    }
+
+    async fn wait_scalar(&self, sql: &str, expected: &str) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(self.scalar_owned(sql.to_owned()).await, Ok(value) if value == expected)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("database barrier `{sql}` did not reach `{expected}`"))?;
+        Ok(())
     }
 }
 
@@ -357,6 +367,243 @@ impl Drop for RuntimeHarness {
     fn drop(&mut self) {
         let _ = self.kill();
         let _ = fs::remove_dir_all(&self.root);
+        // `remove_dir` is deliberately non-recursive: it removes only the suite's
+        // now-empty shared parent and cannot race away another live harness.
+        let _ = fs::remove_dir(&self.test_roots);
+    }
+}
+
+#[derive(Clone)]
+enum InjectedReply {
+    Text(String),
+    ToolCall,
+    Failure,
+}
+
+#[derive(Clone)]
+struct InjectedLlm {
+    replies: Arc<Mutex<VecDeque<InjectedReply>>>,
+    calls: Arc<AtomicUsize>,
+    called: Arc<Notify>,
+    block_call: Option<usize>,
+    release: Arc<Notify>,
+}
+
+impl InjectedLlm {
+    fn new(replies: Vec<InjectedReply>) -> Self {
+        Self {
+            replies: Arc::new(Mutex::new(replies.into())),
+            calls: Arc::new(AtomicUsize::new(0)),
+            called: Arc::new(Notify::new()),
+            block_call: None,
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    fn blocking(replies: Vec<InjectedReply>, block_call: usize) -> Self {
+        let mut llm = Self::new(replies);
+        llm.block_call = Some(block_call);
+        llm
+    }
+
+    async fn wait_calls(&self, expected: usize) {
+        while self.calls.load(Ordering::SeqCst) < expected {
+            let called = self.called.notified();
+            if self.calls.load(Ordering::SeqCst) >= expected {
+                break;
+            }
+            called.await;
+        }
+    }
+}
+
+#[async_trait]
+impl codrik::llm::client::LlmStreamClient for InjectedLlm {
+    async fn stream(
+        &self,
+        _request: codrik::llm::client::LlmRequest,
+        sink: &mut dyn codrik::llm::client::LlmStreamSink,
+        _context: &codrik::llm::client::RunContext,
+    ) -> Result<codrik::llm::client::LlmResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.called.notify_waiters();
+        if self.block_call == Some(call) {
+            self.release.notified().await;
+        }
+        let reply = {
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(InjectedReply::Text("scripted final".into()))
+        };
+        match reply {
+            InjectedReply::Failure => bail!("scripted model failure"),
+            InjectedReply::ToolCall => Ok(codrik::llm::client::LlmResponse {
+                content: String::new(),
+                tool_calls: vec![codrik::llm::client::LlmToolCall {
+                    id: "call-datetime".into(),
+                    name: "datetime".into(),
+                    arguments: "{}".into(),
+                }],
+            }),
+            InjectedReply::Text(text) => {
+                sink.on_event(codrik::llm::client::LlmStreamEvent::TextDelta(text.clone()))
+                    .await?;
+                Ok(codrik::llm::client::LlmResponse {
+                    content: text,
+                    tool_calls: Vec::new(),
+                })
+            }
+        }
+    }
+}
+
+struct InjectedHarness {
+    test_roots: PathBuf,
+    root: PathBuf,
+    config: codrik::config::AppConfig,
+    socket: PathBuf,
+    database: PathBuf,
+    clock: codrik::runtime::model::ManualClock,
+    llm: InjectedLlm,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<Result<()>>>,
+}
+
+impl InjectedHarness {
+    async fn start(replies: Vec<InjectedReply>) -> Result<Self> {
+        Self::start_with_llm(InjectedLlm::new(replies)).await
+    }
+
+    async fn start_with_llm(llm: InjectedLlm) -> Result<Self> {
+        let test_roots = std::env::current_dir()?.join(".t");
+        fs::create_dir_all(&test_roots)?;
+        fs::set_permissions(&test_roots, fs::Permissions::from_mode(0o700))?;
+        let root = test_roots.join(&Uuid::new_v4().simple().to_string()[..8]);
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        let socket = root.join("s");
+        let database = root.join("d");
+        fs::write(
+            root.join("users.json"),
+            format!(
+                r#"{{"version":1,"actors":{{"{ACTOR}":{{"enabled":true,"display_name":null,"identities":[],"tools":["*"]}}}}}}"#
+            ),
+        )?;
+        fs::set_permissions(root.join("users.json"), fs::Permissions::from_mode(0o600))?;
+        let config = yaml_serde::from_str(&format!(
+            "api_key: injected\nbase_url: https://unused.invalid/v1\nmodel: injected\nruntime:\n  actor_id: {ACTOR}\n  database_path: {}\n  socket_path: {}\n  lock_path: {}\n  artifact_path: {}\n",
+            database.display(),
+            socket.display(),
+            root.join("k").display(),
+            root.join("a").display()
+        ))?;
+        let mut harness = Self {
+            test_roots,
+            root,
+            config,
+            socket,
+            database,
+            clock: codrik::runtime::model::ManualClock::new(1_000),
+            llm,
+            shutdown: None,
+            task: None,
+        };
+        harness.spawn().await?;
+        Ok(harness)
+    }
+
+    async fn spawn(&mut self) -> Result<()> {
+        let (shutdown, stopped) = oneshot::channel();
+        self.shutdown = Some(shutdown);
+        let config = self.config.clone();
+        let root = self.root.clone();
+        let clock = self.clock.clone();
+        let llm = self.llm.clone();
+        self.task = Some(tokio::spawn(async move {
+            codrik::app::serve_with_dependencies(config, root, clock, llm, async move {
+                let _ = stopped.await;
+            })
+            .await
+        }));
+        let probe_request = request_id();
+        let readiness = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+                    if send_frame(
+                        &mut stream,
+                        json!({"type":"resume","request_id":probe_request.clone()}),
+                    )
+                    .is_ok()
+                        && wait_for_type(&mut stream, "request_error").is_ok()
+                    {
+                        return;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if readiness.is_err() {
+            if self
+                .task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let result = self.task.take().expect("finished task").await;
+                return match result {
+                    Ok(Ok(())) => bail!("injected runtime exited before readiness"),
+                    Ok(Err(error)) => Err(error).context("injected runtime startup failed"),
+                    Err(error) => Err(error).context("injected runtime task failed"),
+                };
+            }
+            readiness.context("injected runtime readiness")?;
+        }
+        Ok(())
+    }
+
+    async fn crash(&mut self) {
+        self.shutdown.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    async fn scalar(&self, sql: impl Into<String>) -> Result<String> {
+        let connection = tokio_rusqlite::Connection::open(&self.database).await?;
+        let sql = sql.into();
+        connection
+            .call(move |db| db.query_row(&sql, [], |row| row.get(0)))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn wait_scalar(&self, sql: &str, expected: &str) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(self.scalar(sql.to_owned()).await, Ok(value) if value == expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("database barrier `{sql}` did not reach `{expected}`"))?;
+        Ok(())
+    }
+}
+
+impl Drop for InjectedHarness {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir(&self.test_roots);
     }
 }
 
@@ -415,23 +662,144 @@ fn wait_for_type(stream: &mut UnixStream, expected: &str) -> Result<Value> {
     }
 }
 
-fn final_bundle(stream: &mut UnixStream) -> Result<(String, Vec<String>, bool)> {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct VerifiedManifestEntry {
+    delivery_id: String,
+    payload_kind: String,
+    decoded_bytes: usize,
+    sha256: String,
+    chunk_count: usize,
+}
+
+#[derive(Debug)]
+struct VerifiedDelivery {
+    manifest: VerifiedManifestEntry,
+    bytes: Vec<u8>,
+    payload: Value,
+}
+
+#[derive(Debug)]
+struct VerifiedBundle {
+    request_id: String,
+    bundle_id: String,
+    replay: bool,
+    manifest_sha256: String,
+    chunk_frames: usize,
+    deliveries: Vec<VerifiedDelivery>,
+}
+
+impl VerifiedBundle {
+    fn delivery_ids(&self) -> Vec<String> {
+        self.deliveries
+            .iter()
+            .map(|delivery| delivery.manifest.delivery_id.clone())
+            .collect()
+    }
+
+    fn text(&self) -> Option<&str> {
+        self.deliveries.iter().find_map(|delivery| {
+            (delivery.manifest.payload_kind == "text")
+                .then(|| delivery.payload["text"].as_str())
+                .flatten()
+        })
+    }
+}
+
+fn final_bundle(stream: &mut UnixStream, expected_request: &str) -> Result<VerifiedBundle> {
     let begin = wait_for_type(stream, "final_begin")?;
-    let bundle = begin["body"]["bundle_id"]
+    let request_id = begin["body"]["request_id"]
+        .as_str()
+        .context("request id")?
+        .to_owned();
+    assert_eq!(request_id, expected_request);
+    let bundle_id = begin["body"]["bundle_id"]
         .as_str()
         .context("bundle id")?
         .to_owned();
     let replay = begin["body"]["replay"].as_bool().unwrap_or(false);
-    let deliveries = begin["body"]["manifest"]
-        .as_array()
-        .context("manifest")?
+    let manifest: Vec<VerifiedManifestEntry> =
+        serde_json::from_value(begin["body"]["manifest"].clone())?;
+    assert!(!manifest.is_empty());
+    let mut deliveries = manifest
         .iter()
-        .map(|entry| entry["delivery_id"].as_str().unwrap().to_owned())
-        .collect();
+        .cloned()
+        .map(|manifest| VerifiedDelivery {
+            manifest,
+            bytes: Vec::new(),
+            payload: Value::Null,
+        })
+        .collect::<Vec<_>>();
+    let mut delivery_index = 0;
+    let mut next_chunk = 0;
+    let mut chunk_frames = 0;
     loop {
         let event = read_frame(stream)?;
-        if event["body"]["type"] == "final_end" {
-            return Ok((bundle, deliveries, replay));
+        let body = &event["body"];
+        match body["type"].as_str() {
+            Some("final_chunk") => {
+                assert_eq!(body["request_id"], expected_request);
+                assert_eq!(body["bundle_id"], bundle_id);
+                let delivery = deliveries
+                    .get_mut(delivery_index)
+                    .context("extra final chunk")?;
+                assert_eq!(body["delivery_id"], delivery.manifest.delivery_id);
+                assert_eq!(body["chunk_index"], next_chunk);
+                let encoded = body["bytes_base64"].as_str().context("chunk base64")?;
+                let offset = next_chunk * codrik::runtime::MAX_FINAL_CHUNK_BYTES;
+                let expected_bytes = (delivery.manifest.decoded_bytes - offset)
+                    .min(codrik::runtime::MAX_FINAL_CHUNK_BYTES);
+                assert_eq!(encoded.len(), expected_bytes.div_ceil(3) * 4);
+                let decoded = STANDARD.decode(encoded)?;
+                assert_eq!(decoded.len(), expected_bytes);
+                delivery.bytes.extend_from_slice(&decoded);
+                chunk_frames += 1;
+                next_chunk += 1;
+                if next_chunk == delivery.manifest.chunk_count {
+                    delivery_index += 1;
+                    next_chunk = 0;
+                }
+            }
+            Some("final_end") => {
+                assert_eq!(body["request_id"], expected_request);
+                assert_eq!(body["bundle_id"], bundle_id);
+                assert_eq!(delivery_index, deliveries.len());
+                assert_eq!(next_chunk, 0);
+                let manifest_sha256 = body["manifest_sha256"]
+                    .as_str()
+                    .context("manifest hash")?
+                    .to_owned();
+                assert_eq!(
+                    manifest_sha256,
+                    format!("{:x}", Sha256::digest(serde_json::to_vec(&manifest)?))
+                );
+                for delivery in &mut deliveries {
+                    assert_eq!(delivery.bytes.len(), delivery.manifest.decoded_bytes);
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(&delivery.bytes)),
+                        delivery.manifest.sha256
+                    );
+                    delivery.payload = serde_json::from_slice(&delivery.bytes)?;
+                    assert_eq!(delivery.payload["type"], delivery.manifest.payload_kind);
+                    match delivery.manifest.payload_kind.as_str() {
+                        "text" => assert!(delivery.payload["text"].is_string()),
+                        "file" => assert!(delivery.payload["artifact"].is_object()),
+                        "terminal_error" => {
+                            assert!(delivery.payload["code"].is_string());
+                            assert!(delivery.payload["message"].is_string());
+                        }
+                        kind => bail!("unknown final payload kind {kind}"),
+                    }
+                }
+                return Ok(VerifiedBundle {
+                    request_id,
+                    bundle_id,
+                    replay,
+                    manifest_sha256,
+                    chunk_frames,
+                    deliveries,
+                });
+            }
+            event_type => bail!("unexpected event inside final bundle: {event_type:?}"),
         }
     }
 }
@@ -465,13 +833,27 @@ async fn scenario_01_submit_streams_verified_final_and_acks_delivery() -> Result
             fs::read_to_string(&harness.log).unwrap_or_default()
         )
     })?;
-    let (bundle, deliveries, _) = final_bundle(&mut stream).with_context(|| {
+    let verified = final_bundle(&mut stream, &request).with_context(|| {
         format!(
             "daemon log:\n{}",
             fs::read_to_string(&harness.log).unwrap_or_default()
         )
     })?;
-    ack(&harness.socket, &request, &bundle, &deliveries)?;
+    assert_eq!(verified.request_id, request);
+    assert_eq!(verified.text(), Some("hello world"));
+    assert!(!verified.replay);
+    assert_eq!(
+        harness
+            .scalar("SELECT id FROM result_bundles LIMIT 1")
+            .await?,
+        verified.bundle_id
+    );
+    ack(
+        &harness.socket,
+        &request,
+        &verified.bundle_id,
+        &verified.delivery_ids(),
+    )?;
     assert_eq!(
         harness
             .scalar("SELECT state FROM result_bundles LIMIT 1")
@@ -494,7 +876,7 @@ async fn scenario_02_duplicate_submit_creates_one_durable_execution() -> Result<
     wait_for_type(&mut first, "accepted")?;
     let mut duplicate = submit(&harness.socket, &request, "same")?;
     wait_for_type(&mut duplicate, "accepted")?;
-    let _ = final_bundle(&mut duplicate)?;
+    let _ = final_bundle(&mut duplicate, &request)?;
     assert_eq!(harness.count("local_requests").await?, 1);
     assert_eq!(harness.count("events").await?, 1);
     assert_eq!(harness.provider.calls.load(Ordering::SeqCst), 1);
@@ -532,7 +914,7 @@ async fn scenario_04_disconnect_during_streaming_does_not_cancel_work() -> Resul
     drop(stream);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut resumed = resume(&harness.socket, &request)?;
-    let _ = final_bundle(&mut resumed)?;
+    let _ = final_bundle(&mut resumed, &request)?;
     assert_eq!(
         harness
             .scalar("SELECT state FROM local_requests LIMIT 1")
@@ -554,11 +936,16 @@ async fn scenario_05_resume_joins_live_run_or_replays_completion() -> Result<()>
     let mut submitted = submit(&harness.socket, &request, "resume me")?;
     wait_for_type(&mut submitted, "accepted")?;
     let mut live = resume(&harness.socket, &request)?;
-    let (bundle, deliveries, _) = final_bundle(&mut live)?;
-    ack(&harness.socket, &request, &bundle, &deliveries)?;
+    let bundle = final_bundle(&mut live, &request)?;
+    ack(
+        &harness.socket,
+        &request,
+        &bundle.bundle_id,
+        &bundle.delivery_ids(),
+    )?;
     let mut replay = resume(&harness.socket, &request)?;
-    let (_, _, replayed) = final_bundle(&mut replay)?;
-    assert!(replayed);
+    let replayed = final_bundle(&mut replay, &request)?;
+    assert!(replayed.replay);
     Ok(())
 }
 
@@ -567,7 +954,7 @@ async fn scenario_06_multiple_incorporated_requests_receive_final_rows() -> Resu
     let _serial = serialize_acceptance();
     let harness = RuntimeHarness::start(vec![ProviderReply::Text {
         text: "shared".into(),
-        pause_ms: 150,
+        pause_ms: 1_000,
     }])
     .await?;
     let first_id = request_id();
@@ -576,58 +963,236 @@ async fn scenario_06_multiple_incorporated_requests_receive_final_rows() -> Resu
     wait_for_type(&mut first, "accepted")?;
     let mut second = submit(&harness.socket, &second_id, "second")?;
     wait_for_type(&mut second, "accepted")?;
-    let _ = final_bundle(&mut first)?;
-    let _ = final_bundle(&mut second)?;
+    harness
+        .wait_scalar(
+            "SELECT CASE WHEN runs.state='active' AND COUNT(run_events.event_id)=2 AND SUM(run_events.incorporated)=2 THEN 'shared-active' ELSE 'not-ready' END FROM runs JOIN run_events ON run_events.run_id=runs.id GROUP BY runs.id",
+            "shared-active",
+        )
+        .await?;
+    let first_bundle = final_bundle(&mut first, &first_id)?;
+    let second_bundle = final_bundle(&mut second, &second_id)?;
     assert_eq!(harness.count("result_bundles").await?, 2);
+    assert_eq!(
+        harness
+            .scalar("SELECT CAST(COUNT(DISTINCT work_item_id) AS TEXT) FROM local_requests")
+            .await?,
+        "1"
+    );
+    assert_eq!(
+        harness
+            .scalar("SELECT CAST(COUNT(DISTINCT run_id) AS TEXT) FROM events")
+            .await?,
+        "1"
+    );
+    assert_eq!(
+        harness
+            .scalar("SELECT CAST(COUNT(*) AS TEXT) FROM run_events WHERE incorporated=1")
+            .await?,
+        "2"
+    );
+    assert_eq!(
+        harness.scalar("SELECT state FROM runs LIMIT 1").await?,
+        "completed"
+    );
+    assert_eq!(
+        harness
+            .scalar("SELECT state FROM work_items LIMIT 1")
+            .await?,
+        "completed"
+    );
+    assert_eq!(
+        harness
+            .scalar_owned(format!(
+                "SELECT result_bundle_id FROM local_requests WHERE request_id='{first_id}'"
+            ))
+            .await?,
+        first_bundle.bundle_id
+    );
+    assert_eq!(
+        harness
+            .scalar_owned(format!(
+                "SELECT result_bundle_id FROM local_requests WHERE request_id='{second_id}'"
+            ))
+            .await?,
+        second_bundle.bundle_id
+    );
+    assert_eq!(harness.count("outbox_deliveries").await?, 2);
+    assert_eq!(harness.count("outbox").await?, 1);
+    assert_eq!(harness.provider.calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_07_restart_after_ingress_preserves_durable_state() -> Result<()> {
     let _serial = serialize_acceptance();
-    let mut harness = RuntimeHarness::start(vec![ProviderReply::Text {
-        text: "after restart".into(),
-        pause_ms: 300,
-    }])
-    .await?;
+    use codrik::runtime::{
+        model::{ActorId, RequestId, Timestamp},
+        sqlite::SqliteRuntimeStore,
+        store::{
+            CheckpointRun, CheckpointStore, DispatchStore, LocalIngressStore, LocalSubmission,
+        },
+    };
+
+    // Boundary A: ingress is durable, but no run has attached it yet.
+    let mut ingress =
+        InjectedHarness::start(vec![InjectedReply::Text("after ingress".into())]).await?;
+    ingress.crash().await;
     let request = request_id();
-    let mut stream = submit(&harness.socket, &request, "crash boundary")?;
-    wait_for_type(&mut stream, "accepted")?;
-    harness.restart()?;
-    let mut resumed = resume(&harness.socket, &request)?;
-    let _ = final_bundle(&mut resumed)?;
-    assert_eq!(harness.count("local_requests").await?, 1);
+    let store = SqliteRuntimeStore::open(&ingress.database).await?;
+    store
+        .submit_for_actor(
+            &ActorId::from_string(ACTOR),
+            LocalSubmission {
+                request_id: RequestId::parse(&request)?,
+                text: "durable ingress".into(),
+                prompt_sha256: format!("{:x}", Sha256::digest(b"durable ingress")),
+            },
+            Timestamp(1_000),
+        )
+        .await?;
+    assert_eq!(
+        ingress
+            .scalar("SELECT CAST(COUNT(*) AS TEXT) FROM runs")
+            .await?,
+        "0"
+    );
+    ingress.spawn().await.context("boundary A restart")?;
+    let mut resumed = resume(&ingress.socket, &request)?;
+    assert_eq!(
+        final_bundle(&mut resumed, &request)?.text(),
+        Some("after ingress")
+    );
+    assert_eq!(ingress.llm.calls.load(Ordering::SeqCst), 1);
+
+    // Boundary B: a run is attached and its source event is incorporated, but
+    // no model checkpoint or terminal result exists.
+    let mut incorporated =
+        InjectedHarness::start(vec![InjectedReply::Text("after incorporation".into())]).await?;
+    incorporated.crash().await;
+    let request = request_id();
+    let store = SqliteRuntimeStore::open(&incorporated.database).await?;
+    store
+        .submit_for_actor(
+            &ActorId::from_string(ACTOR),
+            LocalSubmission {
+                request_id: RequestId::parse(&request)?,
+                text: "incorporated".into(),
+                prompt_sha256: format!("{:x}", Sha256::digest(b"incorporated")),
+            },
+            Timestamp(1_000),
+        )
+        .await?;
+    let lease = store
+        .acquire_ready_actor_for(
+            &ActorId::from_string(ACTOR),
+            "boundary-b",
+            Timestamp(1_000),
+            Timestamp(31_000),
+        )
+        .await?
+        .context("boundary B lease")?;
+    let run = store
+        .attach_next_run(&lease, 8, Timestamp(1_000))
+        .await?
+        .context("boundary B attached run")?;
+    store
+        .checkpoint_run(
+            CheckpointRun {
+                run: run.clone(),
+                incorporated_event_ids: run.source_event_ids.clone(),
+                checkpointed_attempt_ids: Vec::new(),
+                messages: Vec::new(),
+            },
+            Timestamp(1_000),
+        )
+        .await?;
+    assert_eq!(
+        incorporated
+            .scalar("SELECT CAST(COUNT(*) AS TEXT) FROM run_events WHERE incorporated=1")
+            .await?,
+        "1"
+    );
+    incorporated.clock.advance(31_000);
+    incorporated.spawn().await.context("boundary B restart")?;
+    let mut resumed = resume(&incorporated.socket, &request)?;
+    assert_eq!(
+        final_bundle(&mut resumed, &request)?.text(),
+        Some("after incorporation")
+    );
+    assert_eq!(incorporated.llm.calls.load(Ordering::SeqCst), 1);
+
+    // Boundary C: the first model/tool checkpoint is committed. The second
+    // model call is deliberately held in-flight, then the supervisor crashes;
+    // restart conservatively repeats that ambiguous call.
+    let llm = InjectedLlm::blocking(
+        vec![
+            InjectedReply::ToolCall,
+            InjectedReply::Text("after checkpoint".into()),
+        ],
+        2,
+    );
+    let mut checkpoint = InjectedHarness::start_with_llm(llm).await?;
+    let request = request_id();
+    let mut submitted = submit(&checkpoint.socket, &request, "checkpoint boundary")?;
+    wait_for_type(&mut submitted, "accepted")?;
+    checkpoint.llm.wait_calls(2).await;
+    checkpoint
+        .wait_scalar(
+            "SELECT CASE WHEN COUNT(*) > 0 THEN 'committed' ELSE 'missing' END FROM recent_messages",
+            "committed",
+        )
+        .await?;
+    checkpoint.crash().await;
+    checkpoint.clock.advance(31_000);
+    checkpoint.spawn().await.context("boundary C restart")?;
+    let mut resumed = resume(&checkpoint.socket, &request)?;
+    assert_eq!(
+        final_bundle(&mut resumed, &request)?.text(),
+        Some("after checkpoint")
+    );
+    assert_eq!(checkpoint.llm.calls.load(Ordering::SeqCst), 3);
+
+    // Boundary D: terminal finalization is durable before delivery ACK.
+    let mut terminal =
+        InjectedHarness::start(vec![InjectedReply::Text("terminal durable".into())]).await?;
+    let request = request_id();
+    let mut submitted = submit(&terminal.socket, &request, "terminal boundary")?;
+    wait_for_type(&mut submitted, "accepted")?;
+    let original = final_bundle(&mut submitted, &request)?;
+    assert_eq!(
+        terminal.scalar("SELECT state FROM local_requests").await?,
+        "completed"
+    );
+    terminal.crash().await;
+    terminal.clock.advance(60_000);
+    terminal.spawn().await.context("boundary D restart")?;
+    let mut resumed = resume(&terminal.socket, &request)?;
+    let replayed = final_bundle(&mut resumed, &request)?;
+    assert_eq!(replayed.bundle_id, original.bundle_id);
+    assert_eq!(replayed.manifest_sha256, original.manifest_sha256);
+    assert_eq!(terminal.llm.calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_08_final_end_without_ack_redelivers_without_recomputation() -> Result<()> {
     let _serial = serialize_acceptance();
-    let mut harness = RuntimeHarness::start(vec![ProviderReply::Text {
-        text: "immutable".into(),
-        pause_ms: 0,
-    }])
-    .await?;
+    let mut harness = InjectedHarness::start(vec![InjectedReply::Text("immutable".into())]).await?;
     let request = request_id();
     let mut stream = submit(&harness.socket, &request, "lost ack")?;
     wait_for_type(&mut stream, "accepted")?;
-    let (original_bundle, _, _) = final_bundle(&mut stream)?;
-    harness.kill()?;
-    let db = tokio_rusqlite::Connection::open(&harness.database).await?;
-    db.call(|db| {
-        db.execute(
-            "UPDATE result_bundles SET claim_expires_at=0 WHERE state='delivering'",
-            [],
-        )?;
-        Ok::<(), tokio_rusqlite::rusqlite::Error>(())
-    })
-    .await?;
-    harness.spawn()?;
-    harness.wait_ready(Duration::from_secs(12))?;
+    let original_bundle = final_bundle(&mut stream, &request)?;
+    harness.crash().await;
+    harness.clock.advance(60_000);
+    harness.spawn().await?;
     let mut resumed = resume(&harness.socket, &request)?;
-    let (redelivered_bundle, _, _) = final_bundle(&mut resumed)?;
-    assert_eq!(redelivered_bundle, original_bundle);
-    assert_eq!(harness.provider.calls.load(Ordering::SeqCst), 1);
+    let redelivered_bundle = final_bundle(&mut resumed, &request)?;
+    assert_eq!(redelivered_bundle.bundle_id, original_bundle.bundle_id);
+    assert_eq!(
+        redelivered_bundle.manifest_sha256,
+        original_bundle.manifest_sha256
+    );
+    assert_eq!(harness.llm.calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -672,7 +1237,7 @@ async fn scenario_10_sigterm_preserves_resumable_active_state() -> Result<()> {
     harness.spawn()?;
     harness.wait_ready(Duration::from_secs(12))?;
     let mut resumed = resume(&harness.socket, &request)?;
-    let _ = final_bundle(&mut resumed)?;
+    let _ = final_bundle(&mut resumed, &request)?;
     Ok(())
 }
 
@@ -703,25 +1268,61 @@ async fn scenario_11_orphaned_running_tools_are_not_reinvoked() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_12_fifth_runtime_failure_delivers_terminal_error() -> Result<()> {
     let _serial = serialize_acceptance();
-    let harness = RuntimeHarness::start(vec![
-        ProviderReply::HttpError,
-        ProviderReply::HttpError,
-        ProviderReply::HttpError,
-        ProviderReply::HttpError,
-        ProviderReply::HttpError,
+    let mut harness = InjectedHarness::start(vec![
+        InjectedReply::Failure,
+        InjectedReply::Failure,
+        InjectedReply::Failure,
+        InjectedReply::Failure,
+        InjectedReply::Failure,
     ])
     .await?;
     let request = request_id();
     let mut stream = submit(&harness.socket, &request, "fail five times")?;
     wait_for_type(&mut stream, "accepted")?;
-    let _ = final_bundle(&mut stream)?;
+    harness.llm.wait_calls(1).await;
+    harness
+        .wait_scalar("SELECT CAST(failure_count AS TEXT) FROM work_items", "1")
+        .await?;
+    harness.clock.advance(1_000);
+    harness.llm.wait_calls(2).await;
+    harness
+        .wait_scalar("SELECT CAST(failure_count AS TEXT) FROM work_items", "2")
+        .await?;
+
+    // Restart after durable retry history exists; advancing beyond the actor
+    // lease is the deterministic recovery barrier for the new supervisor.
+    harness.crash().await;
+    harness.clock.advance(30_000);
+    harness.spawn().await?;
+    harness.llm.wait_calls(3).await;
+    harness
+        .wait_scalar("SELECT CAST(failure_count AS TEXT) FROM work_items", "3")
+        .await?;
+    harness.clock.advance(4_000);
+    harness.llm.wait_calls(4).await;
+    harness
+        .wait_scalar("SELECT CAST(failure_count AS TEXT) FROM work_items", "4")
+        .await?;
+    harness.clock.advance(8_000);
+    harness.llm.wait_calls(5).await;
+    let mut resumed = resume(&harness.socket, &request)?;
+    let terminal = final_bundle(&mut resumed, &request)?;
+    assert_eq!(terminal.deliveries.len(), 1);
+    assert_eq!(
+        terminal.deliveries[0].manifest.payload_kind,
+        "terminal_error"
+    );
+    assert_eq!(
+        terminal.deliveries[0].payload["code"],
+        "dispatcher_failure_limit"
+    );
     assert_eq!(
         harness
             .scalar("SELECT state FROM local_requests LIMIT 1")
             .await?,
         "failed_terminal"
     );
-    assert!(harness.provider.calls.load(Ordering::SeqCst) >= 5);
+    assert_eq!(harness.llm.calls.load(Ordering::SeqCst), 5);
     Ok(())
 }
 
@@ -752,7 +1353,7 @@ async fn scenario_14_disconnect_before_accepted_never_races_false_missing() -> R
     let request = request_id();
     drop(submit(&harness.socket, &request, "early disconnect")?);
     let mut resumed = resume(&harness.socket, &request)?;
-    let _ = final_bundle(&mut resumed)?;
+    let _ = final_bundle(&mut resumed, &request)?;
     assert_eq!(harness.count("local_requests").await?, 1);
     Ok(())
 }
@@ -763,7 +1364,10 @@ async fn scenario_15_large_text_and_more_than_32_routes_replay_completely() -> R
     let text = "x".repeat(300_000);
     let harness = RuntimeHarness::start(vec![
         ProviderReply::Files(33),
-        ProviderReply::Text { text, pause_ms: 0 },
+        ProviderReply::Text {
+            text: text.clone(),
+            pause_ms: 0,
+        },
     ])
     .await?;
     let workspace = harness.root.join("workspaces").join(ACTOR);
@@ -777,9 +1381,37 @@ async fn scenario_15_large_text_and_more_than_32_routes_replay_completely() -> R
     let request = request_id();
     let mut stream = submit(&harness.socket, &request, "large bundle")?;
     wait_for_type(&mut stream, "accepted")?;
-    let (_, deliveries, _) = final_bundle(&mut stream)?;
-    assert_eq!(deliveries.len(), 34);
+    let delivered = final_bundle(&mut stream, &request)?;
+    assert_eq!(delivered.deliveries.len(), 34);
+    assert_eq!(
+        delivered
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.manifest.payload_kind == "file")
+            .count(),
+        33
+    );
+    assert_eq!(delivered.text(), Some(text.as_str()));
+    assert!(delivered.chunk_frames > delivered.deliveries.len());
     assert_eq!(harness.count("outbox_deliveries").await?, 34);
+    assert_eq!(harness.provider.calls.load(Ordering::SeqCst), 2);
+    ack(
+        &harness.socket,
+        &request,
+        &delivered.bundle_id,
+        &delivered.delivery_ids(),
+    )?;
+    let mut replay = resume(&harness.socket, &request)?;
+    let replayed = final_bundle(&mut replay, &request)?;
+    assert!(replayed.replay);
+    assert_eq!(replayed.bundle_id, delivered.bundle_id);
+    assert_eq!(replayed.manifest_sha256, delivered.manifest_sha256);
+    assert_eq!(replayed.text(), Some(text.as_str()));
+    assert_eq!(replayed.delivery_ids(), delivered.delivery_ids());
+    for (actual, expected) in replayed.deliveries.iter().zip(&delivered.deliveries) {
+        assert_eq!(actual.bytes, expected.bytes);
+    }
+    assert_eq!(harness.provider.calls.load(Ordering::SeqCst), 2);
     Ok(())
 }
 
@@ -810,18 +1442,48 @@ async fn scenario_16_cancel_terminalizes_every_active_request_on_work_item() -> 
             .len(),
         2
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if harness
-            .scalar("SELECT CAST(COUNT(*) AS TEXT) FROM local_requests WHERE state='cancelled'")
-            .await?
-            == "2"
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let first_bundle = final_bundle(&mut first, &first_id)?;
+    let second_bundle = final_bundle(&mut second, &second_id)?;
+    for bundle in [&first_bundle, &second_bundle] {
+        assert_eq!(bundle.deliveries.len(), 1);
+        assert_eq!(bundle.deliveries[0].manifest.payload_kind, "terminal_error");
+        assert_eq!(bundle.deliveries[0].payload["code"], "cancelled");
     }
-    bail!("requests did not both cancel")
+    assert_eq!(
+        harness
+            .scalar("SELECT CAST(COUNT(*) AS TEXT) FROM local_requests WHERE state='cancelled'")
+            .await?,
+        "2"
+    );
+    assert_eq!(
+        harness
+            .scalar_owned(format!(
+                "SELECT result_bundle_id FROM local_requests WHERE request_id='{first_id}'"
+            ))
+            .await?,
+        first_bundle.bundle_id
+    );
+    assert_eq!(
+        harness
+            .scalar_owned(format!(
+                "SELECT result_bundle_id FROM local_requests WHERE request_id='{second_id}'"
+            ))
+            .await?,
+        second_bundle.bundle_id
+    );
+    ack(
+        &harness.socket,
+        &first_id,
+        &first_bundle.bundle_id,
+        &first_bundle.delivery_ids(),
+    )?;
+    ack(
+        &harness.socket,
+        &second_id,
+        &second_bundle.bundle_id,
+        &second_bundle.delivery_ids(),
+    )?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -846,7 +1508,7 @@ async fn scenario_17_slow_or_malformed_clients_do_not_exhaust_daemon() -> Result
     let request = request_id();
     let mut valid = submit(&harness.socket, &request, "still responsive")?;
     wait_for_type(&mut valid, "accepted")?;
-    let _ = final_bundle(&mut valid)?;
+    let _ = final_bundle(&mut valid, &request)?;
     drop(slow);
     Ok(())
 }
