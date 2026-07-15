@@ -312,13 +312,31 @@ impl ConnectionHandler {
                 bundle_id,
                 delivery_ids,
             } => {
-                self.outbox
+                let result = self
+                    .outbox
                     .acknowledge(BundleAck {
-                        request_id,
-                        bundle_id,
+                        request_id: request_id.clone(),
+                        bundle_id: bundle_id.clone(),
                         delivery_ids,
                     })
-                    .await?;
+                    .await;
+                match result {
+                    Ok(_) => {
+                        sink.send_control(ServerEvent::new(ServerEventBody::AckAccepted {
+                            request_id,
+                            bundle_id,
+                        }))
+                        .await?;
+                    }
+                    Err(error) => {
+                        sink.send_control(request_error(
+                            request_id,
+                            "ack_failed",
+                            &format!("durable final acknowledgement failed: {error}"),
+                        ))
+                        .await?;
+                    }
+                }
                 sink.close().await
             }
         }
@@ -791,7 +809,7 @@ mod tests {
         time::Duration,
     };
 
-    use anyhow::Result;
+    use anyhow::{Result, bail};
     use async_trait::async_trait;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, split},
@@ -1060,6 +1078,7 @@ mod tests {
     #[derive(Default)]
     struct TestOutbox {
         acks: Mutex<Vec<BundleAck>>,
+        ack_error: Mutex<Option<String>>,
         replay: AtomicBool,
         replay_calls: AtomicUsize,
         replay_events: Mutex<Vec<ServerEvent>>,
@@ -1078,6 +1097,9 @@ mod tests {
     #[async_trait]
     impl IpcOutbox for TestOutbox {
         async fn acknowledge(&self, ack: BundleAck) -> Result<AckOutcome> {
+            if let Some(message) = self.ack_error.lock().unwrap().clone() {
+                bail!(message);
+            }
             self.acks.lock().unwrap().push(ack);
             Ok(AckOutcome::Delivered)
         }
@@ -1994,7 +2016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_delegates_exact_bundle_ack_then_closes_without_response() -> Result<()> {
+    async fn ack_delegates_exact_bundle_ack_then_emits_positive_response() -> Result<()> {
         let request = RequestId::new();
         let bundle = BundleId::new();
         let deliveries = vec![DeliveryId::new(), DeliveryId::new()];
@@ -2010,6 +2032,14 @@ mod tests {
                 delivery_ids: deliveries.clone(),
             }))
             .await?;
+        let event = FrameReader::new(&mut client).read_server_event().await?;
+        assert_eq!(
+            event.body,
+            ServerEventBody::AckAccepted {
+                request_id: request.clone(),
+                bundle_id: bundle.clone(),
+            }
+        );
         task.await??;
         assert_eq!(
             outbox.acks.lock().unwrap().as_slice(),
@@ -2019,6 +2049,35 @@ mod tests {
                 delivery_ids: deliveries,
             }]
         );
+        let mut byte = [0_u8; 1];
+        assert_eq!(client.read(&mut byte).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_failure_emits_request_error_and_never_ack_accepted() -> Result<()> {
+        let request = RequestId::new();
+        let bundle = BundleId::new();
+        let mut handler = test_handler();
+        let outbox = Arc::new(TestOutbox::default());
+        *outbox.ack_error.lock().unwrap() = Some("commit failed".into());
+        handler.outbox = outbox;
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::AckFinal {
+                request_id: request.clone(),
+                bundle_id: bundle,
+                delivery_ids: vec![DeliveryId::new()],
+            }))
+            .await?;
+        let event = FrameReader::new(&mut client).read_server_event().await?;
+        assert!(matches!(
+            event.body,
+            ServerEventBody::RequestError { request_id, code, .. }
+                if request_id == request && code == "ack_failed"
+        ));
+        task.await??;
         let mut byte = [0_u8; 1];
         assert_eq!(client.read(&mut byte).await?, 0);
         Ok(())

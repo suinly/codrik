@@ -6,9 +6,9 @@ mod tests {
 
     use super::{LocalRenderer, RenderAction};
     use crate::runtime::{
-        BundleId, BundleState, DeliveryId, RequestId,
+        ArtifactId, BundleId, BundleState, DeliveryId, RequestId,
         ipc::protocol::{FinalManifestEntry, ServerEvent, ServerEventBody, encode_bundle},
-        store::{BundleManifest, FinalPayload, ResultBundle},
+        store::{BundleManifest, FinalPayload, ManagedArtifact, ResultBundle},
     };
 
     #[test]
@@ -89,7 +89,7 @@ mod tests {
             bundle_id: bundle.clone(),
             delivery_id: delivery,
             chunk_index: 0,
-            bytes_base64: STANDARD.encode(b"tampered"),
+            bytes_base64: STANDARD.encode(vec![b'x'; bytes.len()]),
         }))?;
         assert!(
             renderer
@@ -99,6 +99,236 @@ mod tests {
                     manifest_sha256: manifest_hash,
                 }))
                 .is_err()
+        );
+        assert!(renderer.output().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn chunks_must_be_contiguous_in_manifest_delivery_order() -> Result<()> {
+        let request = RequestId::new();
+        let text = "x".repeat(crate::runtime::MAX_FINAL_CHUNK_BYTES + 1);
+        let mut events = final_events(&request, &text)?;
+        let first_chunk = events.remove(1);
+        let second_chunk = events.remove(1);
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request);
+        renderer.handle(events.remove(0))?;
+        assert!(renderer.handle(second_chunk).is_err());
+        assert!(renderer.output().is_empty());
+        drop(first_chunk);
+        Ok(())
+    }
+
+    #[test]
+    fn one_bundle_buffer_capacity_never_exceeds_decoded_limit() -> Result<()> {
+        let request = RequestId::new();
+        let delivery = DeliveryId::new();
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        renderer.handle(ServerEvent::new(ServerEventBody::FinalBegin {
+            request_id: request,
+            bundle_id: BundleId::new(),
+            replay: false,
+            manifest: vec![FinalManifestEntry {
+                delivery_id: delivery,
+                payload_kind: "text".into(),
+                decoded_bytes: crate::runtime::MAX_BUNDLE_BYTES,
+                sha256: "0".repeat(64),
+                chunk_count: crate::runtime::MAX_BUNDLE_BYTES
+                    .div_ceil(crate::runtime::MAX_FINAL_CHUNK_BYTES),
+            }],
+        }))?;
+        assert!(renderer.buffer_capacity_bytes() <= crate::runtime::MAX_BUNDLE_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_id_duplicate_missing_and_interleaved_chunks_before_output() -> Result<()> {
+        let request = RequestId::new();
+        let bundle = ResultBundle {
+            id: BundleId::new(),
+            request_id: request.clone(),
+            state: BundleState::Delivered,
+            manifest: BundleManifest {
+                entries: vec![],
+                sha256: String::new(),
+            },
+            deliveries: vec![
+                (DeliveryId::new(), FinalPayload::Text { text: "one".into() }),
+                (DeliveryId::new(), FinalPayload::Text { text: "two".into() }),
+            ],
+        };
+        let events = encode_bundle(&bundle, false)?;
+
+        let mut wrong_id = events.clone();
+        if let ServerEventBody::FinalChunk { request_id, .. } = &mut wrong_id[1].body {
+            *request_id = RequestId::new();
+        }
+        assert_rejected(&request, wrong_id)?;
+
+        let mut wrong_bundle = events.clone();
+        if let ServerEventBody::FinalChunk { bundle_id, .. } = &mut wrong_bundle[1].body {
+            *bundle_id = BundleId::new();
+        }
+        assert_rejected(&request, wrong_bundle)?;
+
+        let mut wrong_delivery = events.clone();
+        if let ServerEventBody::FinalChunk { delivery_id, .. } = &mut wrong_delivery[1].body {
+            *delivery_id = DeliveryId::new();
+        }
+        assert_rejected(&request, wrong_delivery)?;
+
+        let mut interleaved = events.clone();
+        interleaved.swap(1, 2);
+        assert_rejected(&request, interleaved)?;
+
+        let mut duplicate = events.clone();
+        duplicate.insert(2, duplicate[1].clone());
+        assert_rejected(&request, duplicate)?;
+
+        let mut missing = events;
+        missing.remove(1);
+        assert_rejected(&request, missing)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_bad_base64_size_manifest_hash_and_payload_kind_before_output() -> Result<()> {
+        let request = RequestId::new();
+        let events = final_events(&request, "payload")?;
+
+        let mut bad_base64 = events.clone();
+        if let ServerEventBody::FinalChunk { bytes_base64, .. } = &mut bad_base64[1].body {
+            *bytes_base64 = "!".repeat(bytes_base64.len());
+        }
+        assert_rejected(&request, bad_base64)?;
+
+        let mut bad_manifest_hash = events.clone();
+        if let ServerEventBody::FinalEnd {
+            manifest_sha256, ..
+        } = &mut bad_manifest_hash[2].body
+        {
+            *manifest_sha256 = "0".repeat(64);
+        }
+        assert_rejected(&request, bad_manifest_hash)?;
+
+        let mut bad_kind = events;
+        let manifest = match &mut bad_kind[0].body {
+            ServerEventBody::FinalBegin { manifest, .. } => {
+                manifest[0].payload_kind = "file".into();
+                manifest.clone()
+            }
+            _ => unreachable!(),
+        };
+        if let ServerEventBody::FinalEnd {
+            manifest_sha256, ..
+        } = &mut bad_kind[2].body
+        {
+            *manifest_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&manifest)?));
+        }
+        assert_rejected(&request, bad_kind)?;
+
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        assert!(
+            renderer
+                .handle(ServerEvent::new(ServerEventBody::FinalBegin {
+                    request_id: request,
+                    bundle_id: BundleId::new(),
+                    replay: false,
+                    manifest: vec![FinalManifestEntry {
+                        delivery_id: DeliveryId::new(),
+                        payload_kind: "text".into(),
+                        decoded_bytes: crate::runtime::MAX_BUNDLE_BYTES + 1,
+                        sha256: "0".repeat(64),
+                        chunk_count: (crate::runtime::MAX_BUNDLE_BYTES + 1)
+                            .div_ceil(crate::runtime::MAX_FINAL_CHUNK_BYTES),
+                    }],
+                }))
+                .is_err()
+        );
+        assert!(renderer.output().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn renders_verified_file_and_terminal_error_payloads() -> Result<()> {
+        let request = RequestId::new();
+        let artifact = ManagedArtifact {
+            id: ArtifactId::new(),
+            managed_path: "/tmp/result.txt".into(),
+            display_name: "result.txt".into(),
+            media_type: "text/plain".into(),
+            size: 3,
+            sha256: "a".repeat(64),
+            caption: Some("caption".into()),
+        };
+        let bundle = ResultBundle {
+            id: BundleId::new(),
+            request_id: request.clone(),
+            state: BundleState::Delivered,
+            manifest: BundleManifest {
+                entries: vec![],
+                sha256: String::new(),
+            },
+            deliveries: vec![
+                (DeliveryId::new(), FinalPayload::File { artifact }),
+                (
+                    DeliveryId::new(),
+                    FinalPayload::TerminalError {
+                        code: "failed".into(),
+                        message: "try again".into(),
+                    },
+                ),
+            ],
+        };
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request);
+        for event in encode_bundle(&bundle, false)? {
+            renderer.handle(event)?;
+        }
+        assert_eq!(
+            String::from_utf8(renderer.into_inner())?,
+            "/tmp/result.txt\nError [failed]: try again\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn final_begin_is_accepted_only_once_per_renderer() -> Result<()> {
+        let request = RequestId::new();
+        let events = final_events(&request, "done")?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request);
+        for event in events.clone() {
+            renderer.handle(event)?;
+        }
+        assert!(renderer.handle(events[0].clone()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn renders_escaped_json_strings_from_borrowed_bundle_storage() -> Result<()> {
+        let request = RequestId::new();
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        for event in final_events(&request, "line one\n\"quoted\" 🙂")? {
+            renderer.handle(event)?;
+        }
+        assert_eq!(
+            String::from_utf8(renderer.into_inner())?,
+            "line one\n\"quoted\" 🙂\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_during_bundle_returns_recovery_without_output() -> Result<()> {
+        let request = RequestId::new();
+        let events = final_events(&request, "done")?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        renderer.handle(events[0].clone())?;
+        assert_eq!(
+            renderer.handle(ServerEvent::new(ServerEventBody::ServerShuttingDown {
+                request_id: Some(request),
+                resume_command: None,
+            }))?,
+            RenderAction::Recover
         );
         assert!(renderer.output().is_empty());
         Ok(())
@@ -120,21 +350,32 @@ mod tests {
             false,
         )?)
     }
+
+    fn assert_rejected(request: &RequestId, events: Vec<ServerEvent>) -> Result<()> {
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut rejected = false;
+        for event in events {
+            if renderer.handle(event).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+        assert!(renderer.output().is_empty());
+        Ok(())
+    }
 }
-use std::{
-    collections::{HashMap, HashSet},
-    io::{self, IsTerminal, Write},
-};
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
 use crate::runtime::{
     BundleId, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES, MAX_FINAL_CHUNK_BYTES,
     MAX_MANIFEST_BYTES, RequestId,
     ipc::protocol::{FinalManifestEntry, ServerEvent, ServerEventBody},
-    store::FinalPayload,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,14 +400,22 @@ pub struct LocalRenderer<W> {
     transient_written: bool,
     spinner_frame: usize,
     bundle: Option<PendingBundle>,
+    final_seen: bool,
 }
 
 struct PendingBundle {
     request_id: RequestId,
     bundle_id: BundleId,
     manifest: Vec<FinalManifestEntry>,
-    chunks: HashMap<DeliveryId, Vec<Option<Vec<u8>>>>,
+    deliveries: Vec<BufferedDelivery>,
+    current_delivery: usize,
+    next_chunk: usize,
     buffered_bytes: usize,
+}
+
+struct BufferedDelivery {
+    bytes: Vec<u8>,
+    digest: Sha256,
 }
 
 impl LocalRenderer<io::Stdout> {
@@ -187,6 +436,7 @@ impl<W: Write> LocalRenderer<W> {
             transient_written: false,
             spinner_frame: 0,
             bundle: None,
+            final_seen: false,
         }
     }
 
@@ -201,6 +451,21 @@ impl<W: Write> LocalRenderer<W> {
     }
 
     pub fn handle(&mut self, event: ServerEvent) -> Result<RenderAction> {
+        if self.final_seen {
+            bail!("received an event after the final bundle completed")
+        }
+        if self.bundle.is_some()
+            && !matches!(
+                event.body,
+                ServerEventBody::FinalChunk { .. }
+                    | ServerEventBody::FinalEnd { .. }
+                    | ServerEventBody::RequestError { .. }
+                    | ServerEventBody::ProtocolError { .. }
+                    | ServerEventBody::ServerShuttingDown { .. }
+            )
+        {
+            bail!("received a non-final event while a final bundle was in progress")
+        }
         match event.body {
             ServerEventBody::Accepted { request_id, .. } => {
                 self.require_request(&request_id)?;
@@ -210,6 +475,12 @@ impl<W: Write> LocalRenderer<W> {
             ServerEventBody::CancelAccepted { request_id, .. } => {
                 self.require_request(&request_id)?;
                 Ok(RenderAction::CancelAccepted)
+            }
+            ServerEventBody::AckAccepted { request_id, .. } => {
+                self.require_request(&request_id)?;
+                Ok(RenderAction::DaemonError(
+                    "unexpected final acknowledgement on operation stream".into(),
+                ))
             }
             ServerEventBody::Activity { request_id, .. } => {
                 self.require_request(&request_id)?;
@@ -308,7 +579,7 @@ impl<W: Write> LocalRenderer<W> {
         manifest: Vec<FinalManifestEntry>,
     ) -> Result<()> {
         self.require_request(&request_id)?;
-        if self.bundle.is_some() {
+        if self.bundle.is_some() || self.final_seen {
             bail!("received a second final bundle before the first completed")
         }
         if manifest.is_empty() || manifest.len() > MAX_BUNDLE_DELIVERIES {
@@ -318,9 +589,9 @@ impl<W: Write> LocalRenderer<W> {
         if canonical.len() > MAX_MANIFEST_BYTES {
             bail!("final manifest exceeds protocol limit")
         }
-        let mut seen = HashSet::new();
+        let mut seen = std::collections::HashSet::new();
         let mut decoded_total = 0usize;
-        let mut chunks = HashMap::new();
+        let mut deliveries = Vec::with_capacity(manifest.len());
         for entry in &manifest {
             if !seen.insert(entry.delivery_id.clone()) {
                 bail!("final manifest contains a duplicate delivery ID")
@@ -341,13 +612,18 @@ impl<W: Write> LocalRenderer<W> {
             if decoded_total > MAX_BUNDLE_BYTES {
                 bail!("final bundle exceeds decoded byte limit")
             }
-            chunks.insert(entry.delivery_id.clone(), vec![None; entry.chunk_count]);
+            deliveries.push(BufferedDelivery {
+                bytes: Vec::with_capacity(entry.decoded_bytes),
+                digest: Sha256::new(),
+            });
         }
         self.bundle = Some(PendingBundle {
             request_id,
             bundle_id,
             manifest,
-            chunks,
+            deliveries,
+            current_delivery: 0,
+            next_chunk: 0,
             buffered_bytes: 0,
         });
         Ok(())
@@ -369,30 +645,50 @@ impl<W: Write> LocalRenderer<W> {
         if bundle.request_id != request_id || bundle.bundle_id != bundle_id {
             bail!("final chunk IDs do not match final begin")
         }
-        let decoded = STANDARD
-            .decode(bytes_base64)
-            .context("final chunk is not valid base64")?;
-        if decoded.len() > MAX_FINAL_CHUNK_BYTES {
-            bail!("final chunk exceeds decoded byte limit")
+        let entry = bundle
+            .manifest
+            .get(bundle.current_delivery)
+            .context("final bundle received an extra chunk")?;
+        if entry.delivery_id != delivery_id {
+            bail!("final chunks are not in manifest delivery order")
+        }
+        if chunk_index != bundle.next_chunk {
+            bail!("final chunk indices are not contiguous")
+        }
+        let offset = chunk_index
+            .checked_mul(MAX_FINAL_CHUNK_BYTES)
+            .context("final chunk offset overflow")?;
+        let expected_bytes = (entry.decoded_bytes - offset).min(MAX_FINAL_CHUNK_BYTES);
+        let expected_base64 = expected_bytes.div_ceil(3) * 4;
+        if bytes_base64.len() != expected_base64 {
+            bail!("final chunk encoded size is not canonical")
+        }
+        let delivery = &mut bundle.deliveries[bundle.current_delivery];
+        let before = delivery.bytes.len();
+        delivery.bytes.reserve(expected_bytes);
+        if let Err(error) = STANDARD.decode_vec(bytes_base64.as_bytes(), &mut delivery.bytes) {
+            delivery.bytes.truncate(before);
+            return Err(error).context("final chunk is not valid base64");
+        }
+        let decoded = &delivery.bytes[before..];
+        if decoded.len() != expected_bytes {
+            delivery.bytes.truncate(before);
+            bail!("final chunk decoded size is not the canonical partition")
         }
         bundle.buffered_bytes = bundle
             .buffered_bytes
             .checked_add(decoded.len())
             .context("final bundle size overflow")?;
         if bundle.buffered_bytes > MAX_BUNDLE_BYTES {
+            delivery.bytes.truncate(before);
             bail!("final bundle exceeds decoded byte limit")
         }
-        let slots = bundle
-            .chunks
-            .get_mut(&delivery_id)
-            .context("final chunk has an unknown delivery ID")?;
-        let slot = slots
-            .get_mut(chunk_index)
-            .context("final chunk index is outside the manifest")?;
-        if slot.is_some() {
-            bail!("final chunk index was delivered more than once")
+        delivery.digest.update(decoded);
+        bundle.next_chunk += 1;
+        if bundle.next_chunk == entry.chunk_count {
+            bundle.current_delivery += 1;
+            bundle.next_chunk = 0;
         }
-        *slot = Some(decoded);
         Ok(())
     }
 
@@ -405,7 +701,7 @@ impl<W: Write> LocalRenderer<W> {
         self.require_request(&request_id)?;
         let bundle = self
             .bundle
-            .take()
+            .as_ref()
             .context("final end arrived before begin")?;
         if bundle.request_id != request_id || bundle.bundle_id != bundle_id {
             bail!("final end IDs do not match final begin")
@@ -415,61 +711,285 @@ impl<W: Write> LocalRenderer<W> {
         if actual_manifest_hash != manifest_sha256 {
             bail!("final manifest hash does not match")
         }
+        if bundle.current_delivery != bundle.manifest.len() || bundle.next_chunk != 0 {
+            bail!("final bundle ended before every canonical chunk arrived")
+        }
+        if bundle.buffered_bytes
+            != bundle
+                .manifest
+                .iter()
+                .map(|entry| entry.decoded_bytes)
+                .sum::<usize>()
+        {
+            bail!("final bundle decoded total does not match manifest")
+        }
 
-        let mut verified = Vec::with_capacity(bundle.manifest.len());
-        for entry in &bundle.manifest {
-            let slots = bundle
-                .chunks
-                .get(&entry.delivery_id)
-                .expect("manifest initialized chunks");
-            let mut bytes = Vec::with_capacity(entry.decoded_bytes);
-            for slot in slots {
-                bytes
-                    .extend_from_slice(slot.as_deref().context("final bundle is missing a chunk")?);
-            }
-            if bytes.len() != entry.decoded_bytes {
+        for (entry, delivery) in bundle.manifest.iter().zip(&bundle.deliveries) {
+            if delivery.bytes.len() != entry.decoded_bytes {
                 bail!("final delivery decoded size does not match manifest")
             }
-            if format!("{:x}", Sha256::digest(&bytes)) != entry.sha256 {
+            if format!("{:x}", delivery.digest.clone().finalize()) != entry.sha256 {
                 bail!("final delivery hash does not match manifest")
             }
-            let payload: FinalPayload =
-                serde_json::from_slice(&bytes).context("final delivery payload is invalid")?;
-            if payload_kind(&payload) != entry.payload_kind {
+            let payload =
+                parse_payload(&delivery.bytes).context("final delivery payload is invalid")?;
+            payload.validate()?;
+            if payload.kind() != entry.payload_kind {
                 bail!("final delivery kind does not match manifest")
             }
-            verified.push((entry.delivery_id.clone(), payload));
         }
 
         if self.transient_written || self.terminal {
             self.output.write_all(b"\n")?;
         }
-        for (_, payload) in &verified {
+        for delivery in &bundle.deliveries {
+            let payload = parse_payload(&delivery.bytes)
+                .expect("payload was validated before authoritative output");
             match payload {
-                FinalPayload::Text { text } => writeln!(self.output, "{text}")?,
-                FinalPayload::File { artifact } => {
-                    writeln!(self.output, "{}", artifact.managed_path.display())?
+                FinalPayloadView::Text { text } => {
+                    write_json_string(&mut self.output, text)?;
+                    self.output.write_all(b"\n")?;
                 }
-                FinalPayload::TerminalError { code, message } => {
-                    writeln!(self.output, "Error [{code}]: {message}")?
+                FinalPayloadView::File { artifact } => {
+                    write_json_string(&mut self.output, artifact.managed_path)?;
+                    self.output.write_all(b"\n")?;
+                }
+                FinalPayloadView::TerminalError { code, message } => {
+                    self.output.write_all(b"Error [")?;
+                    write_json_string(&mut self.output, code)?;
+                    self.output.write_all(b"]: ")?;
+                    write_json_string(&mut self.output, message)?;
+                    self.output.write_all(b"\n")?;
                 }
             }
         }
         self.output.flush()?;
+        let delivery_ids = bundle
+            .manifest
+            .iter()
+            .map(|entry| entry.delivery_id.clone())
+            .collect();
+        self.bundle = None;
+        self.final_seen = true;
         Ok(RenderAction::FinalVerified {
             request_id,
             bundle_id,
-            delivery_ids: verified.into_iter().map(|(id, _)| id).collect(),
+            delivery_ids,
         })
+    }
+
+    #[cfg(test)]
+    fn buffer_capacity_bytes(&self) -> usize {
+        self.bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .deliveries
+                    .iter()
+                    .map(|delivery| delivery.bytes.capacity())
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 }
 
-fn payload_kind(payload: &FinalPayload) -> &'static str {
-    match payload {
-        FinalPayload::Text { .. } => "text",
-        FinalPayload::File { .. } => "file",
-        FinalPayload::TerminalError { .. } => "terminal_error",
+enum FinalPayloadView<'a> {
+    Text {
+        text: &'a RawValue,
+    },
+    File {
+        artifact: ManagedArtifactView<'a>,
+    },
+    TerminalError {
+        code: &'a RawValue,
+        message: &'a RawValue,
+    },
+}
+
+impl FinalPayloadView<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::File { .. } => "file",
+            Self::TerminalError { .. } => "terminal_error",
+        }
     }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Text { text } => validate_json_string(text),
+            Self::File { artifact } => artifact.validate(),
+            Self::TerminalError { code, message } => {
+                validate_json_string(code)?;
+                validate_json_string(message)
+            }
+        }
+    }
+}
+
+struct ManagedArtifactView<'a> {
+    id: &'a RawValue,
+    managed_path: &'a RawValue,
+    display_name: &'a RawValue,
+    media_type: &'a RawValue,
+    size: u64,
+    sha256: &'a RawValue,
+    caption: Option<&'a RawValue>,
+}
+
+fn parse_payload(bytes: &[u8]) -> Result<FinalPayloadView<'_>> {
+    let fields: std::collections::HashMap<&str, &RawValue> = serde_json::from_slice(bytes)?;
+    let kind = fields
+        .get("type")
+        .context("final payload type is missing")?;
+    match kind.get() {
+        "\"text\"" => {
+            require_exact_fields(&fields, &["type", "text"])?;
+            Ok(FinalPayloadView::Text {
+                text: fields["text"],
+            })
+        }
+        "\"file\"" => {
+            require_exact_fields(&fields, &["type", "artifact"])?;
+            Ok(FinalPayloadView::File {
+                artifact: parse_artifact(fields["artifact"])?,
+            })
+        }
+        "\"terminal_error\"" => {
+            require_exact_fields(&fields, &["type", "code", "message"])?;
+            Ok(FinalPayloadView::TerminalError {
+                code: fields["code"],
+                message: fields["message"],
+            })
+        }
+        _ => bail!("unknown final payload type"),
+    }
+}
+
+fn parse_artifact(value: &RawValue) -> Result<ManagedArtifactView<'_>> {
+    let fields: std::collections::HashMap<&str, &RawValue> = serde_json::from_str(value.get())?;
+    require_exact_fields(
+        &fields,
+        &[
+            "id",
+            "managed_path",
+            "display_name",
+            "media_type",
+            "size",
+            "sha256",
+            "caption",
+        ],
+    )?;
+    let caption = match fields["caption"].get() {
+        "null" => None,
+        _ => Some(fields["caption"]),
+    };
+    Ok(ManagedArtifactView {
+        id: fields["id"],
+        managed_path: fields["managed_path"],
+        display_name: fields["display_name"],
+        media_type: fields["media_type"],
+        size: serde_json::from_str(fields["size"].get())?,
+        sha256: fields["sha256"],
+        caption,
+    })
+}
+
+fn require_exact_fields(
+    fields: &std::collections::HashMap<&str, &RawValue>,
+    expected: &[&str],
+) -> Result<()> {
+    if fields.len() != expected.len() || expected.iter().any(|field| !fields.contains_key(field)) {
+        bail!("final payload fields are not canonical")
+    }
+    Ok(())
+}
+
+impl ManagedArtifactView<'_> {
+    fn validate(&self) -> Result<()> {
+        validate_json_string(self.id)?;
+        validate_json_string(self.managed_path)?;
+        validate_json_string(self.display_name)?;
+        validate_json_string(self.media_type)?;
+        validate_json_string(self.sha256)?;
+        if let Some(caption) = self.caption {
+            validate_json_string(caption)?;
+        }
+        let _ = self.size;
+        Ok(())
+    }
+}
+
+fn validate_json_string(value: &RawValue) -> Result<()> {
+    let bytes = value.get().as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
+        bail!("final payload field must be a JSON string")
+    }
+    Ok(())
+}
+
+fn write_json_string(output: &mut impl Write, value: &RawValue) -> Result<()> {
+    validate_json_string(value)?;
+    let bytes = &value.get().as_bytes()[1..value.get().len() - 1];
+    let mut index = 0;
+    let mut plain_start = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        output.write_all(&bytes[plain_start..index])?;
+        index += 1;
+        let escape = *bytes.get(index).context("incomplete JSON string escape")?;
+        index += 1;
+        match escape {
+            b'"' | b'\\' | b'/' => output.write_all(&[escape])?,
+            b'b' => output.write_all(&[0x08])?,
+            b'f' => output.write_all(&[0x0c])?,
+            b'n' => output.write_all(b"\n")?,
+            b'r' => output.write_all(b"\r")?,
+            b't' => output.write_all(b"\t")?,
+            b'u' => {
+                let (mut scalar, next) = parse_hex_escape(bytes, index)?;
+                index = next;
+                if (0xd800..=0xdbff).contains(&scalar) {
+                    if bytes.get(index..index + 2) != Some(b"\\u") {
+                        bail!("high surrogate is missing its low surrogate")
+                    }
+                    let (low, next) = parse_hex_escape(bytes, index + 2)?;
+                    if !(0xdc00..=0xdfff).contains(&low) {
+                        bail!("invalid low surrogate")
+                    }
+                    scalar = 0x1_0000 + ((scalar - 0xd800) << 10) + (low - 0xdc00);
+                    index = next;
+                }
+                let character = char::from_u32(scalar).context("invalid Unicode scalar")?;
+                let mut encoded = [0_u8; 4];
+                output.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+            }
+            _ => bail!("invalid JSON string escape"),
+        }
+        plain_start = index;
+    }
+    output.write_all(&bytes[plain_start..])?;
+    Ok(())
+}
+
+fn parse_hex_escape(bytes: &[u8], start: usize) -> Result<(u32, usize)> {
+    let digits = bytes
+        .get(start..start + 4)
+        .context("incomplete Unicode escape")?;
+    let mut value = 0_u32;
+    for digit in digits {
+        value = value * 16
+            + match digit {
+                b'0'..=b'9' => u32::from(digit - b'0'),
+                b'a'..=b'f' => u32::from(digit - b'a' + 10),
+                b'A'..=b'F' => u32::from(digit - b'A' + 10),
+                _ => bail!("invalid Unicode escape"),
+            };
+    }
+    Ok((value, start + 4))
 }
 
 impl LocalRenderer<Vec<u8>> {

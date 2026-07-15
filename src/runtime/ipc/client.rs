@@ -3,13 +3,14 @@ mod tests {
     use std::path::PathBuf;
 
     use anyhow::Result;
-    use tokio::net::UnixListener;
+    use tokio::{net::UnixListener, time::advance};
 
-    use super::LocalIpcClient;
+    use super::{LocalIpcClient, write_operation};
     use crate::runtime::{
-        RequestId,
+        BundleId, DeliveryId, RequestId,
         ipc::protocol::{
-            ClientRequestBody, FrameReader, FrameWriter, ServerEvent, ServerEventBody,
+            ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode, ServerEvent,
+            ServerEventBody,
         },
         model::WorkItemId,
     };
@@ -64,6 +65,91 @@ mod tests {
         assert!(error.contains("codrik serve"));
     }
 
+    #[tokio::test]
+    async fn acknowledgement_requires_matching_positive_response() -> Result<()> {
+        let request = RequestId::new();
+        let bundle = BundleId::new();
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let wrong = BundleId::new();
+        let expected_request = request.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            FrameReader::new(&mut stream).read_client_request().await?;
+            FrameWriter::new(&mut stream)
+                .write_server_event(&ServerEvent::new(ServerEventBody::AckAccepted {
+                    request_id: expected_request,
+                    bundle_id: wrong,
+                }))
+                .await?;
+            anyhow::Ok(())
+        });
+        let error = LocalIpcClient::new(socket.clone())
+            .acknowledge_final(request, bundle, vec![DeliveryId::new()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unexpected"));
+        server.await??;
+        std::fs::remove_file(socket)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_rejects_error_and_eof_responses() -> Result<()> {
+        for response in [Some("rejected"), None] {
+            let request = RequestId::new();
+            let bundle = BundleId::new();
+            let socket = temp_socket();
+            let listener = UnixListener::bind(&socket)?;
+            let expected_request = request.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                FrameReader::new(&mut stream).read_client_request().await?;
+                if let Some(message) = response {
+                    FrameWriter::new(&mut stream)
+                        .write_server_event(&ServerEvent::new(ServerEventBody::RequestError {
+                            request_id: expected_request,
+                            code: "ack_failed".into(),
+                            message: message.into(),
+                        }))
+                        .await?;
+                }
+                anyhow::Ok(())
+            });
+            assert!(
+                LocalIpcClient::new(socket.clone())
+                    .acknowledge_final(request, bundle, vec![DeliveryId::new()])
+                    .await
+                    .is_err()
+            );
+            server.await??;
+            std::fs::remove_file(socket)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_operation_write_uses_protocol_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let request = RequestId::new();
+        let task = tokio::spawn(async move {
+            write_operation(
+                &mut writer,
+                ClientRequestBody::Resume {
+                    request_id: request,
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        advance(std::time::Duration::from_secs(30)).await;
+        assert_eq!(
+            task.await.unwrap().unwrap_err().code(),
+            ProtocolErrorCode::WriteTimeout
+        );
+    }
+
     fn temp_socket() -> PathBuf {
         PathBuf::from("/tmp").join(format!("c11-{}.sock", uuid::Uuid::new_v4()))
     }
@@ -76,6 +162,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use tokio::{
+    io::AsyncWrite,
     net::{
         UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -86,11 +173,21 @@ use tokio::{
 use crate::runtime::{
     BundleId, CancelId, DeliveryId, RequestId,
     ipc::protocol::{
-        ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode, ServerEvent,
+        ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode,
+        ProtocolFailure, ServerEvent,
     },
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn write_operation<W>(write: &mut W, body: ClientRequestBody) -> Result<(), ProtocolFailure>
+where
+    W: AsyncWrite + Unpin,
+{
+    FrameWriter::new(write)
+        .write_client_request(&ClientRequest::new(body))
+        .await
+}
 
 #[derive(Clone, Debug)]
 pub struct LocalIpcClient {
@@ -129,6 +226,8 @@ impl LocalIpcClient {
         bundle_id: BundleId,
         delivery_ids: Vec<DeliveryId>,
     ) -> Result<()> {
+        let expected_request = request_id.clone();
+        let expected_bundle = bundle_id.clone();
         let mut stream = self
             .open(ClientRequestBody::AckFinal {
                 request_id,
@@ -137,8 +236,32 @@ impl LocalIpcClient {
             })
             .await?;
         stream.close_write().await?;
-        while stream.next_event().await?.is_some() {}
-        Ok(())
+        match stream.next_event().await? {
+            Some(ServerEvent {
+                body:
+                    crate::runtime::ipc::protocol::ServerEventBody::AckAccepted {
+                        request_id,
+                        bundle_id,
+                    },
+                ..
+            }) if request_id == expected_request && bundle_id == expected_bundle => Ok(()),
+            Some(ServerEvent {
+                body:
+                    crate::runtime::ipc::protocol::ServerEventBody::RequestError {
+                        code, message, ..
+                    },
+                ..
+            }) => Err(anyhow!(
+                "daemon rejected final acknowledgement ({code}): {message}"
+            )),
+            Some(event) => Err(anyhow!(
+                "daemon returned an unexpected final acknowledgement response: {:?}",
+                event.body
+            )),
+            None => Err(anyhow!(
+                "daemon closed before confirming final acknowledgement for {expected_request}"
+            )),
+        }
     }
 
     async fn open(&self, body: ClientRequestBody) -> Result<ClientEventStream> {
@@ -147,8 +270,7 @@ impl LocalIpcClient {
             .map_err(|_| self.unavailable("connection deadline exceeded"))?
             .map_err(|error| self.unavailable(&error.to_string()))?;
         let (read, mut write) = stream.into_split();
-        FrameWriter::new(&mut write)
-            .write_client_request(&ClientRequest::new(body))
+        write_operation(&mut write, body)
             .await
             .map_err(|error| self.unavailable(&format!("failed to write operation: {error}")))?;
         Ok(ClientEventStream {

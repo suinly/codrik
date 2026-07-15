@@ -159,6 +159,10 @@ pub enum ServerEventBody {
         cancel_id: CancelId,
         affected_request_ids: Vec<RequestId>,
     },
+    AckAccepted {
+        request_id: RequestId,
+        bundle_id: BundleId,
+    },
     Activity {
         request_id: RequestId,
         event: ActivityEvent,
@@ -832,6 +836,10 @@ mod tests {
                 cancel_id: cancel_id(),
                 affected_request_ids: vec![request_id()],
             }),
+            ServerEvent::new(ServerEventBody::AckAccepted {
+                request_id: request_id(),
+                bundle_id: bundle_id(),
+            }),
             ServerEvent::new(ServerEventBody::Activity {
                 request_id: request_id(),
                 event: ActivityEvent::ToolFinished {
@@ -882,6 +890,19 @@ mod tests {
             let json = serde_json::to_vec(&value)?;
             assert_eq!(serde_json::from_slice::<ServerEvent>(&json)?, value);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ack_accepted_has_exact_frozen_v1_json() -> Result<()> {
+        let event = ServerEvent::new(ServerEventBody::AckAccepted {
+            request_id: request_id(),
+            bundle_id: bundle_id(),
+        });
+        assert_eq!(
+            serde_json::to_string(&event)?,
+            r#"{"version":1,"body":{"type":"ack_accepted","request_id":"0190f2ef-0000-7000-8000-000000000001","bundle_id":"0190f2ef-0000-7000-8000-000000000002"}}"#
+        );
         Ok(())
     }
 

@@ -131,9 +131,13 @@ where
                 bundle_id,
                 delivery_ids,
             } => {
-                client
+                if let Err(error) = client
                     .acknowledge_final(request_id, bundle_id, delivery_ids)
-                    .await?;
+                    .await
+                {
+                    writeln!(recovery, "{}", recovery_command(request))?;
+                    return Err(error);
+                }
                 metadata.set_state_if_present(request, RequestMetadataState::Terminal)?;
                 return Ok(());
             }
@@ -161,11 +165,8 @@ impl CliCommand {
         let mut args = args.into_iter();
         let command = args.next().context("missing query or command")?;
 
-        if command == "update" {
-            return Ok(Self::Update);
-        }
-
         let parsed = match command.as_str() {
+            "update" => Self::Update,
             "serve" => Self::Serve,
             "resume" => {
                 let request_id = args.next().context("missing request id")?;
@@ -217,6 +218,7 @@ mod tests {
         let parse = |args: &[&str]| CliCommand::parse(args.iter().copied().map(String::from));
 
         assert_eq!(parse(&["serve"])?, CliCommand::Serve);
+        assert_eq!(parse(&["update"])?, CliCommand::Update);
         assert_eq!(
             parse(&["resume", UUID])?,
             CliCommand::Resume(RequestId::parse(UUID)?)
@@ -229,6 +231,11 @@ mod tests {
         assert!(parse(&["gateway", "telegram"]).is_err());
         assert!(parse(&["--session", "x", "hello"]).is_err());
         assert!(parse(&["--stream", "hello"]).is_err());
+        assert!(parse(&["update", "extra"]).is_err());
+        assert!(parse(&["serve", "extra"]).is_err());
+        assert!(parse(&["resume", UUID, "extra"]).is_err());
+        assert!(parse(&["cancel", UUID, "extra"]).is_err());
+        assert!(parse(&["hello", "extra"]).is_err());
 
         Ok(())
     }
@@ -275,11 +282,19 @@ mod tests {
             }
 
             let (mut ack, _) = listener.accept().await?;
-            let ack = FrameReader::new(&mut ack).read_client_request().await?;
+            let ack_request = FrameReader::new(&mut ack).read_client_request().await?;
             assert!(
-                matches!(ack.body, ClientRequestBody::AckFinal { request_id, bundle_id, delivery_ids }
+                matches!(ack_request.body, ClientRequestBody::AckFinal { request_id, bundle_id, delivery_ids }
                 if request_id == expected_request && bundle_id == expected_bundle && delivery_ids == vec![expected_delivery])
             );
+            FrameWriter::new(&mut ack)
+                .write_server_event(&crate::runtime::ipc::protocol::ServerEvent::new(
+                    crate::runtime::ipc::protocol::ServerEventBody::AckAccepted {
+                        request_id: expected_request,
+                        bundle_id: expected_bundle,
+                    },
+                ))
+                .await?;
             anyhow::Ok(())
         });
 
@@ -347,6 +362,80 @@ mod tests {
         assert_eq!(
             metadata.load(&request)?.unwrap().state,
             RequestMetadataState::SentUnconfirmed
+        );
+        assert_eq!(
+            String::from_utf8(recovery)?,
+            format!("codrik resume {request}\n")
+        );
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_final_ack_failure_prints_recovery_and_keeps_metadata_nonterminal() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let expected_request = request.clone();
+        let server = tokio::spawn(async move {
+            let (mut operation, _) = listener.accept().await?;
+            FrameReader::new(&mut operation)
+                .read_client_request()
+                .await?;
+            let events = encode_bundle(
+                &ResultBundle {
+                    id: BundleId::new(),
+                    request_id: expected_request,
+                    state: BundleState::Delivered,
+                    manifest: BundleManifest {
+                        entries: vec![],
+                        sha256: String::new(),
+                    },
+                    deliveries: vec![(
+                        DeliveryId::new(),
+                        FinalPayload::Text {
+                            text: "done".into(),
+                        },
+                    )],
+                },
+                true,
+            )?;
+            for event in events {
+                FrameWriter::new(&mut operation)
+                    .write_server_event(&event)
+                    .await?;
+            }
+            let (mut ack, _) = listener.accept().await?;
+            FrameReader::new(&mut ack).read_client_request().await?;
+            // EOF without AckAccepted is an ambiguous failure.
+            anyhow::Ok(())
+        });
+        let metadata_root = temp_root();
+        let metadata = RequestMetadataStore::new(metadata_root.clone());
+        metadata.create(&request, 1, "secret")?;
+        metadata.set_state(&request, RequestMetadataState::Accepted)?;
+        let client = LocalIpcClient::new(socket.clone());
+        let stream = client.resume(request.clone()).await?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut recovery = Vec::new();
+        assert!(
+            drive_operation(
+                &client,
+                &request,
+                stream,
+                &metadata,
+                &mut renderer,
+                &mut recovery,
+                pending(),
+            )
+            .await
+            .is_err()
+        );
+        server.await??;
+        assert_eq!(
+            metadata.load(&request)?.unwrap().state,
+            RequestMetadataState::Accepted
         );
         assert_eq!(
             String::from_utf8(recovery)?,

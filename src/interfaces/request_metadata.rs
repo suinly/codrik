@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Barrier},
+    };
 
     use anyhow::Result;
 
@@ -18,6 +22,15 @@ mod tests {
         let json = fs::read_to_string(&path)?;
         assert!(!json.contains("very secret prompt"));
         assert!(!json.contains("response"));
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let mut keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["created_at", "prompt_sha256", "request_id", "state"]);
         let metadata = store.load(&request)?.expect("metadata");
         assert_eq!(metadata.state, RequestMetadataState::Created);
         assert_eq!(metadata.prompt_sha256.len(), 64);
@@ -59,6 +72,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concurrent_stale_writers_cannot_overwrite_terminal() -> Result<()> {
+        let root = temp_root("concurrent");
+        let request = RequestId::new();
+        let store = RequestMetadataStore::new(root.clone());
+        store.create(&request, 1, "secret")?;
+        store.set_state(&request, RequestMetadataState::Accepted)?;
+        let barrier = Arc::new(Barrier::new(17));
+        let mut writers = Vec::new();
+        for index in 0..16 {
+            let store = RequestMetadataStore::new(root.clone());
+            let request = request.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                if index == 0 {
+                    store.set_state(&request, RequestMetadataState::Terminal)
+                } else {
+                    let _ = store.set_state(&request, RequestMetadataState::Accepted);
+                    Ok(())
+                }
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            writer.join().unwrap()?;
+        }
+        assert_eq!(
+            store.load(&request)?.unwrap().state,
+            RequestMetadataState::Terminal
+        );
+        assert_eq!(
+            fs::metadata(store.lock_path(&request))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_bad_lock_permissions_and_cleans_failed_temp_write() -> Result<()> {
+        let root = temp_root("bad-permissions");
+        let request = RequestId::new();
+        let store = RequestMetadataStore::new(root.clone());
+        fs::create_dir_all(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        fs::write(store.lock_path(&request), b"")?;
+        fs::set_permissions(store.lock_path(&request), fs::Permissions::from_mode(0o644))?;
+        assert!(store.create(&request, 1, "secret").is_err());
+        fs::remove_file(store.lock_path(&request))?;
+        fs::create_dir(store.path(&request))?;
+        assert!(store.create(&request, 1, "secret").is_err());
+        assert!(
+            fs::read_dir(&root)?
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_backward_and_bad_file_permissions() -> Result<()> {
+        let root = temp_root("backward");
+        let request = RequestId::new();
+        let store = RequestMetadataStore::new(root.clone());
+        store.create(&request, 1, "secret")?;
+        store.set_state(&request, RequestMetadataState::Terminal)?;
+        assert!(
+            store
+                .set_state(&request, RequestMetadataState::Accepted)
+                .is_err()
+        );
+        fs::set_permissions(store.path(&request), fs::Permissions::from_mode(0o644))?;
+        assert!(store.load(&request).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pre_rename_write_failure_preserves_authoritative_file_and_cleans_temp() -> Result<()> {
+        let root = temp_root("write-failure");
+        let request = RequestId::new();
+        let store = RequestMetadataStore::new(root.clone());
+        store.create(&request, 1, "secret")?;
+        assert!(
+            store
+                .simulate_pre_rename_failure(&request, RequestMetadataState::Accepted)
+                .is_err()
+        );
+        assert_eq!(
+            store.load(&request)?.unwrap().state,
+            RequestMetadataState::Created
+        );
+        assert!(
+            fs::read_dir(&root)?
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     fn temp_root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("codrik-task11-{label}-{}", uuid::Uuid::new_v4()))
     }
@@ -66,11 +185,12 @@ mod tests {
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -108,6 +228,10 @@ impl RequestMetadataStore {
         self.root.join(format!("{request}.json"))
     }
 
+    pub fn lock_path(&self, request: &RequestId) -> PathBuf {
+        self.root.join(format!("{request}.lock"))
+    }
+
     pub fn create(&self, request: &RequestId, created_at: i64, prompt: &str) -> Result<()> {
         let metadata = RequestMetadata {
             request_id: request.clone(),
@@ -115,10 +239,20 @@ impl RequestMetadataStore {
             prompt_sha256: format!("{:x}", Sha256::digest(prompt.as_bytes())),
             state: RequestMetadataState::Created,
         };
+        self.prepare_root()?;
+        let _lock = self.lock(request)?;
+        if let Some(existing) = self.load(request)? {
+            if existing.prompt_sha256 != metadata.prompt_sha256 {
+                bail!("request recovery metadata already exists with a different prompt hash")
+            }
+            return Ok(());
+        }
         self.write_atomic(&metadata)
     }
 
     pub fn set_state(&self, request: &RequestId, state: RequestMetadataState) -> Result<()> {
+        self.prepare_root()?;
+        let _lock = self.lock(request)?;
         let mut metadata = self
             .load(request)?
             .with_context(|| format!("request recovery metadata is missing for {request}"))?;
@@ -138,9 +272,20 @@ impl RequestMetadataStore {
         request: &RequestId,
         state: RequestMetadataState,
     ) -> Result<()> {
-        if self.load(request)?.is_some() {
-            self.set_state(request, state)?;
+        self.prepare_root()?;
+        let _lock = self.lock(request)?;
+        let Some(mut metadata) = self.load(request)? else {
+            return Ok(());
+        };
+        if state < metadata.state {
+            bail!(
+                "request metadata state cannot move backward from {:?} to {:?}",
+                metadata.state,
+                state
+            );
         }
+        metadata.state = state;
+        self.write_atomic(&metadata)?;
         Ok(())
     }
 
@@ -159,7 +304,10 @@ impl RequestMetadataStore {
             }
         };
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+        if !metadata.is_file()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
             bail!(
                 "request metadata must be a regular mode-0600 file: {}",
                 path.display()
@@ -174,7 +322,14 @@ impl RequestMetadataStore {
     }
 
     fn write_atomic(&self, metadata: &RequestMetadata) -> Result<()> {
-        self.prepare_root()?;
+        self.write_atomic_before_rename(metadata, || Ok(()))
+    }
+
+    fn write_atomic_before_rename(
+        &self,
+        metadata: &RequestMetadata,
+        before_rename: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let destination = self.path(&metadata.request_id);
         let temporary = self.root.join(format!(
             ".{}.{}.tmp",
@@ -190,9 +345,11 @@ impl RequestMetadataStore {
                 .with_context(|| {
                     format!("failed to create metadata temp {}", temporary.display())
                 })?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
             serde_json::to_writer(&mut file, metadata)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
+            before_rename()?;
             fs::rename(&temporary, &destination).with_context(|| {
                 format!(
                     "failed to atomically replace request metadata {}",
@@ -208,10 +365,26 @@ impl RequestMetadataStore {
         result
     }
 
+    #[cfg(test)]
+    fn simulate_pre_rename_failure(
+        &self,
+        request: &RequestId,
+        state: RequestMetadataState,
+    ) -> Result<()> {
+        self.prepare_root()?;
+        let _lock = self.lock(request)?;
+        let mut metadata = self.load(request)?.context("metadata missing")?;
+        metadata.state = state;
+        self.write_atomic_before_rename(&metadata, || bail!("injected pre-rename failure"))
+    }
+
     fn prepare_root(&self) -> Result<()> {
         match fs::symlink_metadata(&self.root) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                {
                     bail!(
                         "request metadata root is not a directory: {}",
                         self.root.display()
@@ -226,6 +399,60 @@ impl RequestMetadataStore {
         }
         fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
         Ok(())
+    }
+
+    fn lock(&self, request: &RequestId) -> Result<RequestLock> {
+        let path = self.lock_path(request);
+        let create = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path);
+        let (file, created) = match create {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                    .with_context(|| {
+                        format!("failed to open request metadata lock {}", path.display())
+                    })?,
+                false,
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create request metadata lock {}", path.display())
+                });
+            }
+        };
+        if created {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            bail!(
+                "request metadata lock must be an owned mode-0600 file: {}",
+                path.display()
+            )
+        }
+        file.lock_exclusive()
+            .with_context(|| format!("failed to lock request metadata {}", path.display()))?;
+        Ok(RequestLock(file))
+    }
+}
+
+struct RequestLock(File);
+
+impl Drop for RequestLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
     }
 }
 
