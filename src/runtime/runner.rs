@@ -315,12 +315,6 @@ where
                     }
                 }
             };
-            if !response.content.is_empty() {
-                self.events.publish_activity(
-                    &run.request_ids,
-                    AgentActivityEvent::Description(response.content.clone()),
-                );
-            }
             if response.tool_calls.is_empty() {
                 let intent_key = format!("run:{}:final", run.run_id);
                 match self
@@ -378,6 +372,13 @@ where
                         continue;
                     }
                 }
+            }
+
+            if !response.content.is_empty() {
+                self.events.publish_activity(
+                    &run.request_ids,
+                    AgentActivityEvent::Description(response.content.clone()),
+                );
             }
 
             let assistant =
@@ -548,7 +549,7 @@ mod tests {
         },
         runtime::{
             artifacts::{ArtifactManager, TestPause},
-            ipc::protocol::ServerEventBody,
+            ipc::protocol::{ActivityEvent, ServerEventBody},
             model::{ActorId, AttemptId, Audience, EventKind, ManualClock, RequestId, Timestamp},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
             signals::ActorSignals,
@@ -676,7 +677,10 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct StreamingFinalLlm;
+    struct StreamingFinalLlm {
+        deltas: Vec<String>,
+        content: String,
+    }
 
     #[async_trait]
     impl LlmStreamClient for StreamingFinalLlm {
@@ -686,10 +690,10 @@ mod tests {
             sink: &mut dyn LlmStreamSink,
             _context: &RunContext,
         ) -> Result<LlmResponse> {
-            sink.on_event(LlmStreamEvent::TextDelta("partial".into()))
-                .await?;
-            sink.on_event(LlmStreamEvent::TextDelta("overflow".into()))
-                .await?;
+            for delta in &self.deltas {
+                sink.on_event(LlmStreamEvent::TextDelta(delta.clone()))
+                    .await?;
+            }
             sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
                 index: 0,
                 id: Some("provider-only".into()),
@@ -698,7 +702,7 @@ mod tests {
             }))
             .await?;
             Ok(LlmResponse {
-                content: "authoritative final".into(),
+                content: self.content.clone(),
                 tool_calls: Vec::new(),
             })
         }
@@ -901,7 +905,7 @@ mod tests {
             .unwrap();
         let request_id = RequestId::new();
         let second_request_id = RequestId::new();
-        let hub = StreamHub::with_limits(3, 16, 64);
+        let hub = StreamHub::default();
         let mut subscription = hub.subscribe(request_id.clone()).unwrap();
         let mut second_subscription = hub.subscribe(second_request_id.clone()).unwrap();
         store
@@ -931,7 +935,10 @@ mod tests {
             .await
             .unwrap();
         let runner = ActorRunner::new(
-            StreamingFinalLlm,
+            StreamingFinalLlm {
+                deltas: vec!["partial".into()],
+                content: "authoritative final".into(),
+            },
             NoTools,
             ActorSignals::default(),
             Arc::new(hub),
@@ -948,17 +955,153 @@ mod tests {
             &event.body,
             ServerEventBody::TextDelta { delta, .. } if delta == "partial"
         )));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event.body, ServerEventBody::StreamGap { .. }))
-        );
+        assert!(!events.iter().any(|event| matches!(
+            &event.body,
+            ServerEventBody::Activity {
+                event: ActivityEvent::Description { .. },
+                ..
+            }
+        )));
         let second_events =
             std::iter::from_fn(|| second_subscription.try_recv()).collect::<Vec<_>>();
         assert!(second_events.iter().any(|event| matches!(
             &event.body,
             ServerEventBody::TextDelta { delta, .. } if delta == "partial"
         )));
+        assert_eq!(
+            store.outbox_intents().await.unwrap()[0].payload,
+            OutboxPayload::Text {
+                text: "authoritative final".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_terminal_full_response_does_not_create_description_or_gap() {
+        let (store, request) = store_with_local_text().await;
+        let hub = StreamHub::with_limits(8, 16, 64);
+        let mut subscription = hub.subscribe(request).unwrap();
+        let full_response = "x".repeat(32);
+        let runner = ActorRunner::new(
+            StreamingFinalLlm {
+                deltas: vec!["ok".into()],
+                content: full_response.clone(),
+            },
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(hub),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+
+        assert_eq!(
+            runner.run_once("worker").await.unwrap(),
+            RunOnceOutcome::Completed
+        );
+        let events = std::iter::from_fn(|| subscription.try_recv()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            &event.body,
+            ServerEventBody::TextDelta { delta, .. } if delta == "ok"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            &event.body,
+            ServerEventBody::Activity {
+                event: ActivityEvent::Description { .. },
+                ..
+            } | ServerEventBody::StreamGap { .. }
+        )));
+        assert_eq!(
+            store.outbox_intents().await.unwrap()[0].payload,
+            OutboxPayload::Text {
+                text: full_response
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_intermediate_description_precedes_tool_activity_and_final_has_none() {
+        let (store, request) = store_with_local_text().await;
+        let hub = StreamHub::default();
+        let mut subscription = hub.subscribe(request).unwrap();
+        let runner = ActorRunner::new(
+            ScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([
+                    LlmResponse {
+                        content: "checking".into(),
+                        tool_calls: vec![LlmToolCall {
+                            id: "call-1".into(),
+                            name: "datetime".into(),
+                            arguments: "{}".into(),
+                        }],
+                    },
+                    LlmResponse {
+                        content: "done".into(),
+                        tool_calls: Vec::new(),
+                    },
+                ]))),
+            },
+            RecordingTools::default(),
+            ActorSignals::default(),
+            Arc::new(hub),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+
+        assert_eq!(
+            runner.run_once("worker").await.unwrap(),
+            RunOnceOutcome::Completed
+        );
+        let activity = std::iter::from_fn(|| subscription.try_recv())
+            .filter_map(|event| match event.body {
+                ServerEventBody::Activity { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            activity,
+            vec![
+                ActivityEvent::ModelStepStarted,
+                ActivityEvent::Description {
+                    description: "checking".into(),
+                },
+                ActivityEvent::ToolStarted {
+                    name: "datetime".into(),
+                },
+                ActivityEvent::ToolFinished {
+                    name: "datetime".into(),
+                    succeeded: true,
+                },
+                ActivityEvent::ModelStepStarted,
+                ActivityEvent::Completed,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_overflow_never_fails_authoritative_finalization() {
+        let (store, request) = store_with_local_text().await;
+        let hub = StreamHub::with_limits(3, 16, 64);
+        let mut subscription = hub.subscribe(request).unwrap();
+        let runner = ActorRunner::new(
+            StreamingFinalLlm {
+                deltas: vec!["partial".into(), "overflow".into()],
+                content: "authoritative final".into(),
+            },
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(hub),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+
+        assert_eq!(
+            runner.run_once("worker").await.unwrap(),
+            RunOnceOutcome::Completed
+        );
+        assert!(
+            std::iter::from_fn(|| subscription.try_recv())
+                .any(|event| matches!(event.body, ServerEventBody::StreamGap { .. }))
+        );
         assert_eq!(
             store.outbox_intents().await.unwrap()[0].payload,
             OutboxPayload::Text {
@@ -1266,5 +1409,39 @@ mod tests {
             .await
             .unwrap();
         store
+    }
+
+    async fn store_with_local_text() -> (SqliteRuntimeStore, RequestId) {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let actor = ActorId::from_string("actor:local:1");
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: actor.to_string(),
+                        enabled: true,
+                        tools: vec!["datetime".into()],
+                        identities: Vec::new(),
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        let request = RequestId::new();
+        store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: request.clone(),
+                    text: "hello".into(),
+                    prompt_sha256: "00".repeat(32),
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        (store, request)
     }
 }

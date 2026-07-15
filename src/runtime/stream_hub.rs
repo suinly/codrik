@@ -384,7 +384,52 @@ mod tests {
             subscription.recv().await.unwrap().body,
             ServerEventBody::Activity { .. }
         ));
+        hub.publish_text(std::slice::from_ref(&request), "still ignored");
         assert!(subscription.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn per_subscription_byte_limit_overflows_with_global_capacity_available() {
+        let hub = StreamHub::with_limits(8, 5, 64);
+        let request = request();
+        let mut subscription = hub.subscribe(request.clone()).unwrap();
+
+        hub.publish_text(std::slice::from_ref(&request), "12345");
+        hub.publish_text(std::slice::from_ref(&request), "x");
+
+        assert!(matches!(
+            subscription.recv().await.unwrap().body,
+            ServerEventBody::TextDelta { .. }
+        ));
+        assert!(matches!(
+            subscription.recv().await.unwrap().body,
+            ServerEventBody::StreamGap { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn draining_releases_per_subscription_and_global_byte_budgets() {
+        let hub = StreamHub::with_limits(8, 5, 5);
+        let first_request = request();
+        let second_request = request();
+        let mut first = hub.subscribe(first_request.clone()).unwrap();
+        let mut second = hub.subscribe(second_request.clone()).unwrap();
+
+        hub.publish_text(std::slice::from_ref(&first_request), "12345");
+        assert!(matches!(
+            first.recv().await.unwrap().body,
+            ServerEventBody::TextDelta { .. }
+        ));
+        hub.publish_text(std::slice::from_ref(&first_request), "abcde");
+        assert!(matches!(
+            first.recv().await.unwrap().body,
+            ServerEventBody::TextDelta { .. }
+        ));
+        hub.publish_text(std::slice::from_ref(&second_request), "vwxyz");
+        assert!(matches!(
+            second.recv().await.unwrap().body,
+            ServerEventBody::TextDelta { .. }
+        ));
     }
 
     #[tokio::test]
