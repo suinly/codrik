@@ -9,6 +9,59 @@ use crate::{
     runtime::model::*,
 };
 
+use super::runner::RunOnceOutcome;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantumProgress {
+    None,
+    ModelCheckpoint,
+    KnownToolOutcome,
+    Finalized,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantumReport {
+    pub work_item_id: Option<WorkItemId>,
+    pub outcome: RunOnceOutcome,
+    pub progress: QuantumProgress,
+}
+
+#[derive(Debug)]
+pub enum QuantumFailure {
+    RecoverableWork {
+        work_item_id: WorkItemId,
+        message: String,
+    },
+    AuthorityUnavailable(anyhow::Error),
+}
+
+#[async_trait]
+pub trait QuantumRunner: Send + Sync {
+    async fn run_quantum(
+        &self,
+        actor: &ActorId,
+        owner: &str,
+    ) -> std::result::Result<QuantumReport, QuantumFailure>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureDisposition {
+    RetryAt(Timestamp),
+    Terminalized,
+}
+
+#[async_trait]
+pub trait FailureStore: Send + Sync {
+    async fn record_failure(
+        &self,
+        work: &WorkItemId,
+        error: &str,
+        now: Timestamp,
+    ) -> Result<FailureDisposition>;
+
+    async fn record_progress(&self, work: &WorkItemId, now: Timestamp) -> Result<()>;
+}
+
 #[derive(Clone, Debug)]
 pub struct BeginArtifact {
     pub id: ArtifactId,
@@ -284,6 +337,14 @@ impl std::error::Error for StaleLease {}
 pub trait DispatchStore: Send + Sync {
     async fn acquire_ready_actor(
         &self,
+        owner: &str,
+        now: Timestamp,
+        lease_until: Timestamp,
+    ) -> Result<Option<ActorLease>>;
+
+    async fn acquire_ready_actor_for(
+        &self,
+        actor: &ActorId,
         owner: &str,
         now: Timestamp,
         lease_until: Timestamp,
@@ -568,6 +629,7 @@ pub trait RuntimeStore:
     + ContextStore
     + ArtifactStore
     + BundleStore
+    + FailureStore
 {
 }
 
@@ -579,5 +641,6 @@ impl<T> RuntimeStore for T where
         + ContextStore
         + ArtifactStore
         + BundleStore
+        + FailureStore
 {
 }

@@ -10,9 +10,11 @@ mod artifacts;
 mod bundles;
 mod checkpoint;
 mod dispatch;
+mod failures;
 mod ingress;
 mod local_ingress;
 mod outbox;
+mod retry;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");
 const SERVE_MIGRATION: &str = include_str!("migrations/0002_serve.sql");
@@ -27,6 +29,14 @@ fn map_call_error(error: tokio_rusqlite::Error<anyhow::Error>) -> anyhow::Error 
         tokio_rusqlite::Error::Error(error) => error,
         other => anyhow!(other.to_string()),
     }
+}
+
+pub(crate) fn is_authority_failure(error: &anyhow::Error) -> bool {
+    retry::is_authority_failure(error)
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("unsupported runtime schema")
 }
 
 impl SqliteRuntimeStore {
@@ -66,6 +76,7 @@ impl SqliteRuntimeStore {
                     2 => {}
                     other => anyhow::bail!("unsupported runtime schema version: {other}"),
                 }
+                connection.execute_batch("PRAGMA busy_timeout = 0;")?;
                 Ok(())
             })
             .await

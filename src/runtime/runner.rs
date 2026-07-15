@@ -18,7 +18,8 @@ use crate::{
         signals::ActorSignals,
         store::{
             AttemptOutcome, AttemptRecovery, CheckpointRun, FinalizeOutcome, FinalizeRun,
-            NewOutboxIntent, NewToolAttempt, OutboxPayload, RuntimeStore,
+            NewOutboxIntent, NewToolAttempt, OutboxPayload, QuantumFailure, QuantumProgress,
+            QuantumReport, QuantumRunner, RuntimeStore,
         },
         stream_hub::RuntimeEventPublisher,
     },
@@ -108,7 +109,11 @@ where
         else {
             return Ok(RunOnceOutcome::Idle);
         };
-        let result = self.run_leased(&lease).await;
+        let mut work_item_id = None;
+        let mut progress = QuantumProgress::None;
+        let result = self
+            .run_leased(&lease, &mut work_item_id, &mut progress)
+            .await;
         let release = self.store.release_lease(&lease).await;
         match (result, release) {
             (Err(error), _) => Err(error),
@@ -124,6 +129,8 @@ where
     async fn run_leased(
         &self,
         lease: &crate::runtime::store::ActorLease,
+        work_item_id: &mut Option<crate::runtime::model::WorkItemId>,
+        progress: &mut QuantumProgress,
     ) -> Result<RunOnceOutcome> {
         let mut current_lease = lease.clone();
         let mut heartbeat = tokio::time::interval(self.limits.heartbeat_interval);
@@ -138,6 +145,7 @@ where
         else {
             return Ok(RunOnceOutcome::Idle);
         };
+        *work_item_id = Some(run.work_item_id.clone());
         let mut messages = self
             .store
             .load_recent_context(&lease.actor_id, &run.audience, self.limits.recent_messages)
@@ -239,6 +247,7 @@ where
                     self.clock.now(),
                 )
                 .await?;
+            *progress = QuantumProgress::KnownToolOutcome;
             messages.extend(recovered_messages);
         }
         let mut signal_receiver = self.signals.subscribe(&lease.actor_id).await;
@@ -254,6 +263,7 @@ where
                         self.store
                             .cancel_run(&run, &control, self.clock.now())
                             .await?;
+                        *progress = QuantumProgress::Finalized;
                         self.events
                             .publish_activity(&run.request_ids, AgentActivityEvent::Cancelled);
                         Ok(RunOnceOutcome::Cancelled)
@@ -301,6 +311,7 @@ where
                                 return match control.kind {
                                     EventKind::CancelRequested => {
                                         self.store.cancel_run(&run, &control, self.clock.now()).await?;
+                                        *progress = QuantumProgress::Finalized;
                                         self.events.publish_activity(
                                             &run.request_ids,
                                             AgentActivityEvent::Cancelled,
@@ -339,6 +350,7 @@ where
                     .await?
                 {
                     FinalizeOutcome::Completed => {
+                        *progress = QuantumProgress::Finalized;
                         self.events
                             .publish_activity(&run.request_ids, AgentActivityEvent::Completed);
                         return Ok(RunOnceOutcome::Completed);
@@ -472,6 +484,7 @@ where
                 checkpointed_attempt_ids.push(attempt.id);
                 checkpoint_messages.push(Message::tool_result(tool_call.id, observation));
             }
+            let has_checkpointed_attempts = !checkpointed_attempt_ids.is_empty();
             self.store
                 .checkpoint_run(
                     CheckpointRun {
@@ -483,10 +496,75 @@ where
                     self.clock.now(),
                 )
                 .await?;
+            *progress = if has_checkpointed_attempts {
+                QuantumProgress::KnownToolOutcome
+            } else {
+                QuantumProgress::ModelCheckpoint
+            };
             messages.extend(checkpoint_messages);
         }
         Ok(RunOnceOutcome::Yielded)
     }
+}
+
+#[async_trait::async_trait]
+impl<L, T, S, C> QuantumRunner for ActorRunner<L, T, S, C>
+where
+    L: LlmStreamClient + Send + Sync,
+    T: ToolExecutor + Send + Sync,
+    S: RuntimeStore + Clone + 'static,
+    C: Clock,
+{
+    async fn run_quantum(
+        &self,
+        actor: &crate::runtime::model::ActorId,
+        owner: &str,
+    ) -> std::result::Result<QuantumReport, QuantumFailure> {
+        let now = self.clock.now();
+        let lease_until = match duration_millis(self.limits.lease_duration) {
+            Ok(millis) => now.plus_millis(millis),
+            Err(error) => return Err(QuantumFailure::AuthorityUnavailable(error)),
+        };
+        let lease = self
+            .store
+            .acquire_ready_actor_for(actor, owner, now, lease_until)
+            .await
+            .map_err(QuantumFailure::AuthorityUnavailable)?;
+        let Some(lease) = lease else {
+            return Ok(QuantumReport {
+                work_item_id: None,
+                outcome: RunOnceOutcome::Idle,
+                progress: QuantumProgress::None,
+            });
+        };
+        let mut work_item_id = None;
+        let mut progress = QuantumProgress::None;
+        let result = self
+            .run_leased(&lease, &mut work_item_id, &mut progress)
+            .await;
+        let release = self.store.release_lease(&lease).await;
+        if let Err(error) = release {
+            return Err(QuantumFailure::AuthorityUnavailable(error));
+        }
+        match result {
+            Ok(outcome) => Ok(QuantumReport {
+                work_item_id,
+                outcome,
+                progress,
+            }),
+            Err(error) if work_item_id.is_some() && !authority_error(&error) => {
+                Err(QuantumFailure::RecoverableWork {
+                    work_item_id: work_item_id.expect("checked above"),
+                    message: error.to_string(),
+                })
+            }
+            Err(error) => Err(QuantumFailure::AuthorityUnavailable(error)),
+        }
+    }
+}
+
+fn authority_error(error: &anyhow::Error) -> bool {
+    crate::runtime::sqlite::is_authority_failure(error)
 }
 
 struct RuntimeLlmSink<'a> {

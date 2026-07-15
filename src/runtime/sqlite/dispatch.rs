@@ -6,7 +6,7 @@ use crate::{
     agent::message::Message,
     runtime::{
         model::{ActorId, Audience, EventId, RequestId, RunId, Timestamp, WorkItemId},
-        sqlite::{SqliteRuntimeStore, map_call_error},
+        sqlite::{SqliteRuntimeStore, map_call_error, retry::call_connection_with_busy_retry},
         store::{ActorLease, AttachedRun, ControlEvent, ControlStore, DispatchStore, StaleLease},
     },
 };
@@ -23,8 +23,9 @@ impl DispatchStore for SqliteRuntimeStore {
             bail!("lease expiry must be after current time");
         }
         let owner = owner.to_string();
-        self.connection
-            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<Option<ActorLease>> {
+        call_connection_with_busy_retry(
+            &self.connection,
+            move |connection| -> Result<Option<ActorLease>> {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
@@ -43,12 +44,17 @@ impl DispatchStore for SqliteRuntimeStore {
                                JOIN work_items ON work_items.id = events.work_item_id
                                WHERE events.actor_id = actors.id
                                  AND events.state = 'pending'
+                                 AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                                  AND (
                                     work_items.cancellation_requested_at IS NULL
                                     OR events.kind = 'cancel_requested'
                                  )
                             )
-                            OR EXISTS (SELECT 1 FROM runs WHERE runs.actor_id = actors.id AND runs.state = 'active')
+                            OR EXISTS (
+                               SELECT 1 FROM runs JOIN work_items ON work_items.id = runs.work_item_id
+                               WHERE runs.actor_id = actors.id AND runs.state = 'active'
+                                 AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
+                            )
                          )
                          ORDER BY COALESCE(
                             (
@@ -56,6 +62,7 @@ impl DispatchStore for SqliteRuntimeStore {
                                JOIN work_items ON work_items.id = events.work_item_id
                                WHERE events.actor_id = actors.id
                                  AND events.state = 'pending'
+                                 AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                                  AND (
                                     work_items.cancellation_requested_at IS NULL
                                     OR events.kind = 'cancel_requested'
@@ -116,13 +123,86 @@ impl DispatchStore for SqliteRuntimeStore {
                 transaction.commit()?;
                 Ok(Some(ActorLease {
                     actor_id: ActorId::from_string(actor_id),
-                    owner_id: owner,
+                    owner_id: owner.clone(),
                     generation,
                     expires_at: lease_until,
                 }))
-            })
-            .await
-            .map_err(|error| anyhow!("failed to acquire actor lease: {error}"))
+            },
+        )
+        .await
+        .map_err(|error| anyhow!("failed to acquire actor lease: {error}"))
+    }
+
+    async fn acquire_ready_actor_for(
+        &self,
+        actor: &ActorId,
+        owner: &str,
+        now: Timestamp,
+        lease_until: Timestamp,
+    ) -> Result<Option<ActorLease>> {
+        if lease_until <= now {
+            bail!("lease expiry must be after current time");
+        }
+        let actor = actor.clone();
+        let owner = owner.to_string();
+        call_connection_with_busy_retry(&self.connection, move |connection| -> Result<Option<ActorLease>> {
+            let transaction = connection.transaction_with_behavior(
+                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let ready = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM actors
+                    LEFT JOIN actor_leases ON actor_leases.actor_id = actors.id
+                    WHERE actors.id = ?1 AND actors.enabled = 1
+                      AND (actor_leases.actor_id IS NULL OR actor_leases.owner_id = ?2 OR actor_leases.expires_at <= ?3)
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM events JOIN work_items ON work_items.id = events.work_item_id
+                          WHERE events.actor_id = actors.id AND events.state = 'pending'
+                            AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?3)
+                            AND (work_items.cancellation_requested_at IS NULL OR events.kind = 'cancel_requested')
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM runs JOIN work_items ON work_items.id = runs.work_item_id
+                          WHERE runs.actor_id = actors.id AND runs.state = 'active'
+                            AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?3)
+                        )
+                      )
+                )",
+                params![actor.as_str(), owner, now.0],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !ready { return Ok(None); }
+            let current = transaction.query_row(
+                "SELECT generation, owner_id, expires_at FROM actor_leases WHERE actor_id = ?1",
+                [actor.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+            ).optional()?;
+            let generation = match current {
+                None => {
+                    transaction.execute(
+                        "INSERT INTO actor_leases(actor_id, generation, owner_id, expires_at) VALUES (?1, 1, ?2, ?3)",
+                        params![actor.as_str(), owner, lease_until.0],
+                    )?;
+                    1
+                }
+                Some((generation, current_owner, expires_at)) if current_owner == owner && expires_at > now.0 => {
+                    transaction.execute("UPDATE actor_leases SET expires_at = ?2 WHERE actor_id = ?1", params![actor.as_str(), lease_until.0])?;
+                    generation
+                }
+                Some((generation, _, expires_at)) if expires_at <= now.0 => {
+                    let next = generation + 1;
+                    transaction.execute(
+                        "UPDATE actor_leases SET generation = ?2, owner_id = ?3, expires_at = ?4 WHERE actor_id = ?1",
+                        params![actor.as_str(), next, owner, lease_until.0],
+                    )?;
+                    next
+                }
+                Some(_) => return Ok(None),
+            };
+            transaction.commit()?;
+            Ok(Some(ActorLease { actor_id: actor.clone(), owner_id: owner.clone(), generation, expires_at: lease_until }))
+        }).await.map_err(|error| anyhow!("failed to acquire configured actor lease: {error}"))
     }
 
     async fn renew_lease(
@@ -170,8 +250,9 @@ impl DispatchStore for SqliteRuntimeStore {
             bail!("max_events must be greater than zero");
         }
         let lease = lease.clone();
-        self.connection
-            .call(move |connection| -> Result<Option<AttachedRun>> {
+        call_connection_with_busy_retry(
+            &self.connection,
+            move |connection| -> Result<Option<AttachedRun>> {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
@@ -184,9 +265,10 @@ impl DispatchStore for SqliteRuntimeStore {
                          FROM runs
                          JOIN work_items ON work_items.id = runs.work_item_id
                          WHERE runs.actor_id = ?1 AND runs.state = 'active'
+                           AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                          ORDER BY runs.updated_at, runs.id
                          LIMIT 1",
-                        [lease.actor_id.as_str()],
+                        params![lease.actor_id.as_str(), now.0],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -209,6 +291,7 @@ impl DispatchStore for SqliteRuntimeStore {
                                  FROM events
                                  JOIN work_items ON work_items.id = events.work_item_id
                                  WHERE events.actor_id = ?1 AND events.state = 'pending'
+                                   AND (work_items.next_attempt_at IS NULL OR work_items.next_attempt_at <= ?2)
                                    AND (
                                       work_items.cancellation_requested_at IS NULL
                                       OR events.kind = 'cancel_requested'
@@ -219,7 +302,7 @@ impl DispatchStore for SqliteRuntimeStore {
                                     ELSE 2 END,
                                     events.mailbox_sequence
                                  LIMIT 1",
-                                [lease.actor_id.as_str()],
+                                params![lease.actor_id.as_str(), now.0],
                                 |row| {
                                     Ok((
                                         row.get::<_, String>(0)?,
@@ -320,6 +403,70 @@ impl DispatchStore for SqliteRuntimeStore {
                     .map(|event| event.sequence)
                     .max()
                     .unwrap_or(previous_observed);
+                let messages = event_rows
+                    .iter()
+                    .filter(|event| !event.incorporated)
+                    .map(|event| event_message(&event.payload_json))
+                    .collect::<Result<Vec<_>>>();
+                let messages = match messages {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let diagnostic = serde_json::json!({
+                            "code": "malformed_persisted_payload",
+                            "message": error.to_string(),
+                            "run_id": run_id,
+                        }).to_string();
+                        transaction.execute(
+                            "UPDATE work_items SET state = 'blocked_unknown_outcome',
+                             next_attempt_at = NULL, last_error = ?2, updated_at = ?3 WHERE id = ?1",
+                            params![work_item_id, diagnostic, now.0],
+                        )?;
+                        transaction.execute(
+                            "UPDATE events SET state = 'blocked', updated_at = ?2
+                             WHERE id IN (SELECT event_id FROM run_events WHERE run_id = ?1)",
+                            params![run_id, now.0],
+                        )?;
+                        transaction.execute(
+                            "UPDATE runs SET state = 'failed_terminal', updated_at = ?2 WHERE id = ?1",
+                            params![run_id, now.0],
+                        )?;
+                        transaction.commit()?;
+                        return Ok(None);
+                    }
+                };
+                let malformed_checkpoint = {
+                    let mut statement = transaction.prepare(
+                        "SELECT message_json FROM recent_messages WHERE work_item_id = ?1 ORDER BY id",
+                    )?;
+                    let rows = statement
+                        .query_map([work_item_id.as_str()], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    rows.into_iter()
+                        .find_map(|json| serde_json::from_str::<Message>(&json).err())
+                };
+                if let Some(error) = malformed_checkpoint {
+                    let diagnostic = serde_json::json!({
+                        "code": "malformed_persisted_checkpoint",
+                        "message": error.to_string(),
+                        "run_id": run_id,
+                    }).to_string();
+                    transaction.execute(
+                        "UPDATE work_items SET state = 'blocked_unknown_outcome',
+                         next_attempt_at = NULL, last_error = ?2, updated_at = ?3 WHERE id = ?1",
+                        params![work_item_id, diagnostic, now.0],
+                    )?;
+                    transaction.execute(
+                        "UPDATE events SET state = 'blocked', updated_at = ?2
+                         WHERE id IN (SELECT event_id FROM run_events WHERE run_id = ?1)",
+                        params![run_id, now.0],
+                    )?;
+                    transaction.execute(
+                        "UPDATE runs SET state = 'failed_terminal', updated_at = ?2 WHERE id = ?1",
+                        params![run_id, now.0],
+                    )?;
+                    transaction.commit()?;
+                    return Ok(None);
+                }
                 transaction.execute(
                     "UPDATE runs SET lease_generation = ?2, observed_sequence = ?3, updated_at = ?4 WHERE id = ?1",
                     params![run_id, lease.generation, observed_sequence, now.0],
@@ -327,7 +474,7 @@ impl DispatchStore for SqliteRuntimeStore {
                 transaction.commit()?;
 
                 Ok(Some(AttachedRun {
-                    lease,
+                    lease: lease.clone(),
                     work_item_id: WorkItemId::from_string(work_item_id),
                     run_id: RunId::from_string(run_id),
                     observed_sequence,
@@ -337,15 +484,11 @@ impl DispatchStore for SqliteRuntimeStore {
                         .collect(),
                     request_ids,
                     audience: decode_audience(&audience_kind, audience_address)?,
-                    messages: event_rows
-                        .into_iter()
-                        .filter(|event| !event.incorporated)
-                        .map(|event| event_message(&event.payload_json))
-                        .collect::<Result<Vec<_>>>()?,
+                    messages,
                 }))
-            })
-            .await
-            .map_err(map_call_error)
+            },
+        )
+        .await
     }
 
     async fn release_lease(&self, lease: &ActorLease) -> Result<()> {
@@ -590,6 +733,30 @@ impl SqliteRuntimeStore {
             .await
             .map_err(map_call_error)
     }
+
+    async fn poison_only_event_for_test(&self) -> Result<()> {
+        self.connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute("UPDATE events SET payload_json = '{malformed'", [])?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| anyhow!("failed to poison event: {error}"))
+    }
+
+    async fn blocked_payload_probe(&self) -> Result<(String, String, Option<String>)> {
+        self.connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT work_items.state, events.state, work_items.last_error
+                 FROM work_items JOIN events ON events.work_item_id = work_items.id LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .await
+            .map_err(|error| anyhow!("failed to inspect blocked payload: {error}"))
+    }
 }
 
 #[cfg(test)]
@@ -600,9 +767,9 @@ mod tests {
             model::{ActorId, Audience, CancelId, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                ControlStore, DispatchStore, IngressStore, LocalCancel, LocalIngressStore,
-                LocalSubmission, LocalSubmitOutcome, NewInboundEvent, RuntimeAuthorizationStore,
-                StaleLease,
+                ControlStore, DispatchStore, FailureStore, IngressStore, LocalCancel,
+                LocalIngressStore, LocalSubmission, LocalSubmitOutcome, NewInboundEvent,
+                RuntimeAuthorizationStore, StaleLease,
             },
         },
     };
@@ -666,6 +833,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<StaleLease>().is_some());
+    }
+
+    #[tokio::test]
+    async fn malformed_persisted_payload_is_atomically_blocked_without_redispatch() {
+        let store = store_with_event().await;
+        store.poison_only_event_for_test().await.unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(20))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .attach_next_run(&lease, 8, Timestamp(11))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.release_lease(&lease).await.unwrap();
+        assert!(
+            store
+                .acquire_ready_actor("worker-2", Timestamp(12), Timestamp(22))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (work, event, diagnostic) = store.blocked_payload_probe().await.unwrap();
+        assert_eq!(work, "blocked_unknown_outcome");
+        assert_eq!(event, "blocked");
+        assert!(diagnostic.unwrap().contains("malformed_persisted_payload"));
+    }
+
+    #[tokio::test]
+    async fn ready_acquisition_honors_persisted_next_attempt_at() {
+        let store = store_with_event().await;
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(20))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .record_failure(&run.work_item_id, "retry", Timestamp(12))
+            .await
+            .unwrap();
+        store.release_lease(&lease).await.unwrap();
+        assert!(
+            store
+                .acquire_ready_actor("early", Timestamp(1_011), Timestamp(2_000))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .acquire_ready_actor("due", Timestamp(1_012), Timestamp(2_000))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
