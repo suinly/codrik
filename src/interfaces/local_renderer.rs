@@ -318,6 +318,122 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_payload_fields_and_invalid_artifact_id_before_output() -> Result<()> {
+        let request = RequestId::new();
+        for (kind, payload) in [
+            ("text", br#"{"type":"text","text":"first","text":"second"}"#.to_vec()),
+            ("text", br#"{"type":"text","type":"text","text":"value"}"#.to_vec()),
+            ("text", br#"{"type":"text","text":"value","unknown":true}"#.to_vec()),
+            ("text", br#"{"type":"text"}"#.to_vec()),
+            ("file", br#"{"type":"file","artifact":{"id":"not-a-uuid","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}}"#.to_vec()),
+            ("file", br#"{"type":"file","artifact":{"id":"0190f2ef-0000-7000-8000-000000000001","id":"0190f2ef-0000-7000-8000-000000000002","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}}"#.to_vec()),
+            ("file", br#"{"type":"file","artifact":{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null,"unknown":true}}"#.to_vec()),
+            ("file", br#"{"type":"file","artifact":{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#.to_vec()),
+        ] {
+            assert_rejected(&request, raw_final_events(&request, vec![(kind, payload)])?)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validates_all_json_string_escapes_controls_and_surrogates_before_output() -> Result<()> {
+        let request = RequestId::new();
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        for event in raw_final_events(
+            &request,
+            vec![(
+                "text",
+                br#"{"type":"text","text":"\uD83D\uDE42\n\t\\\""}"#.to_vec(),
+            )],
+        )? {
+            renderer.handle(event)?;
+        }
+        assert_eq!(String::from_utf8(renderer.into_inner())?, "🙂\n\t\\\"\n");
+
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        for event in raw_final_events(
+            &request,
+            vec![(
+                "text",
+                br#"{"type":"text","text":"\u263A\b\f\r\/"}"#.to_vec(),
+            )],
+        )? {
+            renderer.handle(event)?;
+        }
+        assert_eq!(
+            renderer.into_inner(),
+            ["☺".as_bytes(), b"\x08\x0c\r/\n"].concat()
+        );
+
+        for invalid in [
+            br#"{"type":"text","text":"\uD800"}"#.as_slice(),
+            br#"{"type":"text","text":"\uDC00"}"#.as_slice(),
+            br#"{"type":"text","text":"\uD800\u0041"}"#.as_slice(),
+            br#"{"type":"text","text":"\u12"}"#.as_slice(),
+            br#"{"type":"text","text":"\uZZZZ"}"#.as_slice(),
+            br#"{"type":"text","text":"\x"}"#.as_slice(),
+            b"{\"type\":\"text\",\"text\":\"bad\x01control\"}".as_slice(),
+        ] {
+            assert_rejected(
+                &request,
+                raw_final_events(&request, vec![("text", invalid.to_vec())])?,
+            )?;
+        }
+        for invalid in [
+            br#"{"type":"terminal_error","code":"\uD800","message":"message"}"#.to_vec(),
+            br#"{"type":"terminal_error","code":"code","message":"\uD800"}"#.to_vec(),
+        ] {
+            assert_rejected(
+                &request,
+                raw_final_events(&request, vec![("terminal_error", invalid)])?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_later_delivery_produces_zero_authoritative_output_or_ack() -> Result<()> {
+        let request = RequestId::new();
+        assert_rejected(
+            &request,
+            raw_final_events(
+                &request,
+                vec![
+                    ("text", br#"{"type":"text","text":"first"}"#.to_vec()),
+                    (
+                        "terminal_error",
+                        br#"{"type":"terminal_error","code":"bad","message":"\uD800"}"#.to_vec(),
+                    ),
+                ],
+            )?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn validates_every_artifact_field_and_semantics_before_output() -> Result<()> {
+        let request = RequestId::new();
+        for artifact in [
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"relative","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}"#,
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"short","caption":null}"#,
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":-1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}"#,
+            r#"{"id":"\uD800","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}"#,
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/\uD800","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}"#,
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"\uD800","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}"#,
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"result","media_type":"\uD800","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":null}"#,
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\uD800","caption":null}"#,
+            r#"{"id":"0190f2ef-0000-7000-8000-000000000001","managed_path":"/tmp/result","display_name":"result","media_type":"text/plain","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","caption":"\uD800"}"#,
+        ] {
+            let payload = format!(r#"{{"type":"file","artifact":{artifact}}}"#).into_bytes();
+            assert_rejected(
+                &request,
+                raw_final_events(&request, vec![("file", payload)])?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn shutdown_during_bundle_returns_recovery_without_output() -> Result<()> {
         let request = RequestId::new();
         let events = final_events(&request, "done")?;
@@ -351,6 +467,51 @@ mod tests {
         )?)
     }
 
+    fn raw_final_events(
+        request: &RequestId,
+        payloads: Vec<(&str, Vec<u8>)>,
+    ) -> Result<Vec<ServerEvent>> {
+        let bundle = BundleId::new();
+        let mut manifest = Vec::new();
+        let mut chunks = Vec::new();
+        for (kind, bytes) in payloads {
+            let delivery = DeliveryId::new();
+            manifest.push(FinalManifestEntry {
+                delivery_id: delivery.clone(),
+                payload_kind: kind.into(),
+                decoded_bytes: bytes.len(),
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                chunk_count: bytes.len().div_ceil(crate::runtime::MAX_FINAL_CHUNK_BYTES),
+            });
+            for (chunk_index, chunk) in bytes
+                .chunks(crate::runtime::MAX_FINAL_CHUNK_BYTES)
+                .enumerate()
+            {
+                chunks.push(ServerEvent::new(ServerEventBody::FinalChunk {
+                    request_id: request.clone(),
+                    bundle_id: bundle.clone(),
+                    delivery_id: delivery.clone(),
+                    chunk_index,
+                    bytes_base64: STANDARD.encode(chunk),
+                }));
+            }
+        }
+        let manifest_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&manifest)?));
+        let mut events = vec![ServerEvent::new(ServerEventBody::FinalBegin {
+            request_id: request.clone(),
+            bundle_id: bundle.clone(),
+            replay: false,
+            manifest,
+        })];
+        events.extend(chunks);
+        events.push(ServerEvent::new(ServerEventBody::FinalEnd {
+            request_id: request.clone(),
+            bundle_id: bundle,
+            manifest_sha256,
+        }));
+        Ok(events)
+    }
+
     fn assert_rejected(request: &RequestId, events: Vec<ServerEvent>) -> Result<()> {
         let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
         let mut rejected = false;
@@ -373,8 +534,8 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
 use crate::runtime::{
-    BundleId, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES, MAX_FINAL_CHUNK_BYTES,
-    MAX_MANIFEST_BYTES, RequestId,
+    ArtifactId, BundleId, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES,
+    MAX_FINAL_CHUNK_BYTES, MAX_MANIFEST_BYTES, RequestId,
     ipc::protocol::{FinalManifestEntry, ServerEvent, ServerEventBody},
 };
 
@@ -827,93 +988,102 @@ impl FinalPayloadView<'_> {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedArtifactView<'a> {
+    #[serde(borrow)]
     id: &'a RawValue,
+    #[serde(borrow)]
     managed_path: &'a RawValue,
+    #[serde(borrow)]
     display_name: &'a RawValue,
+    #[serde(borrow)]
     media_type: &'a RawValue,
     size: u64,
+    #[serde(borrow)]
     sha256: &'a RawValue,
-    caption: Option<&'a RawValue>,
+    #[serde(borrow)]
+    caption: &'a RawValue,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinalPayloadObject<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a RawValue,
+    #[serde(default, borrow)]
+    text: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    artifact: Option<ManagedArtifactView<'a>>,
+    #[serde(default, borrow)]
+    code: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    message: Option<&'a RawValue>,
 }
 
 fn parse_payload(bytes: &[u8]) -> Result<FinalPayloadView<'_>> {
-    let fields: std::collections::HashMap<&str, &RawValue> = serde_json::from_slice(bytes)?;
-    let kind = fields
-        .get("type")
-        .context("final payload type is missing")?;
-    match kind.get() {
-        "\"text\"" => {
-            require_exact_fields(&fields, &["type", "text"])?;
+    let payload: FinalPayloadObject<'_> =
+        serde_json::from_slice(bytes).context("final payload shape is not canonical")?;
+    match payload.kind.get() {
+        "\"text\""
+            if payload.artifact.is_none()
+                && payload.code.is_none()
+                && payload.message.is_none() =>
+        {
             Ok(FinalPayloadView::Text {
-                text: fields["text"],
+                text: payload.text.context("final text payload is missing text")?,
             })
         }
-        "\"file\"" => {
-            require_exact_fields(&fields, &["type", "artifact"])?;
+        "\"file\""
+            if payload.text.is_none() && payload.code.is_none() && payload.message.is_none() =>
+        {
             Ok(FinalPayloadView::File {
-                artifact: parse_artifact(fields["artifact"])?,
+                artifact: payload
+                    .artifact
+                    .context("final file payload is missing artifact")?,
             })
         }
-        "\"terminal_error\"" => {
-            require_exact_fields(&fields, &["type", "code", "message"])?;
+        "\"terminal_error\"" if payload.text.is_none() && payload.artifact.is_none() => {
             Ok(FinalPayloadView::TerminalError {
-                code: fields["code"],
-                message: fields["message"],
+                code: payload
+                    .code
+                    .context("final terminal error payload is missing code")?,
+                message: payload
+                    .message
+                    .context("final terminal error payload is missing message")?,
             })
         }
-        _ => bail!("unknown final payload type"),
+        _ => bail!("final payload fields or type are not canonical"),
     }
-}
-
-fn parse_artifact(value: &RawValue) -> Result<ManagedArtifactView<'_>> {
-    let fields: std::collections::HashMap<&str, &RawValue> = serde_json::from_str(value.get())?;
-    require_exact_fields(
-        &fields,
-        &[
-            "id",
-            "managed_path",
-            "display_name",
-            "media_type",
-            "size",
-            "sha256",
-            "caption",
-        ],
-    )?;
-    let caption = match fields["caption"].get() {
-        "null" => None,
-        _ => Some(fields["caption"]),
-    };
-    Ok(ManagedArtifactView {
-        id: fields["id"],
-        managed_path: fields["managed_path"],
-        display_name: fields["display_name"],
-        media_type: fields["media_type"],
-        size: serde_json::from_str(fields["size"].get())?,
-        sha256: fields["sha256"],
-        caption,
-    })
-}
-
-fn require_exact_fields(
-    fields: &std::collections::HashMap<&str, &RawValue>,
-    expected: &[&str],
-) -> Result<()> {
-    if fields.len() != expected.len() || expected.iter().any(|field| !fields.contains_key(field)) {
-        bail!("final payload fields are not canonical")
-    }
-    Ok(())
 }
 
 impl ManagedArtifactView<'_> {
     fn validate(&self) -> Result<()> {
-        validate_json_string(self.id)?;
-        validate_json_string(self.managed_path)?;
-        validate_json_string(self.display_name)?;
-        validate_json_string(self.media_type)?;
-        validate_json_string(self.sha256)?;
-        if let Some(caption) = self.caption {
-            validate_json_string(caption)?;
+        let id = collect_small_json_string(self.id, 64)?;
+        ArtifactId::parse(std::str::from_utf8(&id)?).context("final artifact ID is not a UUID")?;
+
+        let mut path_first = None;
+        visit_json_string(self.managed_path, |decoded| {
+            if path_first.is_none() {
+                path_first = decoded.first().copied();
+            }
+            if decoded.contains(&0) {
+                bail!("final artifact path contains NUL")
+            }
+            Ok(())
+        })?;
+        if path_first != Some(b'/') {
+            bail!("final artifact managed path must be absolute")
+        }
+
+        require_nonempty_json_string(self.display_name, "display name")?;
+        require_nonempty_json_string(self.media_type, "media type")?;
+        let sha256 = collect_small_json_string(self.sha256, 64)?;
+        if sha256.len() != 64 || !sha256.iter().all(u8::is_ascii_hexdigit) {
+            bail!("final artifact SHA-256 must be 64 hexadecimal characters")
+        }
+        if self.caption.get() != "null" {
+            validate_json_string(self.caption)?;
         }
         let _ = self.size;
         Ok(())
@@ -921,34 +1091,60 @@ impl ManagedArtifactView<'_> {
 }
 
 fn validate_json_string(value: &RawValue) -> Result<()> {
-    let bytes = value.get().as_bytes();
-    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
-        bail!("final payload field must be a JSON string")
+    visit_json_string(value, |_| Ok(()))
+}
+
+fn require_nonempty_json_string(value: &RawValue, field: &str) -> Result<()> {
+    let mut decoded_bytes = 0usize;
+    visit_json_string(value, |decoded| {
+        decoded_bytes += decoded.len();
+        Ok(())
+    })?;
+    if decoded_bytes == 0 {
+        bail!("final artifact {field} must not be empty")
     }
     Ok(())
 }
 
-fn write_json_string(output: &mut impl Write, value: &RawValue) -> Result<()> {
-    validate_json_string(value)?;
+fn collect_small_json_string(value: &RawValue, limit: usize) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    visit_json_string(value, |bytes| {
+        if decoded.len().saturating_add(bytes.len()) > limit {
+            bail!("final payload identifier exceeds its size limit")
+        }
+        decoded.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    Ok(decoded)
+}
+
+fn visit_json_string(value: &RawValue, mut decoded: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let bytes = value.get().as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
+        bail!("final payload field must be a JSON string")
+    }
     let bytes = &value.get().as_bytes()[1..value.get().len() - 1];
     let mut index = 0;
     let mut plain_start = 0;
     while index < bytes.len() {
+        if bytes[index] < 0x20 || bytes[index] == b'"' {
+            bail!("final payload string contains an unescaped control or quote")
+        }
         if bytes[index] != b'\\' {
             index += 1;
             continue;
         }
-        output.write_all(&bytes[plain_start..index])?;
+        decoded(&bytes[plain_start..index])?;
         index += 1;
         let escape = *bytes.get(index).context("incomplete JSON string escape")?;
         index += 1;
         match escape {
-            b'"' | b'\\' | b'/' => output.write_all(&[escape])?,
-            b'b' => output.write_all(&[0x08])?,
-            b'f' => output.write_all(&[0x0c])?,
-            b'n' => output.write_all(b"\n")?,
-            b'r' => output.write_all(b"\r")?,
-            b't' => output.write_all(b"\t")?,
+            b'"' | b'\\' | b'/' => decoded(&[escape])?,
+            b'b' => decoded(&[0x08])?,
+            b'f' => decoded(&[0x0c])?,
+            b'n' => decoded(b"\n")?,
+            b'r' => decoded(b"\r")?,
+            b't' => decoded(b"\t")?,
             b'u' => {
                 let (mut scalar, next) = parse_hex_escape(bytes, index)?;
                 index = next;
@@ -965,14 +1161,21 @@ fn write_json_string(output: &mut impl Write, value: &RawValue) -> Result<()> {
                 }
                 let character = char::from_u32(scalar).context("invalid Unicode scalar")?;
                 let mut encoded = [0_u8; 4];
-                output.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+                decoded(character.encode_utf8(&mut encoded).as_bytes())?;
             }
             _ => bail!("invalid JSON string escape"),
         }
         plain_start = index;
     }
-    output.write_all(&bytes[plain_start..])?;
+    decoded(&bytes[plain_start..])?;
     Ok(())
+}
+
+fn write_json_string(output: &mut impl Write, value: &RawValue) -> Result<()> {
+    visit_json_string(value, |decoded| {
+        output.write_all(decoded)?;
+        Ok(())
+    })
 }
 
 fn parse_hex_escape(bytes: &[u8], start: usize) -> Result<(u32, usize)> {

@@ -1,9 +1,11 @@
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        env, fs,
         os::unix::fs::PermissionsExt,
+        process::Command,
         sync::{Arc, Barrier},
+        time::{Duration, Instant},
     };
 
     use anyhow::Result;
@@ -34,8 +36,8 @@ mod tests {
         let metadata = store.load(&request)?.expect("metadata");
         assert_eq!(metadata.state, RequestMetadataState::Created);
         assert_eq!(metadata.prompt_sha256.len(), 64);
-        assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(fs::metadata(path)?.permissions().mode() & 0o7777, 0o600);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -58,7 +60,7 @@ mod tests {
             store.load(&request)?.expect("metadata").state,
             RequestMetadataState::SentUnconfirmed
         );
-        assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o7777, 0o700);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -107,7 +109,7 @@ mod tests {
             fs::metadata(store.lock_path(&request))?
                 .permissions()
                 .mode()
-                & 0o777,
+                & 0o7777,
             0o600
         );
         fs::remove_dir_all(root)?;
@@ -175,6 +177,114 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
         );
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_special_permission_bits_on_root_lock_and_metadata() -> Result<()> {
+        let root = temp_root("special-bits");
+        let request = RequestId::new();
+        let store = RequestMetadataStore::new(root.clone());
+        store.create(&request, 1, "secret")?;
+
+        fs::set_permissions(store.path(&request), fs::Permissions::from_mode(0o4600))?;
+        assert!(store.load(&request).is_err());
+        fs::set_permissions(store.path(&request), fs::Permissions::from_mode(0o600))?;
+
+        fs::set_permissions(
+            store.lock_path(&request),
+            fs::Permissions::from_mode(0o4600),
+        )?;
+        assert!(
+            store
+                .set_state(&request, RequestMetadataState::Accepted)
+                .is_err()
+        );
+        fs::set_permissions(store.lock_path(&request), fs::Permissions::from_mode(0o600))?;
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o4700))?;
+        assert!(
+            store
+                .set_state(&request, RequestMetadataState::Accepted)
+                .is_err()
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cross_process_lock_prevents_stale_accepted_overwriting_terminal() -> Result<()> {
+        let root = temp_root("process-lock");
+        let request = RequestId::new();
+        let store = RequestMetadataStore::new(root.clone());
+        store.create(&request, 1, "secret")?;
+        store.set_state(&request, RequestMetadataState::Accepted)?;
+        let ready = root.join("accepted-ready");
+        let release = root.join("accepted-release");
+        let executable = env::current_exe()?;
+
+        let mut accepted = Command::new(&executable)
+            .args([
+                "--exact",
+                "interfaces::request_metadata::tests::metadata_process_writer_helper",
+                "--nocapture",
+            ])
+            .env("CODRIK_METADATA_HELPER_ROOT", &root)
+            .env("CODRIK_METADATA_HELPER_REQUEST", request.to_string())
+            .env("CODRIK_METADATA_HELPER_STATE", "accepted")
+            .env("CODRIK_METADATA_HELPER_READY", &ready)
+            .env("CODRIK_METADATA_HELPER_RELEASE", &release)
+            .spawn()?;
+        wait_for_path(&ready)?;
+
+        let mut terminal = Command::new(&executable)
+            .args([
+                "--exact",
+                "interfaces::request_metadata::tests::metadata_process_writer_helper",
+                "--nocapture",
+            ])
+            .env("CODRIK_METADATA_HELPER_ROOT", &root)
+            .env("CODRIK_METADATA_HELPER_REQUEST", request.to_string())
+            .env("CODRIK_METADATA_HELPER_STATE", "terminal")
+            .spawn()?;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            terminal.try_wait()?.is_none(),
+            "terminal writer did not block"
+        );
+        fs::write(&release, b"release")?;
+        assert!(accepted.wait()?.success());
+        assert!(terminal.wait()?.success());
+        assert_eq!(
+            store.load(&request)?.unwrap().state,
+            RequestMetadataState::Terminal
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_process_writer_helper() -> Result<()> {
+        let Ok(root) = env::var("CODRIK_METADATA_HELPER_ROOT") else {
+            return Ok(());
+        };
+        let request = RequestId::parse(&env::var("CODRIK_METADATA_HELPER_REQUEST")?)?;
+        let state = match env::var("CODRIK_METADATA_HELPER_STATE")?.as_str() {
+            "accepted" => RequestMetadataState::Accepted,
+            "terminal" => RequestMetadataState::Terminal,
+            other => anyhow::bail!("unknown helper state {other}"),
+        };
+        RequestMetadataStore::new(root.into()).set_state(&request, state)
+    }
+
+    fn wait_for_path(path: &std::path::Path) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !path.exists() {
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for {}", path.display())
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
     }
 
@@ -263,6 +373,8 @@ impl RequestMetadataStore {
                 state
             );
         }
+        #[cfg(test)]
+        self.pause_test_writer_after_load(request)?;
         metadata.state = state;
         self.write_atomic(&metadata)
     }
@@ -284,6 +396,8 @@ impl RequestMetadataStore {
                 state
             );
         }
+        #[cfg(test)]
+        self.pause_test_writer_after_load(request)?;
         metadata.state = state;
         self.write_atomic(&metadata)?;
         Ok(())
@@ -305,7 +419,7 @@ impl RequestMetadataStore {
         };
         let metadata = file.metadata()?;
         if !metadata.is_file()
-            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.permissions().mode() & 0o7777 != 0o600
             || metadata.uid() != unsafe { libc::geteuid() }
         {
             bail!(
@@ -346,6 +460,9 @@ impl RequestMetadataStore {
                     format!("failed to create metadata temp {}", temporary.display())
                 })?;
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+                bail!("request metadata temp file mode is not exactly 0600")
+            }
             serde_json::to_writer(&mut file, metadata)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
@@ -390,6 +507,12 @@ impl RequestMetadataStore {
                         self.root.display()
                     );
                 }
+                if metadata.permissions().mode() & 0o7000 != 0 {
+                    bail!(
+                        "request metadata root must not have special permission bits: {}",
+                        self.root.display()
+                    )
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut builder = DirBuilder::new();
@@ -398,6 +521,9 @@ impl RequestMetadataStore {
             Err(error) => return Err(error.into()),
         }
         fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
+        if fs::metadata(&self.root)?.permissions().mode() & 0o7777 != 0o700 {
+            bail!("request metadata root mode is not exactly 0700")
+        }
         Ok(())
     }
 
@@ -434,7 +560,7 @@ impl RequestMetadataStore {
         }
         let metadata = file.metadata()?;
         if !metadata.is_file()
-            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.permissions().mode() & 0o7777 != 0o600
             || metadata.uid() != unsafe { libc::geteuid() }
         {
             bail!(
@@ -445,6 +571,31 @@ impl RequestMetadataStore {
         file.lock_exclusive()
             .with_context(|| format!("failed to lock request metadata {}", path.display()))?;
         Ok(RequestLock(file))
+    }
+
+    #[cfg(test)]
+    fn pause_test_writer_after_load(&self, request: &RequestId) -> Result<()> {
+        let Ok(ready) = std::env::var("CODRIK_METADATA_HELPER_READY") else {
+            return Ok(());
+        };
+        let expected_request = request.to_string();
+        if std::env::var("CODRIK_METADATA_HELPER_REQUEST")
+            .ok()
+            .as_deref()
+            != Some(expected_request.as_str())
+        {
+            return Ok(());
+        }
+        let release = std::env::var("CODRIK_METADATA_HELPER_RELEASE")?;
+        fs::write(&ready, b"locked")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::path::Path::new(&release).exists() {
+            if std::time::Instant::now() >= deadline {
+                bail!("timed out waiting to release metadata test writer")
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
     }
 }
 

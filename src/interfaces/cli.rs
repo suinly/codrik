@@ -131,10 +131,16 @@ where
                 bundle_id,
                 delivery_ids,
             } => {
-                if let Err(error) = client
-                    .acknowledge_final(request_id, bundle_id, delivery_ids)
-                    .await
-                {
+                let acknowledgement = client.acknowledge_final(request_id, bundle_id, delivery_ids);
+                tokio::pin!(acknowledgement);
+                let acknowledgement = tokio::select! {
+                    _ = &mut interrupt => {
+                        writeln!(recovery, "{}", recovery_command(request))?;
+                        return Ok(())
+                    }
+                    result = &mut acknowledgement => result,
+                };
+                if let Err(error) = acknowledgement {
                     writeln!(recovery, "{}", recovery_command(request))?;
                     return Err(error);
                 }
@@ -191,10 +197,10 @@ impl CliCommand {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::pending, path::PathBuf};
+    use std::{future::pending, path::PathBuf, sync::Arc, time::Duration};
 
     use anyhow::Result;
-    use tokio::{io::AsyncReadExt, net::UnixListener};
+    use tokio::{io::AsyncReadExt, net::UnixListener, sync::Notify};
 
     use super::{CliCommand, drive_operation};
     use crate::{
@@ -479,6 +485,90 @@ mod tests {
             async {},
         )
         .await?;
+        server.await??;
+        assert_eq!(
+            metadata.load(&request)?.unwrap().state,
+            RequestMetadataState::Accepted
+        );
+        assert_eq!(
+            String::from_utf8(recovery)?,
+            format!("codrik resume {request}\n")
+        );
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupt_drops_blocked_ack_without_cancel_and_keeps_recovery() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let expected_request = request.clone();
+        let ack_started = Arc::new(Notify::new());
+        let server_notice = ack_started.clone();
+        let release_server = Arc::new(Notify::new());
+        let server_release = release_server.clone();
+        let server = tokio::spawn(async move {
+            let (mut operation, _) = listener.accept().await?;
+            FrameReader::new(&mut operation)
+                .read_client_request()
+                .await?;
+            let events = encode_bundle(
+                &ResultBundle {
+                    id: BundleId::new(),
+                    request_id: expected_request,
+                    state: BundleState::Delivered,
+                    manifest: BundleManifest {
+                        entries: vec![],
+                        sha256: String::new(),
+                    },
+                    deliveries: vec![(
+                        DeliveryId::new(),
+                        FinalPayload::Text {
+                            text: "done".into(),
+                        },
+                    )],
+                },
+                true,
+            )?;
+            for event in events {
+                FrameWriter::new(&mut operation)
+                    .write_server_event(&event)
+                    .await?;
+            }
+
+            let (mut ack, _) = listener.accept().await?;
+            let request = FrameReader::new(&mut ack).read_client_request().await?;
+            assert!(matches!(request.body, ClientRequestBody::AckFinal { .. }));
+            server_notice.notify_one();
+            server_release.notified().await;
+            anyhow::Ok(())
+        });
+
+        let metadata_root = temp_root();
+        let metadata = RequestMetadataStore::new(metadata_root.clone());
+        metadata.create(&request, 1, "secret")?;
+        metadata.set_state(&request, RequestMetadataState::Accepted)?;
+        let client = LocalIpcClient::new(socket.clone());
+        let stream = client.resume(request.clone()).await?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut recovery = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_operation(
+                &client,
+                &request,
+                stream,
+                &metadata,
+                &mut renderer,
+                &mut recovery,
+                ack_started.notified(),
+            ),
+        )
+        .await
+        .expect("interrupt must remain selectable during ACK")?;
+        release_server.notify_one();
         server.await??;
         assert_eq!(
             metadata.load(&request)?.unwrap().state,

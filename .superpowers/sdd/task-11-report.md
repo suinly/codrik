@@ -20,6 +20,11 @@ operations through one-operation Unix socket connections.
   manifest delivery order, bounded delivery allocation, escaped JSON payloads,
   interleaved shutdown recovery, the missing metadata lock path, and trailing
   arguments accepted by `update`.
+- The second correction reproduced three additional boundaries before changing
+  production code: duplicate JSON keys and malformed later deliveries were
+  accepted after earlier output, Ctrl-C timed out while a separate ACK read was
+  paused, and mode-04600 files plus a child-process lock rendezvous exposed the
+  incomplete permission mask and missing deterministic process test seam.
 
 ## GREEN implementation
 
@@ -30,9 +35,12 @@ operations through one-operation Unix socket connections.
   atomic rename, and directory fsync across processes. The leaf directory is
   created/repaired to mode 0700; metadata and lock reads use `O_NOFOLLOW` and
   reject non-regular, wrong-owner, or incorrectly permissioned files. Tests
-  cover concurrent stale writers, backward transitions, permission failures,
-  injected pre-rename failure, cleanup, and preservation of the authoritative
-  request file.
+  use the full Unix 07777 mask and cover special bits, concurrent stale writers,
+  backward transitions, permission failures, injected pre-rename failure,
+  cleanup, and preservation of the authoritative request file. A spawned test
+  process holds the OS lock after loading `accepted` while a second process
+  blocks before committing `terminal`, proving stale state cannot overwrite the
+  terminal transition across process boundaries.
 - `LocalIpcClient` applies a bounded socket connect and the protocol's bounded
   frame write, sends exactly one operation, and retains the write half only to
   keep the event subscription live. Submit, Resume, Cancel, and final ACK each
@@ -57,29 +65,38 @@ operations through one-operation Unix socket connections.
   no chunk vectors, assembled duplicate, or owned payload copy are retained.
   Before output or ACK coordinates are produced, it validates every ID, count,
   decoded size, delivery and manifest hash, allowed kind, exact payload shape,
-  and complete bundle state. Borrowed raw JSON values preserve escaped strings
-  without copying the payload.
+  and complete bundle state. Duplicate-preserving borrowed structs reject
+  duplicate, missing, and unknown payload/artifact fields. A streaming string
+  scan validates every escape, control, Unicode scalar, and surrogate pair in
+  every delivery before any authoritative output. Artifact validation parses
+  the UUID-backed ID and checks its u64 size, absolute NUL-free path, nonempty
+  display/media fields, and 64-digit hexadecimal hash without copying the
+  decoded bundle.
 - The CLI writes final output only after verification, sends ACK on a separate
   connection, and only after the matching positive response marks metadata
   terminal. ACK failure leaves metadata nonterminal and prints exactly
   `codrik resume <id>`.
-  Ctrl-C, EOF, and `ServerShuttingDown` leave metadata nonterminal, close only
-  the client connection, and print exactly `codrik resume <id>`. An integration
-  test confirms interrupt sends no Cancel frame.
+  Ctrl-C remains selectable during separate ACK connect/write/read; interrupt
+  drops that ACK future immediately. Ctrl-C, EOF, and `ServerShuttingDown` leave
+  metadata nonterminal, close only client connections, and print exactly
+  `codrik resume <id>`. Deterministic paused-operation and paused-ACK tests
+  confirm interrupt never sends a Cancel frame.
 
 ## Verification evidence
 
 - `rtk cargo test runtime::ipc::protocol::tests` — 20 passed.
 - `rtk cargo test runtime::ipc::server::tests` — 24 passed.
 - `rtk cargo test runtime::ipc::client::tests` — 5 passed.
-- `rtk cargo test interfaces::local_renderer::tests` — 11 passed.
-- `rtk cargo test interfaces::request_metadata::tests` — 7 passed.
-- `rtk cargo test interfaces::cli::tests` — 5 passed.
-- `rtk cargo test` — 417 passed, 1 ignored.
+- `rtk cargo test interfaces::local_renderer::tests` — 15 passed.
+- `rtk cargo test interfaces::request_metadata::tests` — 12 passed across the
+  parent and spawned helper-process suites.
+- `rtk cargo test interfaces::cli::tests` — 6 passed.
+- `rtk cargo test` — 427 passed, 1 ignored across the parent and spawned
+  helper-process suites.
 - `rtk cargo check` — passed with the existing pre-composition warning baseline.
 - `rtk cargo fmt --check` — passed.
-- `rtk cargo clippy --all-targets --all-features` — 0 errors; existing warning
-  baseline remains.
+- `rtk cargo clippy --all-targets --all-features` — 0 errors and 634 existing
+  warnings.
 - `rtk git diff --check` — passed.
 
 ## Self-review and concerns
