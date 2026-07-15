@@ -1,5 +1,6 @@
 pub mod artifacts;
 pub mod dispatcher;
+pub mod instance_lock;
 pub mod ipc;
 pub mod model;
 pub mod outbox_worker;
