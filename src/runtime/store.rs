@@ -313,6 +313,7 @@ pub struct AttachedRun {
     pub run_id: RunId,
     pub observed_sequence: i64,
     pub source_event_ids: Vec<EventId>,
+    pub request_ids: Vec<RequestId>,
     pub audience: Audience,
     pub messages: Vec<Message>,
 }

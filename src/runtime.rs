@@ -6,6 +6,7 @@ pub mod service;
 pub mod signals;
 pub mod sqlite;
 pub mod store;
+pub mod stream_hub;
 
 pub use model::{
     ArtifactId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState, MAX_BUNDLE_BYTES,

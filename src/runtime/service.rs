@@ -17,7 +17,7 @@ pub trait ReadyRunner: Send + Sync {
 #[async_trait]
 impl<L, T, S, C> ReadyRunner for ActorRunner<L, T, S, C>
 where
-    L: crate::llm::client::LlmClient + Send + Sync,
+    L: crate::llm::client::LlmStreamClient + Send + Sync,
     T: crate::agent::tool::ToolExecutor + Send + Sync,
     S: RuntimeStore + Send + Sync + Clone + 'static,
     C: crate::runtime::model::Clock,
@@ -103,13 +103,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use anyhow::Result;
     use async_trait::async_trait;
 
     use crate::{
         agent::tool::{Tool, ToolCallContext, ToolCapabilities, ToolExecution, ToolExecutor},
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
-        llm::client::{LlmClient, LlmRequest, LlmResponse, RunContext},
+        llm::client::{
+            LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamSink, RunContext,
+        },
         runtime::{
             artifacts::ArtifactManager,
             model::{ActorId, AttemptId, ManualClock, Timestamp},
@@ -121,6 +125,7 @@ mod tests {
                 DispatchStore, IngressOutcome, IngressStore, NewInboundEvent, NewToolAttempt,
                 OutboxPayload, RuntimeAuthorizationStore, ToolAttemptStore,
             },
+            stream_hub::NoopRuntimeEventPublisher,
         },
     };
 
@@ -149,6 +154,18 @@ mod tests {
                 content: "done".into(),
                 tool_calls: Vec::new(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for FinalLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.generate(request, context).await
         }
     }
 
@@ -207,6 +224,7 @@ mod tests {
             FinalLlm,
             NoTools,
             signals.clone(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&store, ManualClock::new(1_000)),
         );
@@ -285,6 +303,7 @@ mod tests {
             FinalLlm,
             NoTools,
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&reopened, ManualClock::new(1_000)),
         );
@@ -303,6 +322,7 @@ mod tests {
             FinalLlm,
             NoTools,
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&after_commit, ManualClock::new(2_000)),
         );
@@ -377,6 +397,7 @@ mod tests {
             FinalLlm,
             NoTools,
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&reopened, ManualClock::new(1_000)),
         );

@@ -530,6 +530,7 @@ mod tests {
             run_id: RunId::from_string("run-1"),
             observed_sequence: 0,
             source_event_ids: Vec::new(),
+            request_ids: Vec::new(),
             audience: Audience::ActorPrivate,
             messages: Vec::new(),
         };

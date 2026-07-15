@@ -5,7 +5,7 @@ use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 use crate::{
     agent::message::Message,
     runtime::{
-        model::{ActorId, Audience, EventId, RunId, Timestamp, WorkItemId},
+        model::{ActorId, Audience, EventId, RequestId, RunId, Timestamp, WorkItemId},
         sqlite::{SqliteRuntimeStore, map_call_error},
         store::{ActorLease, AttachedRun, ControlEvent, ControlStore, DispatchStore, StaleLease},
     },
@@ -294,6 +294,27 @@ impl DispatchStore for SqliteRuntimeStore {
                 }
 
                 let event_rows = load_run_events(&transaction, &run_id)?;
+                let request_ids = {
+                    let mut statement = transaction.prepare(
+                        "SELECT local_requests.request_id
+                         FROM local_requests
+                         JOIN run_events ON run_events.event_id = local_requests.event_id
+                         WHERE run_events.run_id = ?1 AND local_requests.state = 'active'
+                         ORDER BY local_requests.created_at, local_requests.request_id",
+                    )?;
+                    statement
+                        .query_map([&run_id], |row| row.get::<_, String>(0))?
+                        .map(|row| {
+                            RequestId::parse(&row?).map_err(|error| {
+                                tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    tokio_rusqlite::rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
                 let observed_sequence = event_rows
                     .iter()
                     .map(|event| event.sequence)
@@ -314,6 +335,7 @@ impl DispatchStore for SqliteRuntimeStore {
                         .iter()
                         .map(|event| EventId::from_string(event.id.clone()))
                         .collect(),
+                    request_ids,
                     audience: decode_audience(&audience_kind, audience_address)?,
                     messages: event_rows
                         .into_iter()

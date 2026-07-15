@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 
@@ -8,7 +8,10 @@ use crate::{
         tool::{ToolCallContext, ToolExecutor},
         tool_observation,
     },
-    llm::client::{LlmClient, LlmRequest, LlmToolCall, RunContext},
+    llm::client::{
+        AgentActivityEvent, LlmRequest, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
+        LlmToolCall, RunContext,
+    },
     runtime::{
         artifacts::ArtifactManager,
         model::{AttemptId, Clock, EventKind, OutboxId},
@@ -17,6 +20,7 @@ use crate::{
             AttemptOutcome, AttemptRecovery, CheckpointRun, FinalizeOutcome, FinalizeRun,
             NewOutboxIntent, NewToolAttempt, OutboxPayload, RuntimeStore,
         },
+        stream_hub::RuntimeEventPublisher,
     },
 };
 
@@ -60,13 +64,14 @@ pub struct ActorRunner<L, T, S, C> {
     tools: T,
     clock: C,
     signals: ActorSignals,
+    events: Arc<dyn RuntimeEventPublisher>,
     limits: RunnerLimits,
     artifacts: ArtifactManager<S, C>,
 }
 
 impl<L, T, S, C> ActorRunner<L, T, S, C>
 where
-    L: LlmClient + Send + Sync,
+    L: LlmStreamClient + Send + Sync,
     T: ToolExecutor + Send + Sync,
     S: RuntimeStore + Clone + 'static,
     C: Clock,
@@ -75,6 +80,7 @@ where
         llm: L,
         tools: T,
         signals: ActorSignals,
+        events: Arc<dyn RuntimeEventPublisher>,
         limits: RunnerLimits,
         artifacts: ArtifactManager<S, C>,
     ) -> Self {
@@ -86,6 +92,7 @@ where
             tools,
             clock,
             signals,
+            events,
             limits,
             artifacts,
         }
@@ -156,6 +163,12 @@ where
                     self.store
                         .mark_attempt_running(&run, &attempt.id, self.clock.now())
                         .await?;
+                    self.events.publish_activity(
+                        &run.request_ids,
+                        AgentActivityEvent::ToolStarted {
+                            name: attempt.tool_name.clone(),
+                        },
+                    );
                     let tool_context = ToolCallContext {
                         attempt_id: attempt.id.to_string(),
                         authorized_tools: vec![attempt.tool_name.clone()],
@@ -185,6 +198,13 @@ where
                             .finish_attempt(&run, &attempt.id, outcome.clone(), self.clock.now())
                             .await?;
                     }
+                    self.events.publish_activity(
+                        &run.request_ids,
+                        AgentActivityEvent::ToolFinished {
+                            name: attempt.tool_name.clone(),
+                            succeeded: matches!(outcome, AttemptOutcome::Succeeded { .. }),
+                        },
+                    );
                     outcome
                 }
                 AttemptRecovery::OutcomeUnknown => {
@@ -234,6 +254,8 @@ where
                         self.store
                             .cancel_run(&run, &control, self.clock.now())
                             .await?;
+                        self.events
+                            .publish_activity(&run.request_ids, AgentActivityEvent::Cancelled);
                         Ok(RunOnceOutcome::Cancelled)
                     }
                     EventKind::UserMessage => Ok(RunOnceOutcome::Yielded),
@@ -244,8 +266,14 @@ where
                 messages: messages.clone(),
                 tools: self.tools.definitions(),
             };
+            self.events
+                .publish_activity(&run.request_ids, AgentActivityEvent::ModelStepStarted);
             let response = {
-                let generation = self.llm.generate(request, &context);
+                let mut sink = RuntimeLlmSink {
+                    requests: &run.request_ids,
+                    publisher: self.events.as_ref(),
+                };
+                let generation = self.llm.stream(request, &mut sink, &context);
                 tokio::pin!(generation);
                 loop {
                     tokio::select! {
@@ -273,6 +301,10 @@ where
                                 return match control.kind {
                                     EventKind::CancelRequested => {
                                         self.store.cancel_run(&run, &control, self.clock.now()).await?;
+                                        self.events.publish_activity(
+                                            &run.request_ids,
+                                            AgentActivityEvent::Cancelled,
+                                        );
                                         Ok(RunOnceOutcome::Cancelled)
                                     }
                                     EventKind::UserMessage => Ok(RunOnceOutcome::Yielded),
@@ -283,6 +315,12 @@ where
                     }
                 }
             };
+            if !response.content.is_empty() {
+                self.events.publish_activity(
+                    &run.request_ids,
+                    AgentActivityEvent::Description(response.content.clone()),
+                );
+            }
             if response.tool_calls.is_empty() {
                 let intent_key = format!("run:{}:final", run.run_id);
                 match self
@@ -306,7 +344,11 @@ where
                     )
                     .await?
                 {
-                    FinalizeOutcome::Completed => return Ok(RunOnceOutcome::Completed),
+                    FinalizeOutcome::Completed => {
+                        self.events
+                            .publish_activity(&run.request_ids, AgentActivityEvent::Completed);
+                        return Ok(RunOnceOutcome::Completed);
+                    }
                     FinalizeOutcome::Preempted { .. } => {
                         run = self
                             .store
@@ -368,6 +410,12 @@ where
                 self.store
                     .mark_attempt_running(&run, &attempt.id, self.clock.now())
                     .await?;
+                self.events.publish_activity(
+                    &run.request_ids,
+                    AgentActivityEvent::ToolStarted {
+                        name: tool_call.name.clone(),
+                    },
+                );
                 let tool_context = ToolCallContext {
                     attempt_id: attempt.id.to_string(),
                     authorized_tools: Vec::new(),
@@ -407,7 +455,15 @@ where
                         )
                     }
                 };
-                if !matches!(outcome, AttemptOutcome::Succeeded { .. }) {
+                let succeeded = matches!(outcome, AttemptOutcome::Succeeded { .. });
+                self.events.publish_activity(
+                    &run.request_ids,
+                    AgentActivityEvent::ToolFinished {
+                        name: tool_call.name.clone(),
+                        succeeded,
+                    },
+                );
+                if !succeeded {
                     self.store
                         .finish_attempt(&run, &attempt.id, outcome, self.clock.now())
                         .await?;
@@ -429,6 +485,21 @@ where
             messages.extend(checkpoint_messages);
         }
         Ok(RunOnceOutcome::Yielded)
+    }
+}
+
+struct RuntimeLlmSink<'a> {
+    requests: &'a [crate::runtime::model::RequestId],
+    publisher: &'a dyn RuntimeEventPublisher,
+}
+
+#[async_trait::async_trait]
+impl LlmStreamSink for RuntimeLlmSink<'_> {
+    async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
+        if let LlmStreamEvent::TextDelta(delta) = event {
+            self.publisher.publish_text(self.requests, &delta);
+        }
+        Ok(())
     }
 }
 
@@ -471,17 +542,23 @@ mod tests {
             ToolExecutor,
         },
         auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
-        llm::client::{LlmClient, LlmRequest, LlmResponse, LlmToolCall, RunContext},
+        llm::client::{
+            LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamEvent, LlmStreamSink,
+            LlmToolCall, LlmToolCallDelta, RunContext,
+        },
         runtime::{
             artifacts::{ArtifactManager, TestPause},
-            model::{ActorId, AttemptId, Audience, EventKind, ManualClock, Timestamp},
+            ipc::protocol::ServerEventBody,
+            model::{ActorId, AttemptId, Audience, EventKind, ManualClock, RequestId, Timestamp},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
             store::{
-                AttemptOutcome, AttemptRecovery, DispatchStore, IngressStore, NewInboundEvent,
-                OutboxPayload, RuntimeAuthorizationStore, ToolAttemptStore,
+                AttemptOutcome, AttemptRecovery, DispatchStore, IngressStore, LocalIngressStore,
+                LocalSubmission, NewInboundEvent, OutboxPayload, RuntimeAuthorizationStore,
+                ToolAttemptStore,
             },
+            stream_hub::{NoopRuntimeEventPublisher, StreamHub},
         },
     };
 
@@ -510,6 +587,18 @@ mod tests {
                 content: "done".into(),
                 tool_calls: Vec::new(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for FinalLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.generate(request, context).await
         }
     }
 
@@ -552,6 +641,18 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LlmStreamClient for ScriptedLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.generate(request, context).await
+        }
+    }
+
     #[derive(Clone, Default)]
     struct RecordingTools {
         attempts: Arc<Mutex<Vec<String>>>,
@@ -574,6 +675,35 @@ mod tests {
         started: Arc<Notify>,
     }
 
+    #[derive(Clone)]
+    struct StreamingFinalLlm;
+
+    #[async_trait]
+    impl LlmStreamClient for StreamingFinalLlm {
+        async fn stream(
+            &self,
+            _request: LlmRequest,
+            sink: &mut dyn LlmStreamSink,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
+            sink.on_event(LlmStreamEvent::TextDelta("partial".into()))
+                .await?;
+            sink.on_event(LlmStreamEvent::TextDelta("overflow".into()))
+                .await?;
+            sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
+                index: 0,
+                id: Some("provider-only".into()),
+                name: Some("hidden".into()),
+                arguments: Some("{}".into()),
+            }))
+            .await?;
+            Ok(LlmResponse {
+                content: "authoritative final".into(),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
     #[async_trait]
     impl LlmClient for BlockingLlm {
         async fn generate(
@@ -583,6 +713,18 @@ mod tests {
         ) -> Result<LlmResponse> {
             self.started.notify_one();
             std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for BlockingLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.generate(request, context).await
         }
     }
 
@@ -613,6 +755,18 @@ mod tests {
                 content: if call == 0 { "stale" } else { "fresh" }.into(),
                 tool_calls: Vec::new(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for InjectingLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.generate(request, context).await
         }
     }
 
@@ -708,6 +862,7 @@ mod tests {
             FinalLlm,
             NoTools,
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&store, ManualClock::new(1_000)),
         );
@@ -722,6 +877,92 @@ mod tests {
             outbox[0].payload,
             OutboxPayload::Text {
                 text: "done".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_fans_out_text_for_attached_requests_but_finalizes_complete_response() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![LegacyActor {
+                        id: "actor:local:1".into(),
+                        enabled: true,
+                        tools: Vec::new(),
+                        identities: Vec::new(),
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        let request_id = RequestId::new();
+        let second_request_id = RequestId::new();
+        let hub = StreamHub::with_limits(3, 16, 64);
+        let mut subscription = hub.subscribe(request_id.clone()).unwrap();
+        let mut second_subscription = hub.subscribe(second_request_id.clone()).unwrap();
+        store
+            .submit_for_actor(
+                &ActorId::from_string("actor:local:1"),
+                LocalSubmission {
+                    request_id,
+                    text: "hello".into(),
+                    prompt_sha256:
+                        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        store
+            .submit_for_actor(
+                &ActorId::from_string("actor:local:1"),
+                LocalSubmission {
+                    request_id: second_request_id,
+                    text: "more context".into(),
+                    prompt_sha256:
+                        "d0e6e76cb7f5008f6c9ea7c788e43922c120eb68e334b14dc7d34d41dba1c200".into(),
+                },
+                Timestamp(3),
+            )
+            .await
+            .unwrap();
+        let runner = ActorRunner::new(
+            StreamingFinalLlm,
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(hub),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+
+        assert_eq!(
+            runner.run_once("worker").await.unwrap(),
+            RunOnceOutcome::Completed
+        );
+        let events = std::iter::from_fn(|| subscription.try_recv()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            &event.body,
+            ServerEventBody::TextDelta { delta, .. } if delta == "partial"
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.body, ServerEventBody::StreamGap { .. }))
+        );
+        let second_events =
+            std::iter::from_fn(|| second_subscription.try_recv()).collect::<Vec<_>>();
+        assert!(second_events.iter().any(|event| matches!(
+            &event.body,
+            ServerEventBody::TextDelta { delta, .. } if delta == "partial"
+        )));
+        assert_eq!(
+            store.outbox_intents().await.unwrap()[0].payload,
+            OutboxPayload::Text {
+                text: "authoritative final".into()
             }
         );
     }
@@ -751,6 +992,7 @@ mod tests {
             llm,
             tools,
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&store, ManualClock::new(1_000)),
         );
@@ -812,6 +1054,7 @@ mod tests {
                 attempts: attempts.clone(),
             },
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             artifacts,
         );
@@ -872,6 +1115,7 @@ mod tests {
             },
             NoTools,
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&store, ManualClock::new(1_000)),
         );
@@ -900,6 +1144,7 @@ mod tests {
             },
             NoTools,
             signals.clone(),
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&store, ManualClock::new(1_000)),
         );
@@ -933,6 +1178,7 @@ mod tests {
             FinalLlm,
             NoTools,
             signals,
+            Arc::new(NoopRuntimeEventPublisher),
             RunnerLimits::default(),
             test_artifacts(&store, ManualClock::new(1_001)),
         );
@@ -965,6 +1211,7 @@ mod tests {
             },
             RecordingTools::default(),
             ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
             limits,
             test_artifacts(&store, ManualClock::new(1_000)),
         );
