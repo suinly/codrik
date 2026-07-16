@@ -536,6 +536,32 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn request_rejections_are_definitive_but_server_busy_is_recoverable() -> Result<()> {
+        let request = RequestId::new();
+        for code in ["missing_request", "actor_unavailable", "request_conflict"] {
+            let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+            assert!(matches!(
+                renderer.handle(ServerEvent::new(ServerEventBody::RequestError {
+                    request_id: request.clone(),
+                    code: code.into(),
+                    message: "rejected".into(),
+                }))?,
+                RenderAction::DaemonError { recover: false, .. }
+            ));
+        }
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        assert!(matches!(
+            renderer.handle(ServerEvent::new(ServerEventBody::RequestError {
+                request_id: request,
+                code: "server_busy".into(),
+                message: "retry".into(),
+            }))?,
+            RenderAction::DaemonError { recover: true, .. }
+        ));
+        Ok(())
+    }
+
     fn final_events(request: &RequestId, text: &str) -> Result<Vec<ServerEvent>> {
         let delivery = DeliveryId::new();
         Ok(encode_bundle(
@@ -644,7 +670,10 @@ pub enum RenderAction {
         delivery_ids: Vec<DeliveryId>,
     },
     Recover,
-    DaemonError(String),
+    DaemonError {
+        message: String,
+        recover: bool,
+    },
 }
 
 pub struct LocalRenderer<W> {
@@ -760,9 +789,10 @@ impl<W: Write> LocalRenderer<W> {
             }
             ServerEventBody::AckAccepted { request_id, .. } => {
                 self.require_request(&request_id)?;
-                Ok(RenderAction::DaemonError(
-                    "unexpected final acknowledgement on operation stream".into(),
-                ))
+                Ok(RenderAction::DaemonError {
+                    message: "unexpected final acknowledgement on operation stream".into(),
+                    recover: false,
+                })
             }
             ServerEventBody::Activity { request_id, .. } => {
                 self.require_request(&request_id)?;
@@ -803,13 +833,15 @@ impl<W: Write> LocalRenderer<W> {
                 message,
             } => {
                 self.require_request(&request_id)?;
-                Ok(RenderAction::DaemonError(format!(
-                    "daemon rejected request {request_id} ({code}): {message}"
-                )))
+                Ok(RenderAction::DaemonError {
+                    recover: code == "server_busy",
+                    message: format!("daemon rejected request {request_id} ({code}): {message}"),
+                })
             }
-            ServerEventBody::ProtocolError { code, message } => Ok(RenderAction::DaemonError(
-                format!("daemon protocol error ({code:?}): {message}"),
-            )),
+            ServerEventBody::ProtocolError { code, message } => Ok(RenderAction::DaemonError {
+                message: format!("daemon protocol error ({code:?}): {message}"),
+                recover: false,
+            }),
             ServerEventBody::ServerShuttingDown { request_id, .. } => {
                 if let Some(request_id) = request_id {
                     self.require_request(&request_id)?;

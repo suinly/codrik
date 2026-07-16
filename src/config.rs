@@ -7,11 +7,11 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
-    pub telegram: Option<TelegramConfig>,
     #[serde(default)]
     pub attachments: AttachmentConfig,
     #[serde(default)]
@@ -73,11 +73,6 @@ fn resolve_runtime_path(configured: Option<&Path>, codrik_home: &Path, default: 
         Ok(relative) => codrik_home.join(relative),
         Err(_) => path.to_path_buf(),
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TelegramConfig {
-    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -191,6 +186,14 @@ mod tests {
         assert_eq!(config.attachments.max_file_size_mb, 32);
         assert_eq!(config.attachments.image_detail, ImageDetailConfig::High);
         Ok(())
+    }
+
+    #[test]
+    fn obsolete_telegram_secret_config_is_rejected() {
+        let result = yaml_serde::from_str::<AppConfig>(
+            "api_key: key\nbase_url: https://example.test/v1\nmodel: test\ntelegram:\n  token: secret\n",
+        );
+        assert!(result.is_err());
     }
 
     #[test]

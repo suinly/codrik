@@ -226,8 +226,10 @@ where
                 writeln!(recovery, "{}", recovery_command(request))?;
                 return Ok(());
             }
-            RenderAction::DaemonError(message) => {
-                writeln!(recovery, "{}", recovery_command(request))?;
+            RenderAction::DaemonError { message, recover } => {
+                if recover {
+                    writeln!(recovery, "{}", recovery_command(request))?;
+                }
                 bail!(message)
             }
             RenderAction::CancelAccepted => bail!("unexpected cancellation response"),
@@ -656,6 +658,55 @@ mod tests {
             metadata.path(&request),
             std::fs::Permissions::from_mode(0o600),
         )?;
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definitive_missing_request_does_not_print_resume_recovery() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let expected = request.clone();
+        let server = tokio::spawn(async move {
+            let (mut operation, _) = listener.accept().await?;
+            FrameReader::new(&mut operation)
+                .read_client_request()
+                .await?;
+            FrameWriter::new(&mut operation)
+                .write_server_event(&crate::runtime::ipc::protocol::ServerEvent::new(
+                    crate::runtime::ipc::protocol::ServerEventBody::RequestError {
+                        request_id: expected,
+                        code: "missing_request".into(),
+                        message: "request does not exist".into(),
+                    },
+                ))
+                .await?;
+            anyhow::Ok(())
+        });
+        let metadata_root = temp_root();
+        let metadata = RequestMetadataStore::new(metadata_root.clone());
+        metadata.create(&request, 1, "secret")?;
+        let client = LocalIpcClient::new(socket.clone());
+        let stream = client.resume(request.clone()).await?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut recovery = Vec::new();
+        assert!(
+            drive_operation(
+                &client,
+                &request,
+                stream,
+                &metadata,
+                &mut renderer,
+                &mut recovery,
+                pending(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(recovery.is_empty());
+        server.await??;
         std::fs::remove_file(socket)?;
         std::fs::remove_dir_all(metadata_root)?;
         Ok(())

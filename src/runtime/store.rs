@@ -486,6 +486,13 @@ pub struct ClaimedBundleRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayBundleRef {
+    pub actor_id: ActorId,
+    pub request_id: RequestId,
+    pub bundle_id: BundleId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClaimedBundleLoad {
     Loaded(ResultBundle),
     FailedTerminal,
@@ -560,6 +567,7 @@ pub trait BundleStore: Send + Sync {
         now: Timestamp,
     ) -> Result<ClaimedBundleLoad>;
     async fn load_bundle(&self, id: &BundleId) -> Result<ResultBundle>;
+    async fn load_bundle_state(&self, id: &BundleId) -> Result<BundleState>;
     async fn acknowledge_bundle(&self, ack: BundleAck, now: Timestamp) -> Result<AckOutcome>;
     async fn fail_bundle_retryable(
         &self,
@@ -574,11 +582,12 @@ pub trait BundleStore: Send + Sync {
         error: &str,
         now: Timestamp,
     ) -> Result<()>;
-    async fn replay_bundle(
+    async fn resolve_replay_bundle(
         &self,
         actor: &ActorId,
         request: &RequestId,
-    ) -> Result<Option<ResultBundle>>;
+    ) -> Result<Option<ReplayBundleRef>>;
+    async fn load_replay_bundle(&self, replay: &ReplayBundleRef) -> Result<ResultBundle>;
 }
 
 #[derive(Clone, Debug)]

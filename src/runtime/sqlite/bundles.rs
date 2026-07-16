@@ -14,7 +14,8 @@ use crate::runtime::{
     store::{
         AckOutcome, AckRejected, BundleAck, BundleClaim, BundleManifest, BundleManifestEntry,
         BundleStore, ClaimRenewal, ClaimTransition, ClaimedBundle, ClaimedBundleLoad,
-        ClaimedBundleRef, FinalPayload, ManagedArtifact, OutboxPayload, ResultBundle,
+        ClaimedBundleRef, FinalPayload, ManagedArtifact, OutboxPayload, ReplayBundleRef,
+        ResultBundle,
     },
 };
 
@@ -273,6 +274,21 @@ impl BundleStore for SqliteRuntimeStore {
             .map_err(map_call_error)
     }
 
+    async fn load_bundle_state(&self, id: &BundleId) -> Result<BundleState> {
+        let id = id.to_string();
+        self.connection
+            .call(move |connection| -> Result<BundleState> {
+                let state = connection.query_row(
+                    "SELECT state FROM result_bundles WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                decode_state(&state)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
     async fn acknowledge_bundle(&self, ack: BundleAck, now: Timestamp) -> Result<AckOutcome> {
         self.connection
             .call(move |connection| -> Result<AckOutcome> {
@@ -437,15 +453,15 @@ impl BundleStore for SqliteRuntimeStore {
             .map_err(map_call_error)
     }
 
-    async fn replay_bundle(
+    async fn resolve_replay_bundle(
         &self,
         actor: &ActorId,
         request: &RequestId,
-    ) -> Result<Option<ResultBundle>> {
-        let actor = actor.to_string();
-        let request = request.to_string();
+    ) -> Result<Option<ReplayBundleRef>> {
+        let actor = actor.clone();
+        let request = request.clone();
         self.connection
-            .call(move |connection| -> Result<Option<ResultBundle>> {
+            .call(move |connection| -> Result<Option<ReplayBundleRef>> {
                 let bundle_id = connection
                     .query_row(
                         "SELECT result_bundles.id FROM result_bundles
@@ -454,13 +470,67 @@ impl BundleStore for SqliteRuntimeStore {
                          WHERE result_bundles.request_id = ?1
                            AND local_requests.actor_id = ?2
                            AND result_bundles.state = 'delivered'",
-                        params![request, actor],
+                        params![request.as_str(), actor.as_str()],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?;
                 bundle_id
-                    .map(|id| load_bundle_row(connection, &id))
+                    .map(|id| {
+                        Ok(ReplayBundleRef {
+                            actor_id: actor,
+                            request_id: request,
+                            bundle_id: BundleId::parse(&id)?,
+                        })
+                    })
                     .transpose()
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn load_replay_bundle(&self, replay: &ReplayBundleRef) -> Result<ResultBundle> {
+        let replay = replay.clone();
+        self.connection
+            .call(move |connection| -> Result<ResultBundle> {
+                let transaction = connection.transaction()?;
+                let valid = transaction
+                    .query_row(
+                        "SELECT 1
+                         FROM result_bundles
+                         JOIN local_requests
+                           ON local_requests.request_id = result_bundles.request_id
+                         WHERE result_bundles.id = ?1
+                           AND result_bundles.request_id = ?2
+                           AND result_bundles.state = 'delivered'
+                           AND local_requests.actor_id = ?3
+                           AND local_requests.result_bundle_id = result_bundles.id",
+                        params![
+                            replay.bundle_id.as_str(),
+                            replay.request_id.as_str(),
+                            replay.actor_id.as_str()
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !valid {
+                    bail!("replay reference no longer has actor-scoped bundle authority");
+                }
+                let wrong_actor_count: i64 = transaction.query_row(
+                    "SELECT count(*)
+                     FROM outbox_deliveries
+                     JOIN outbox ON outbox.id = outbox_deliveries.outbox_id
+                     WHERE outbox_deliveries.bundle_id = ?1
+                       AND outbox.actor_id != ?2",
+                    params![replay.bundle_id.as_str(), replay.actor_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if wrong_actor_count != 0 {
+                    bail!("replay bundle contains delivery payloads owned by another actor");
+                }
+                let bundle = load_bundle_row(&transaction, replay.bundle_id.as_str())?;
+                transaction.commit()?;
+                Ok(bundle)
             })
             .await
             .map_err(map_call_error)
@@ -787,7 +857,7 @@ mod tests {
         let other = ActorId::from_string("actor:other");
         assert!(
             store
-                .replay_bundle(&other, &seeded.request_id)
+                .resolve_replay_bundle(&other, &seeded.request_id)
                 .await
                 .unwrap()
                 .is_none()
@@ -796,6 +866,38 @@ mod tests {
         ack.actor_id = other;
         assert!(store.acknowledge_bundle(ack, Timestamp(2)).await.is_err());
         assert_eq!(bundle_state(&store, &seeded.bundle_id).await, "delivering");
+    }
+
+    #[tokio::test]
+    async fn replay_load_rejects_corrupt_outbox_actor_ownership() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "delivered", 1, false).await.unwrap();
+        let actor = ActorId::from_string("bundle-actor");
+        let replay = store
+            .resolve_replay_bundle(&actor, &seeded.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let bundle_id = seeded.bundle_id.to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO actors(id, enabled, tools_json, created_at)
+                     VALUES ('actor:other', 1, '[]', 1)",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE outbox SET actor_id = 'actor:other'
+                     WHERE id IN (
+                         SELECT outbox_id FROM outbox_deliveries WHERE bundle_id = ?1
+                     )",
+                    [bundle_id],
+                )
+            })
+            .await
+            .unwrap();
+        assert!(store.load_replay_bundle(&replay).await.is_err());
     }
 
     #[tokio::test]

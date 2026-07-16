@@ -195,3 +195,115 @@ Exact ordered gate:
 - No known correctness concern remains from the seven Important findings.
   Existing clippy warnings outside this wave are non-fatal and documented by
   the gate output.
+
+---
+
+## Second whole-branch re-review fix wave
+
+Date: 2026-07-16
+
+### Replay load ordering
+
+- RED command:
+  `rtk cargo test runtime::outbox_worker::tests::sixty_four_delivered_replays_do_not_preload_before_transmission_permits -- --nocapture`
+- RED result: failed because all 64 full replay bundles loaded before the
+  first four sinks obtained transmission slots.
+- Fix: replay now performs a lightweight actor-scoped
+  `ReplayBundleRef` lookup, acquires the shared transmission permit, reserves
+  memory, and only then loads the exact delivered bundle transactionally.
+  Sixty-four waiting replays retain only lightweight IDs/metadata.
+- GREEN result: 1 passed. Full replay load count remained bounded by the
+  active transmission/memory reservations and never approached 64.
+
+### Explicit 64 MiB canonical-memory authority
+
+- RED command:
+  `rtk cargo test runtime::outbox_worker::tests::max_bundles_never_reserve_more_than_sixty_four_mibibytes -- --nocapture`
+- RED result: compile failure because no explicit memory-budget accounting or
+  peak reservation API existed.
+- Fix: `OutboxWorker` owns a shared weighted 64 MiB semaphore. Each possible
+  max bundle conservatively reserves 32 MiB before its full claimed/replay
+  load, covering the overlap between the typed `ResultBundle` and canonical
+  `PreparedBundle`. Claim leases continue renewing while waiting for memory.
+  The typed bundle is explicitly dropped immediately after preparation; only
+  claim/request/retry metadata and the shared prepared payload remain.
+  Bundle-state polling no longer performs full payload loads.
+- GREEN result: 1 passed. Mixed claimed and replay max bundles reached an
+  observed peak of exactly 64 MiB, with at most two full loads before release.
+
+### Independent immutable fan-out
+
+- RED command:
+  `rtk cargo test runtime::outbox_worker::tests::fast_recipient_reaches_final_end_without_waiting_for_slow_recipient -- --nocapture`
+- RED result: failed because frame-by-frame `join_all` prevented the fast sink
+  from advancing past the slow sink's first frame.
+- Fix: every fixed-snapshot recipient now owns an independent lazy frame
+  iteration/task over one shared `Arc<PreparedBundle>`. Canonical payload bytes
+  are shared and no recipient deep-copies a full payload or frame vector.
+- GREEN commands:
+  - fast-recipient command above;
+  - `rtk cargo test runtime::outbox_worker::tests::first_ack_does_not_truncate_another_snapshotted_send -- --nocapture`
+- GREEN result: the fast recipient reached `FinalEnd` before the slow
+  recipient's 45-second deadline, while the already-started slow send still
+  completed after the first ACK.
+
+### Second-wave Minors
+
+- RED command:
+  `rtk cargo test interfaces::cli::tests::definitive_missing_request_does_not_print_resume_recovery -- --nocapture`
+- RED result: definitive `missing_request` printed a misleading resume command.
+- Fix: definitive request rejections (`missing_request`, actor unavailable,
+  request conflict, and other non-retryable request errors) no longer print
+  resume recovery. Transport/EOF/ACK/shutdown ambiguity still prints recovery;
+  `server_busy` remains explicitly recoverable.
+- Replay full-load transactions now revalidate reciprocal request ownership,
+  configured actor ownership, delivered state, and every joined
+  `outbox.actor_id`. A corruption test proves foreign outbox ownership rejects
+  replay.
+- Removed the obsolete `TelegramConfig` token surface. `AppConfig` now rejects
+  unknown legacy `telegram:` configuration while all current API, attachment,
+  and runtime configuration remains valid.
+
+### Second-wave verification
+
+Focused:
+
+- `rtk cargo test runtime::outbox_worker::tests` — 21 passed.
+- `rtk cargo test runtime::ipc::protocol::tests` — 21 passed.
+- `rtk cargo test runtime::sqlite::bundles::tests` — 18 passed.
+- `rtk cargo test runtime::ipc::server::tests` — 31 passed.
+- `rtk cargo test runtime::ipc::client::tests` — 6 passed.
+- `rtk cargo test interfaces::local_renderer::tests` — 18 passed.
+- `rtk cargo test interfaces::cli::tests` — 9 passed.
+- `rtk cargo test app::tests` — 12 passed.
+- `rtk cargo test config::tests` — 7 passed.
+
+Full and acceptance:
+
+- `rtk cargo test` — 458 passed, 1 ignored.
+- `rtk cargo test --test serve_runtime -- --nocapture --test-threads=1` —
+  17 passed.
+- `rtk cargo test --test install_script -- --nocapture --test-threads=1` —
+  17 passed.
+
+Second-wave exact ordered gate:
+
+1. `rtk cargo fmt --check` — passed.
+2. `rtk cargo test` — 458 passed, 1 ignored.
+3. `rtk cargo check` — passed with the existing unused future
+   external-gateway identity-resolver warning.
+4. `rtk cargo clippy --all-targets --all-features` — 0 errors; 46 existing
+   non-denied warnings.
+5. `rtk git diff --check` — passed.
+
+Second-wave decisions:
+
+- The four-transmission limit remains, but the weighted memory authority can
+  reduce concurrent max-sized bundles below four to preserve the hard 64 MiB
+  decoded/canonical ceiling.
+- Lightweight replay resolution may run for many waiting clients; no full
+  payload load or preparation occurs before both transmission and memory
+  authority are held.
+- Recipient independence applies only to socket progress. Durable first-ACK
+  semantics remain unchanged and never cancel a send already started from the
+  fixed snapshot.
