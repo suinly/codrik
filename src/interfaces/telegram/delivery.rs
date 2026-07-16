@@ -8,8 +8,8 @@ use tokio::sync::watch;
 
 use crate::{
     interfaces::telegram::api::{
-        SendFile, SendMessage, TelegramApi, TelegramApiError, TelegramApiErrorClass,
-        TelegramMessageRef,
+        InputRichMessage, SendFile, SendMessage, SendRichMessage, TelegramApi, TelegramApiError,
+        TelegramApiErrorClass, TelegramMessageRef,
     },
     runtime::{
         gateway::{ClaimedGatewayDelivery, GatewayDeliveryState},
@@ -246,15 +246,7 @@ where
         delivery: &ClaimedGatewayDelivery,
     ) -> std::result::Result<TelegramMessageRef, DeliveryError> {
         match &delivery.payload {
-            OutboxPayload::Text { text } => self
-                .api
-                .send_message(SendMessage {
-                    chat_id: delivery.route.address.clone(),
-                    text: text.clone(),
-                    reply_parameters: None,
-                })
-                .await
-                .map_err(DeliveryError::Api),
+            OutboxPayload::Text { text } => self.send_text(delivery, text).await,
             OutboxPayload::File {
                 managed_path,
                 display_name,
@@ -296,6 +288,35 @@ where
             OutboxPayload::TerminalError { .. } => Err(DeliveryError::Terminal(
                 "terminal errors must be projected to text before Telegram delivery",
             )),
+        }
+    }
+
+    async fn send_text(
+        &self,
+        delivery: &ClaimedGatewayDelivery,
+        text: &str,
+    ) -> std::result::Result<TelegramMessageRef, DeliveryError> {
+        match self
+            .api
+            .send_rich_message(SendRichMessage {
+                chat_id: delivery.route.address.clone(),
+                rich_message: InputRichMessage {
+                    markdown: text.to_owned(),
+                },
+            })
+            .await
+        {
+            Ok(message) => Ok(message),
+            Err(error) if error.class() == TelegramApiErrorClass::Terminal => self
+                .api
+                .send_message(SendMessage {
+                    chat_id: delivery.route.address.clone(),
+                    text: text.to_owned(),
+                    reply_parameters: None,
+                })
+                .await
+                .map_err(DeliveryError::Api),
+            Err(error) => Err(DeliveryError::Api(error)),
         }
     }
 }
@@ -384,8 +405,10 @@ mod tests {
             types::TelegramBot,
         },
         runtime::{
-            gateway::{DeliveryRoute, NewGatewayDelivery},
-            model::{ArtifactId, ManualClock, Timestamp},
+            gateway::{
+                ClaimedGatewayDelivery, DeliveryRoute, GatewayDeliveryClaim, NewGatewayDelivery,
+            },
+            model::{ArtifactId, GatewayDeliveryId, ManualClock, Timestamp, WorkItemId},
             sqlite::SqliteRuntimeStore,
             store::{GatewayDeliveryStore, OutboxPayload},
         },
@@ -393,19 +416,30 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingApi {
+        rich_messages: Arc<Mutex<Vec<(String, String)>>>,
         messages: Arc<Mutex<Vec<(String, String)>>>,
         edits: Arc<Mutex<Vec<(i64, String)>>>,
         files: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
-        responses: Arc<Mutex<VecDeque<TelegramApiErrorClass>>>,
+        rich_responses: Arc<Mutex<VecDeque<TelegramApiErrorClass>>>,
+        plain_responses: Arc<Mutex<VecDeque<TelegramApiErrorClass>>>,
         delay: Duration,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
     }
 
     impl RecordingApi {
-        fn with_error(class: TelegramApiErrorClass) -> Self {
+        fn with_rich_error(class: TelegramApiErrorClass) -> Self {
             let api = Self::default();
-            api.responses.lock().unwrap().push_back(class);
+            api.rich_responses.lock().unwrap().push_back(class);
+            api
+        }
+
+        fn with_rich_and_plain_errors(
+            rich: TelegramApiErrorClass,
+            plain: TelegramApiErrorClass,
+        ) -> Self {
+            let api = Self::with_rich_error(rich);
+            api.plain_responses.lock().unwrap().push_back(plain);
             api
         }
 
@@ -416,17 +450,21 @@ mod tests {
             }
         }
 
-        async fn response(&self) -> Result<TelegramMessageRef, TelegramApiError> {
+        async fn response(
+            &self,
+            method: &'static str,
+            responses: &Mutex<VecDeque<TelegramApiErrorClass>>,
+        ) -> Result<TelegramMessageRef, TelegramApiError> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
             self.active.fetch_sub(1, Ordering::SeqCst);
-            if let Some(class) = self.responses.lock().unwrap().pop_front() {
+            if let Some(class) = responses.lock().unwrap().pop_front() {
                 Err(TelegramApiError::classified(
                     class,
-                    "sendMessage",
+                    method,
                     "injected failure",
                 ))
             } else {
@@ -457,14 +495,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((command.chat_id, command.text));
-            self.response().await
+            self.response("sendMessage", &self.plain_responses).await
         }
 
         async fn send_rich_message(
             &self,
-            _command: SendRichMessage,
+            command: SendRichMessage,
         ) -> Result<TelegramMessageRef, TelegramApiError> {
-            unreachable!()
+            self.rich_messages
+                .lock()
+                .unwrap()
+                .push((command.chat_id, command.rich_message.markdown));
+            self.response("sendRichMessage", &self.rich_responses).await
         }
 
         async fn send_chat_action(
@@ -490,7 +532,7 @@ mod tests {
             command: SendFile,
         ) -> Result<TelegramMessageRef, TelegramApiError> {
             self.files.lock().unwrap().push(("photo", command.path));
-            self.response().await
+            self.response("sendPhoto", &self.plain_responses).await
         }
 
         async fn send_document(
@@ -498,7 +540,7 @@ mod tests {
             command: SendFile,
         ) -> Result<TelegramMessageRef, TelegramApiError> {
             self.files.lock().unwrap().push(("document", command.path));
-            self.response().await
+            self.response("sendDocument", &self.plain_responses).await
         }
     }
 
@@ -559,6 +601,119 @@ mod tests {
         std::env::temp_dir().join(format!("codrik-telegram-{}", uuid::Uuid::new_v4()))
     }
 
+    fn claimed_text(text: &str) -> Result<ClaimedGatewayDelivery> {
+        Ok(ClaimedGatewayDelivery {
+            claim: GatewayDeliveryClaim {
+                id: GatewayDeliveryId::new(),
+                owner: "worker-1".into(),
+                expires_at: Timestamp(1_000),
+            },
+            intent_key: "final:0".into(),
+            source_outbox_id: None,
+            work_item_id: Some(WorkItemId::new()),
+            ordinal: 0,
+            route: route("100")?,
+            payload: OutboxPayload::Text { text: text.into() },
+            attempt_count: 1,
+            remote_message_id: None,
+        })
+    }
+
+    fn delivery_worker(
+        store: SqliteRuntimeStore,
+        api: RecordingApi,
+    ) -> TelegramDeliveryWorker<SqliteRuntimeStore, RecordingApi, ManualClock> {
+        TelegramDeliveryWorker::new(
+            store,
+            api,
+            ManualClock::new(10),
+            "telegram:900",
+            "worker-1",
+            std::env::temp_dir(),
+        )
+    }
+
+    #[tokio::test]
+    async fn final_markdown_uses_rich_message_without_plain_send() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let api = RecordingApi::default();
+        let worker = delivery_worker(store, api.clone());
+        let delivery = claimed_text("# Heading\n\n| A | B |")?;
+
+        worker
+            .send_payload(&delivery)
+            .await
+            .expect("rich send succeeds");
+
+        assert_eq!(
+            *api.rich_messages.lock().unwrap(),
+            vec![("100".into(), "# Heading\n\n| A | B |".into())]
+        );
+        assert!(api.messages.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_rich_rejection_falls_back_to_plain_text_once() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let api = RecordingApi::with_rich_error(TelegramApiErrorClass::Terminal);
+        let worker = delivery_worker(store, api.clone());
+        let delivery = claimed_text("broken **markdown")?;
+
+        worker
+            .send_payload(&delivery)
+            .await
+            .expect("plain fallback succeeds");
+
+        assert_eq!(api.rich_messages.lock().unwrap().len(), 1);
+        assert_eq!(
+            *api.messages.lock().unwrap(),
+            vec![("100".into(), "broken **markdown".into())]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncertain_rich_failures_never_fall_back() -> Result<()> {
+        for class in [
+            TelegramApiErrorClass::Retryable { retry_after: None },
+            TelegramApiErrorClass::OutcomeUnknown,
+        ] {
+            let store = SqliteRuntimeStore::open_in_memory().await?;
+            let api = RecordingApi::with_rich_error(class);
+            let worker = delivery_worker(store, api.clone());
+            let delivery = claimed_text("**markdown**")?;
+
+            let error = worker.send_payload(&delivery).await.unwrap_err();
+
+            assert!(matches!(error, super::DeliveryError::Api(_)));
+            assert!(api.messages.lock().unwrap().is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plain_fallback_error_controls_delivery_result() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let api = RecordingApi::with_rich_and_plain_errors(
+            TelegramApiErrorClass::Terminal,
+            TelegramApiErrorClass::OutcomeUnknown,
+        );
+        let worker = delivery_worker(store, api.clone());
+        let delivery = claimed_text("broken **markdown")?;
+
+        let error = worker.send_payload(&delivery).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::DeliveryError::Api(ref error)
+                if error.class() == TelegramApiErrorClass::OutcomeUnknown
+        ));
+        assert_eq!(api.rich_messages.lock().unwrap().len(), 1);
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn text_delivery_completes_and_is_not_sent_again() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
@@ -589,9 +744,10 @@ mod tests {
         assert_eq!(worker.run_once().await?, 1);
         assert_eq!(worker.run_once().await?, 0);
         assert_eq!(
-            *api.messages.lock().unwrap(),
+            *api.rich_messages.lock().unwrap(),
             vec![("100".into(), "hello".into())]
         );
+        assert!(api.messages.lock().unwrap().is_empty());
         Ok(())
     }
 
@@ -599,7 +755,7 @@ mod tests {
     async fn telegram_retry_after_is_scheduled_exactly() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         enqueue_text(&store, "retry:1").await?;
-        let api = RecordingApi::with_error(TelegramApiErrorClass::Retryable {
+        let api = RecordingApi::with_rich_error(TelegramApiErrorClass::Retryable {
             retry_after: Some(Duration::from_secs(5)),
         });
         let clock = ManualClock::new(10);
@@ -617,7 +773,8 @@ mod tests {
         assert_eq!(worker.run_once().await?, 0);
         clock.advance(1);
         assert_eq!(worker.run_once().await?, 1);
-        assert_eq!(api.messages.lock().unwrap().len(), 2);
+        assert_eq!(api.rich_messages.lock().unwrap().len(), 2);
+        assert!(api.messages.lock().unwrap().is_empty());
         Ok(())
     }
 
@@ -629,7 +786,16 @@ mod tests {
         ] {
             let store = SqliteRuntimeStore::open_in_memory().await?;
             enqueue_text(&store, key).await?;
-            let api = RecordingApi::with_error(class);
+            let api = match class {
+                TelegramApiErrorClass::Terminal => RecordingApi::with_rich_and_plain_errors(
+                    TelegramApiErrorClass::Terminal,
+                    TelegramApiErrorClass::Terminal,
+                ),
+                TelegramApiErrorClass::OutcomeUnknown => {
+                    RecordingApi::with_rich_error(TelegramApiErrorClass::OutcomeUnknown)
+                }
+                TelegramApiErrorClass::Retryable { .. } => unreachable!(),
+            };
             let clock = ManualClock::new(10);
             let worker = TelegramDeliveryWorker::new(
                 store,
@@ -643,7 +809,7 @@ mod tests {
             assert_eq!(worker.run_once().await?, 1);
             clock.advance(60_000);
             assert_eq!(worker.run_once().await?, 0);
-            assert_eq!(api.messages.lock().unwrap().len(), 1);
+            assert_eq!(api.rich_messages.lock().unwrap().len(), 1);
         }
         Ok(())
     }
@@ -820,6 +986,7 @@ mod tests {
         let (_sender, receiver) = tokio::sync::watch::channel(true);
 
         worker.run(receiver).await?;
+        assert!(api.rich_messages.lock().unwrap().is_empty());
         assert!(api.messages.lock().unwrap().is_empty());
         Ok(())
     }
@@ -861,9 +1028,10 @@ mod tests {
         assert_eq!(sent.message_id, 77);
         assert!(api.edits.lock().unwrap().is_empty());
         assert_eq!(
-            *api.messages.lock().unwrap(),
+            *api.rich_messages.lock().unwrap(),
             vec![("100".into(), "final".into())]
         );
+        assert!(api.messages.lock().unwrap().is_empty());
 
         delivery.ordinal = 1;
         delivery.payload = OutboxPayload::Text {
@@ -875,12 +1043,13 @@ mod tests {
             .expect("later chunk send succeeds");
         assert_eq!(sent.message_id, 77);
         assert_eq!(
-            *api.messages.lock().unwrap(),
+            *api.rich_messages.lock().unwrap(),
             vec![
                 ("100".into(), "final".into()),
                 ("100".into(), "continued".into())
             ]
         );
+        assert!(api.messages.lock().unwrap().is_empty());
         Ok(())
     }
 }
