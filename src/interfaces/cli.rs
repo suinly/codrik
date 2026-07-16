@@ -3,7 +3,6 @@ use std::{env, future::Future, io::Write, path::PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    auth::AuthorizationStore,
     config::{AppConfig, codrik_dir},
     interfaces::{
         local_renderer::{LocalRenderer, RenderAction},
@@ -12,7 +11,7 @@ use crate::{
     runtime::{
         RequestId,
         ipc::client::{ClientEventStream, LocalIpcClient},
-        model::{Clock, SystemClock},
+        model::{ActorId, Clock, SystemClock},
     },
     updater,
 };
@@ -24,31 +23,9 @@ pub async fn run() -> Result<()> {
         CliCommand::Submit(prompt) => submit(prompt).await,
         CliCommand::Resume(request) => resume(request).await,
         CliCommand::Cancel(request) => cancel(request).await,
-        CliCommand::InstallerValidate { config, users } => {
+        CliCommand::InstallerValidateConfig { config } => {
             let config = AppConfig::load(config)?;
-            let actor = config.required_runtime()?.actor_id.trim();
-            if !AuthorizationStore::new(users)
-                .actor_is_enabled(actor)
-                .await?
-            {
-                bail!("configured runtime actor is absent or disabled in users.json")
-            }
-            println!("{actor}");
-            Ok(())
-        }
-        CliCommand::InstallerHasActors { users } => {
-            if !AuthorizationStore::new(users).has_actors().await? {
-                bail!("users.json contains no actors")
-            }
-            Ok(())
-        }
-        CliCommand::InstallerValidateActor { users, actor } => {
-            if !AuthorizationStore::new(users)
-                .actor_is_enabled(&actor)
-                .await?
-            {
-                bail!("authorization actor is absent or disabled")
-            }
+            let actor = ActorId::parse_workspace_safe(&config.required_runtime()?.actor_id)?;
             println!("{actor}");
             Ok(())
         }
@@ -244,9 +221,7 @@ enum CliCommand {
     Resume(RequestId),
     Cancel(RequestId),
     Submit(String),
-    InstallerValidate { config: PathBuf, users: PathBuf },
-    InstallerHasActors { users: PathBuf },
-    InstallerValidateActor { users: PathBuf, actor: String },
+    InstallerValidateConfig { config: PathBuf },
 }
 
 impl CliCommand {
@@ -265,22 +240,15 @@ impl CliCommand {
                 let request_id = args.next().context("missing request id")?;
                 Self::Cancel(RequestId::parse(&request_id)?)
             }
-            "__installer_validate" => {
+            "__installer_validate_config" => {
                 let config = PathBuf::from(args.next().context("missing config path")?);
-                let users = PathBuf::from(args.next().context("missing users path")?);
-                Self::InstallerValidate { config, users }
-            }
-            "__installer_has_actors" => {
-                let users = PathBuf::from(args.next().context("missing users path")?);
-                Self::InstallerHasActors { users }
-            }
-            "__installer_validate_actor" => {
-                let users = PathBuf::from(args.next().context("missing users path")?);
-                let actor = args.next().context("missing actor id")?;
-                Self::InstallerValidateActor { users, actor }
+                Self::InstallerValidateConfig { config }
             }
             "gateway" | "--session" | "--stream" => {
                 bail!("legacy local command is unsupported; use serve, resume, or cancel")
+            }
+            _ if command.starts_with("__installer_") => {
+                bail!("unknown internal command: {command}")
             }
             _ if command.starts_with('-') => bail!("unknown option: {command}"),
             _ => Self::Submit(command),
@@ -331,7 +299,16 @@ mod tests {
             parse(&["cancel", UUID])?,
             CliCommand::Cancel(RequestId::parse(UUID)?)
         );
+        assert_eq!(
+            parse(&["__installer_validate_config", "/tmp/config.yml"])?,
+            CliCommand::InstallerValidateConfig {
+                config: PathBuf::from("/tmp/config.yml"),
+            }
+        );
         assert_eq!(parse(&["hello"])?, CliCommand::Submit("hello".into()));
+        for removed in ["validate", "has_actors", "validate_actor"] {
+            assert!(CliCommand::parse([format!("__installer_{removed}")]).is_err());
+        }
         assert!(parse(&["gateway", "telegram"]).is_err());
         assert!(parse(&["--session", "x", "hello"]).is_err());
         assert!(parse(&["--stream", "hello"]).is_err());

@@ -20,6 +20,7 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuntimeConfig {
+    #[serde(deserialize_with = "deserialize_strict_string")]
     pub actor_id: String,
     #[serde(default)]
     pub database_path: Option<PathBuf>,
@@ -38,6 +39,37 @@ pub struct RuntimePaths {
     pub lock: PathBuf,
     pub artifacts: PathBuf,
     pub client_requests: PathBuf,
+}
+
+fn deserialize_strict_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StrictStringVisitor;
+
+    impl serde::de::Visitor<'_> for StrictStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_any(StrictStringVisitor)
 }
 
 impl RuntimeConfig {
@@ -247,6 +279,19 @@ mod tests {
 
         assert!(config.required_runtime().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn runtime_config_rejects_non_string_actor_id() {
+        for actor_id in ["true", "7", "null"] {
+            let yaml = format!(
+                "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: {actor_id}\n"
+            );
+            assert!(
+                yaml_serde::from_str::<AppConfig>(&yaml).is_err(),
+                "accepted actor_id: {actor_id}"
+            );
+        }
     }
 
     #[test]

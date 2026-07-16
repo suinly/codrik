@@ -366,13 +366,6 @@ install_serve_service() {
   esac
 }
 
-authorization_has_actors() {
-  users_file="$1"
-  validator="$(installer_validator_binary)"
-  [ -n "$validator" ] && [ -x "$validator" ] || return 1
-  "$validator" __installer_has_actors "$users_file" >/dev/null 2>&1
-}
-
 installer_validator_binary() {
   if [ -n "${CODRIK_VALIDATOR_BIN:-}" ]; then
     printf '%s\n' "$CODRIK_VALIDATOR_BIN"
@@ -383,67 +376,9 @@ installer_validator_binary() {
 
 installer_validate_config() {
   config_file="$1"
-  users_file="$2"
   validator="$(installer_validator_binary)"
   [ -n "$validator" ] && [ -x "$validator" ] || return 1
-  "$validator" __installer_validate "$config_file" "$users_file"
-}
-
-installer_validate_actor() {
-  users_file="$1"
-  actor_id="$2"
-  validator="$(installer_validator_binary)"
-  [ -n "$validator" ] && [ -x "$validator" ] || return 1
-  "$validator" __installer_validate_actor "$users_file" "$actor_id"
-}
-
-bootstrap_or_select_actor() {
-  runtime_dir="$1"
-  allow_owner_bootstrap="${2:-0}"
-  users_file="$runtime_dir/users.json"
-
-  mkdir -p "$runtime_dir"
-  chmod 700 "$runtime_dir"
-  if authorization_has_actors "$users_file"; then
-    echo "Existing users.json is user-owned and will not be modified: $users_file" >&2
-    actor_id=""
-    while [ -z "$actor_id" ]; do
-      actor_id="$(ask "Existing authorization actor ID" "")"
-      if [ -z "$actor_id" ]; then
-        echo "An explicit actor ID is required." >&2
-      elif ! installer_validate_actor "$users_file" "$actor_id" >/dev/null 2>&1; then
-        echo "Actor ID is absent or disabled in users.json." >&2
-        actor_id=""
-      fi
-    done
-    printf '%s\n' "$actor_id"
-    return
-  fi
-
-  if [ "$allow_owner_bootstrap" != "1" ]; then
-    cat >&2 <<'GUIDANCE'
-Existing installation has no usable authorization actors. Codrik did not grant tools: ["*"] during upgrade.
-Create or restore users.json with an explicit actor, then configure runtime.actor_id. Codrik service was not started.
-GUIDANCE
-    return 1
-  fi
-
-  umask 077
-  cat >"$users_file" <<'USERS'
-{
-  "version": 1,
-  "actors": {
-    "actor:local:owner": {
-      "enabled": true,
-      "display_name": null,
-      "identities": [],
-      "tools": ["*"]
-    }
-  }
-}
-USERS
-  chmod 600 "$users_file"
-  printf '%s\n' "actor:local:owner"
+  "$validator" __installer_validate_config "$config_file"
 }
 
 capture_install_state() {
@@ -484,7 +419,6 @@ YAML
 
 configure_codrik() {
   config_dir="$1"
-  runtime_dir="$2"
   config_file="$config_dir/config.yml"
   legacy_config_file="$config_dir/codrik.config.yml"
   CONFIGURED_CONFIG_FILE="$config_file"
@@ -509,11 +443,11 @@ configure_codrik() {
 
   if [ -f "$config_file" ] && ! ask_yes_no "$config_file already exists. Overwrite it?" "n"; then
     echo "Keeping existing config: $config_file"
-    if actor_id="$(installer_validate_config "$config_file" "$runtime_dir/users.json" 2>/dev/null)"; then
+    if actor_id="$(installer_validate_config "$config_file" 2>/dev/null)"; then
       CONFIGURED_RUNTIME_READY=1
     else
       print_missing_runtime_actor
-      echo "Config or authorization failed production validation; fix both files before starting Codrik." >&2
+      echo "Config failed production validation; fix it before starting Codrik." >&2
     fi
     return
   fi
@@ -528,9 +462,7 @@ configure_codrik() {
 
   base_url="$(ask "OpenAI-compatible base URL" "$DEFAULT_BASE_URL")"
   model="$(ask "Model" "$DEFAULT_MODEL")"
-  if ! actor_id="$(bootstrap_or_select_actor "$runtime_dir" "$CLEAN_INTERACTIVE_INSTALL")"; then
-    return
-  fi
+  actor_id="actor:local:owner"
 
   mkdir -p "$config_dir"
   write_config "$config_file" "$api_key" "$base_url" "$model" "$actor_id"
@@ -609,7 +541,7 @@ INSTALLER_BINARY="$install_dir/$BIN_NAME"
 echo "Installed $BIN_NAME $tag to $install_dir/$BIN_NAME"
 
 if [ "${CODRIK_SKIP_CONFIG:-0}" != "1" ]; then
-  configure_codrik "$config_dir" "$runtime_dir"
+  configure_codrik "$config_dir"
 fi
 
 maybe_install_serve_service "$install_dir/$BIN_NAME"
