@@ -3,13 +3,16 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Result, bail};
 use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
 use crate::{
-    interfaces::telegram::api::{
-        EditMessageText, ReplyParameters, SendFile, SendMessage, TelegramApi, TelegramApiError,
-        TelegramApiErrorClass, TelegramMessageRef,
+    interfaces::telegram::{
+        api::{
+            EditMessageText, ReplyParameters, SendFile, SendMessage, TelegramApi, TelegramApiError,
+            TelegramApiErrorClass, TelegramMessageRef,
+        },
+        streaming::lock_gateway_stream,
     },
     runtime::{
         gateway::{ClaimedGatewayDelivery, GatewayDeliveryState},
@@ -30,6 +33,7 @@ const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
 enum DeliveryError {
     Api(TelegramApiError),
     Terminal(&'static str),
+    StreamEditTerminal,
 }
 
 struct DeliverySuccess {
@@ -128,11 +132,18 @@ where
             return Ok(());
         };
 
+        let _stream_guard = if delivery.ordinal == 0
+            && let Some(work_item) = &delivery.work_item_id
+        {
+            Some(lock_gateway_stream(work_item, &delivery.route).await)
+        } else {
+            None
+        };
         let stream_message_id = if delivery.ordinal == 0 {
             match &delivery.work_item_id {
                 Some(work_item) => self
                     .store
-                    .resolve_gateway_stream(work_item, &delivery.route)
+                    .claim_gateway_stream_for_final(work_item, &delivery.route, self.clock.now())
                     .await?
                     .and_then(|value| value.parse::<i64>().ok()),
                 None => None,
@@ -140,9 +151,27 @@ where
         } else {
             None
         };
-        let (claim, result) = self
+        if stream_message_id.is_some()
+            && !self
+                .store
+                .set_gateway_delivery_retry_safe(&claim, true, self.clock.now())
+                .await?
+        {
+            bail!("Telegram delivery claim was lost before retry-safe edit");
+        }
+        let (mut claim, mut result) = self
             .send_with_renewals(claim, &delivery, stream_message_id)
             .await?;
+        if matches!(result, Err(DeliveryError::StreamEditTerminal)) {
+            if !self
+                .store
+                .set_gateway_delivery_retry_safe(&claim, false, self.clock.now())
+                .await?
+            {
+                bail!("Telegram delivery claim was lost before send fallback");
+            }
+            (claim, result) = self.send_with_renewals(claim, &delivery, None).await?;
+        }
         let transition_time = self.clock.now();
         match result {
             Ok(success) => {
@@ -180,6 +209,7 @@ where
                     bail!("Telegram delivery claim was lost before terminal transition");
                 }
             }
+            Err(DeliveryError::StreamEditTerminal) => unreachable!("fallback handled above"),
             Err(DeliveryError::Api(error)) => match error.class() {
                 TelegramApiErrorClass::Retryable { retry_after } => {
                     if !self
@@ -276,7 +306,7 @@ where
         match &delivery.payload {
             OutboxPayload::Text { text } => {
                 if let Some(message_id) = stream_message_id {
-                    return self
+                    match self
                         .api
                         .edit_message_text(EditMessageText {
                             chat_id: delivery.route.address.clone(),
@@ -287,8 +317,13 @@ where
                         .map(|()| DeliverySuccess {
                             message: TelegramMessageRef { message_id },
                             edited_stream: true,
-                        })
-                        .map_err(DeliveryError::Api);
+                        }) {
+                        Ok(success) => return Ok(success),
+                        Err(error) if !matches!(error.class(), TelegramApiErrorClass::Terminal) => {
+                            return Err(DeliveryError::Api(error));
+                        }
+                        Err(_) => return Err(DeliveryError::StreamEditTerminal),
+                    }
                 }
                 let reply_parameters = delivery
                     .route
@@ -327,7 +362,7 @@ where
                         "managed artifact exceeds Telegram size limit",
                     ));
                 }
-                validate_managed_file(&self.artifact_root, managed_path, *size, sha256)
+                let file = validate_managed_file(&self.artifact_root, managed_path, *size, sha256)
                     .await
                     .map_err(|_| {
                         DeliveryError::Terminal("managed artifact integrity check failed")
@@ -335,6 +370,8 @@ where
                 let command = SendFile {
                     chat_id: delivery.route.address.clone(),
                     path: managed_path.clone(),
+                    file,
+                    length: *size,
                     display_name: display_name.clone(),
                     caption: caption.clone(),
                 };
@@ -386,7 +423,7 @@ async fn validate_managed_file(
     path: &std::path::Path,
     expected_size: u64,
     expected_sha256: &str,
-) -> Result<()> {
+) -> Result<tokio::fs::File> {
     let metadata = tokio::fs::symlink_metadata(path).await?;
     if !metadata.file_type().is_file() || metadata.len() != expected_size {
         bail!("managed artifact metadata mismatch");
@@ -409,7 +446,8 @@ async fn validate_managed_file(
     if format!("{:x}", hasher.finalize()) != expected_sha256.to_ascii_lowercase() {
         bail!("managed artifact SHA-256 mismatch");
     }
-    Ok(())
+    file.rewind().await?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -419,7 +457,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -427,8 +465,9 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
 
-    use super::{TelegramDeliveryWorker, retry_at};
+    use super::{TelegramDeliveryWorker, retry_at, validate_managed_file};
     use crate::{
         interfaces::telegram::{
             api::{
@@ -454,6 +493,7 @@ mod tests {
         delay: Duration,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+        terminal_edit: Arc<AtomicBool>,
     }
 
     impl RecordingApi {
@@ -518,6 +558,13 @@ mod tests {
             &self,
             command: EditMessageText,
         ) -> Result<(), TelegramApiError> {
+            if self.terminal_edit.load(Ordering::SeqCst) {
+                return Err(TelegramApiError::classified(
+                    TelegramApiErrorClass::Terminal,
+                    "editMessageText",
+                    "message not found",
+                ));
+            }
             self.edits
                 .lock()
                 .unwrap()
@@ -766,6 +813,31 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn validated_file_handle_is_pinned_across_path_replacement() -> Result<()> {
+        let root = temp_artifact_root();
+        tokio::fs::create_dir_all(&root).await?;
+        let path = root.join("result.txt");
+        tokio::fs::write(&path, b"validated").await?;
+        let mut file = validate_managed_file(
+            &root,
+            &path,
+            9,
+            &format!("{:x}", Sha256::digest(b"validated")),
+        )
+        .await?;
+
+        let replacement = root.join("replacement.txt");
+        tokio::fs::write(&replacement, b"replaced!").await?;
+        tokio::fs::rename(&replacement, &path).await?;
+        let mut uploaded = Vec::new();
+        file.read_to_end(&mut uploaded).await?;
+
+        assert_eq!(uploaded, b"validated");
+        tokio::fs::remove_dir_all(root).await?;
+        Ok(())
+    }
+
     #[test]
     fn exponential_retry_is_deterministic_and_capped() {
         let first = retry_at(Timestamp(100), 1, None, "delivery-1");
@@ -889,6 +961,53 @@ mod tests {
         assert_eq!(
             *api.messages.lock().unwrap(),
             vec![("100".into(), "continued".into())]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_edit_failure_falls_back_to_durable_send() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let api = RecordingApi::default();
+        api.terminal_edit.store(true, Ordering::SeqCst);
+        let worker = TelegramDeliveryWorker::new(
+            store,
+            api.clone(),
+            ManualClock::new(10),
+            "telegram:900",
+            "worker-1",
+            std::env::temp_dir(),
+        );
+        let delivery = crate::runtime::gateway::ClaimedGatewayDelivery {
+            claim: crate::runtime::gateway::GatewayDeliveryClaim {
+                id: crate::runtime::model::GatewayDeliveryId::new(),
+                owner: "worker-1".into(),
+                expires_at: Timestamp(1_000),
+            },
+            intent_key: "final:fallback".into(),
+            source_outbox_id: None,
+            work_item_id: Some(crate::runtime::model::WorkItemId::new()),
+            ordinal: 0,
+            route: route("100")?,
+            payload: OutboxPayload::Text {
+                text: "durable fallback".into(),
+            },
+            attempt_count: 1,
+            remote_message_id: None,
+        };
+
+        assert!(matches!(
+            worker.send_payload(&delivery, Some(77)).await,
+            Err(super::DeliveryError::StreamEditTerminal)
+        ));
+        let sent = worker
+            .send_payload(&delivery, None)
+            .await
+            .expect("terminal edit failure falls back to send");
+        assert!(!sent.edited_stream);
+        assert_eq!(
+            *api.messages.lock().unwrap(),
+            vec![("100".into(), "durable fallback".into())]
         );
         Ok(())
     }

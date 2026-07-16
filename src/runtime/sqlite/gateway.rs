@@ -106,7 +106,15 @@ impl GatewayDeliveryStore for SqliteRuntimeStore {
                 )?;
                 transaction.execute(
                     "UPDATE gateway_deliveries
-                     SET state = 'outcome_unknown', claim_owner = NULL,
+                     SET state = CASE
+                            WHEN transport_retry_safe = 1 THEN 'failed_retryable'
+                            ELSE 'outcome_unknown'
+                         END,
+                         next_attempt_at = CASE
+                            WHEN transport_retry_safe = 1 THEN ?1
+                            ELSE next_attempt_at
+                         END,
+                         claim_owner = NULL,
                          claim_expires_at = NULL, error_class = 'expired_claim',
                          last_error = 'delivery claim expired with unknown transport outcome',
                          updated_at = ?1
@@ -121,13 +129,32 @@ impl GatewayDeliveryStore for SqliteRuntimeStore {
                          WHERE candidate.gateway = ?1
                            AND candidate.state IN ('pending','failed_retryable')
                            AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at <= ?2)
-                           AND candidate.id = (
-                               SELECT first.id FROM gateway_deliveries first
-                               WHERE first.gateway = candidate.gateway
-                                 AND first.address = candidate.address
-                                 AND first.state IN ('pending','failed_retryable')
-                                 AND (first.next_attempt_at IS NULL OR first.next_attempt_at <= ?2)
-                               ORDER BY first.created_at, first.id LIMIT 1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM gateway_deliveries earlier
+                               WHERE earlier.gateway = candidate.gateway
+                                 AND earlier.address = candidate.address
+                                 AND earlier.state IN ('pending','failed_retryable')
+                                 AND (
+                                     earlier.created_at < candidate.created_at
+                                     OR (
+                                         earlier.created_at = candidate.created_at
+                                         AND earlier.id < candidate.id
+                                     )
+                                 )
+                                 AND NOT EXISTS (
+                                     SELECT 1 FROM gateway_deliveries blocked_by
+                                     WHERE earlier.source_outbox_id IS NOT NULL
+                                       AND blocked_by.source_outbox_id = earlier.source_outbox_id
+                                       AND blocked_by.ordinal < earlier.ordinal
+                                       AND blocked_by.state IN ('failed_terminal','outcome_unknown')
+                                 )
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM gateway_deliveries predecessor
+                               WHERE candidate.source_outbox_id IS NOT NULL
+                                 AND predecessor.source_outbox_id = candidate.source_outbox_id
+                                 AND predecessor.ordinal < candidate.ordinal
+                                 AND predecessor.state != 'delivered'
                            )
                            AND NOT EXISTS (
                                SELECT 1 FROM gateway_deliveries active
@@ -219,6 +246,34 @@ impl GatewayDeliveryStore for SqliteRuntimeStore {
         .await
     }
 
+    async fn set_gateway_delivery_retry_safe(
+        &self,
+        claim: &GatewayDeliveryClaim,
+        retry_safe: bool,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let claim = claim.clone();
+        self.connection
+            .call(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE gateway_deliveries
+                     SET transport_retry_safe = ?4, updated_at = ?5
+                     WHERE id = ?1 AND state = 'delivering'
+                       AND claim_owner = ?2 AND claim_expires_at = ?3",
+                    params![
+                        claim.id.as_str(),
+                        claim.owner,
+                        claim.expires_at.0,
+                        retry_safe as i64,
+                        now.0
+                    ],
+                )?;
+                Ok(changed == 1)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
     async fn fail_gateway_delivery(
         &self,
         claim: &GatewayDeliveryClaim,
@@ -299,7 +354,8 @@ impl GatewayStreamStore for SqliteRuntimeStore {
                 connection
                     .query_row(
                         "SELECT remote_message_id FROM gateway_streams
-                         WHERE work_item_id = ?1 AND gateway = ?2 AND address = ?3",
+                         WHERE work_item_id = ?1 AND gateway = ?2 AND address = ?3
+                           AND state = 'active'",
                         params![work_item.as_str(), route.gateway, route.address],
                         |row| row.get::<_, String>(0),
                     )
@@ -322,10 +378,38 @@ impl GatewayStreamStore for SqliteRuntimeStore {
             .call(move |connection| {
                 connection.execute(
                     "UPDATE gateway_streams SET state = 'closed', updated_at = ?4
-                     WHERE work_item_id = ?1 AND gateway = ?2 AND address = ?3",
+                     WHERE work_item_id = ?1 AND gateway = ?2 AND address = ?3
+                       AND state = 'active'",
                     params![work_item.as_str(), route.gateway, route.address, now.0],
                 )?;
                 Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn claim_gateway_stream_for_final(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+        now: Timestamp,
+    ) -> Result<Option<String>> {
+        let work_item = work_item.clone();
+        let route = route.clone();
+        self.connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "UPDATE gateway_streams
+                         SET state = 'finalizing', updated_at = ?4
+                         WHERE work_item_id = ?1 AND gateway = ?2 AND address = ?3
+                           AND state IN ('active', 'closed', 'finalizing')
+                         RETURNING remote_message_id",
+                        params![work_item.as_str(), route.gateway, route.address, now.0],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
             })
             .await
             .map_err(map_call_error)
@@ -411,10 +495,11 @@ async fn transition_claim(
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use tokio_rusqlite::params;
 
     use crate::runtime::{
-        gateway::{DeliveryRoute, NewGatewayDelivery},
-        model::Timestamp,
+        gateway::{DeliveryRoute, GatewayDeliveryState, NewGatewayDelivery},
+        model::{OutboxId, Timestamp},
         sqlite::SqliteRuntimeStore,
         store::{GatewayDeliveryStore, GatewayStreamStore, OutboxPayload},
     };
@@ -427,6 +512,50 @@ mod tests {
             DeliveryRoute::new("telegram:900", address, None, 4096, 1024)?,
             OutboxPayload::Text { text: text.into() },
         )
+    }
+
+    async fn source_outbox(store: &SqliteRuntimeStore, suffix: &str) -> Result<OutboxId> {
+        let work = format!("work-{suffix}");
+        let run = format!("run-{suffix}");
+        let outbox = format!("outbox-{suffix}");
+        let intent = format!("intent-{suffix}");
+        let work_for_insert = work.clone();
+        let run_for_insert = run.clone();
+        let outbox_for_insert = outbox.clone();
+        store
+            .connection
+            .call(move |connection| -> Result<()> {
+                connection.execute(
+                    "INSERT OR IGNORE INTO actors(id, enabled, tools_json, created_at)
+                     VALUES ('actor', 1, '[]', 1)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO work_items(
+                        id, actor_id, kind, audience_kind, state, created_at, updated_at
+                     ) VALUES (?1, 'actor', 'interactive', 'actor_private', 'ready', 1, 1)",
+                    [work_for_insert.as_str()],
+                )?;
+                connection.execute(
+                    "INSERT INTO runs(
+                        id, actor_id, work_item_id, state, lease_generation,
+                        observed_sequence, created_at, updated_at
+                     ) VALUES (?1, 'actor', ?2, 'completed', 1, 1, 1, 1)",
+                    params![run_for_insert, work_for_insert],
+                )?;
+                connection.execute(
+                    "INSERT INTO outbox(
+                        id, intent_key, actor_id, work_item_id, run_id,
+                        intent_class, audience_kind, payload_json, created_at
+                     ) VALUES (?1, ?2, 'actor', ?3, ?4,
+                        'interactive_reply', 'actor_private', '{}', 1)",
+                    params![outbox_for_insert, intent, work, run],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(super::map_call_error)?;
+        Ok(OutboxId::from_string(outbox))
     }
 
     #[tokio::test]
@@ -501,6 +630,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_retry_safe_claim_is_retried() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        store
+            .enqueue_gateway_delivery(delivery("safe-edit", "100", "hello")?, Timestamp(1))
+            .await?;
+        let claimed = store
+            .claim_gateway_deliveries("telegram:900", "worker", Timestamp(2), Timestamp(32), 10)
+            .await?;
+        assert!(
+            store
+                .set_gateway_delivery_retry_safe(&claimed[0].claim, true, Timestamp(3))
+                .await?
+        );
+
+        let retried = store
+            .claim_gateway_deliveries("telegram:900", "worker-2", Timestamp(33), Timestamp(63), 10)
+            .await?;
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].claim.id, claimed[0].claim.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_blocks_later_delivery_for_same_address() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        for key in ["first", "second"] {
+            store
+                .enqueue_gateway_delivery(delivery(key, "100", key)?, Timestamp(1))
+                .await?;
+        }
+        let first = store
+            .claim_gateway_deliveries("telegram:900", "worker", Timestamp(2), Timestamp(32), 10)
+            .await?;
+        assert_eq!(first.len(), 1);
+        store
+            .retry_gateway_delivery(
+                &first[0].claim,
+                Timestamp(100),
+                "retry",
+                "retry",
+                Timestamp(3),
+            )
+            .await?;
+
+        assert!(
+            store
+                .claim_gateway_deliveries(
+                    "telegram:900",
+                    "worker",
+                    Timestamp(4),
+                    Timestamp(34),
+                    10,
+                )
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unresolved_chunk_blocks_only_its_own_response_suffix() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let source = source_outbox(&store, "first").await?;
+        for ordinal in 0..2 {
+            store
+                .enqueue_gateway_delivery(
+                    NewGatewayDelivery::new(
+                        format!("first:{ordinal}"),
+                        Some(source.clone()),
+                        ordinal,
+                        DeliveryRoute::new("telegram:900", "100", None, 4096, 1024)?,
+                        OutboxPayload::Text {
+                            text: format!("first {ordinal}"),
+                        },
+                    )?,
+                    Timestamp(1),
+                )
+                .await?;
+        }
+        let first = store
+            .claim_gateway_deliveries("telegram:900", "worker", Timestamp(2), Timestamp(32), 10)
+            .await?;
+        assert_eq!(first.len(), 1);
+        store
+            .fail_gateway_delivery(
+                &first[0].claim,
+                GatewayDeliveryState::OutcomeUnknown,
+                "unknown",
+                "unknown",
+                Timestamp(3),
+            )
+            .await?;
+        assert!(
+            store
+                .claim_gateway_deliveries(
+                    "telegram:900",
+                    "worker",
+                    Timestamp(4),
+                    Timestamp(34),
+                    10,
+                )
+                .await?
+                .is_empty()
+        );
+
+        let unrelated = source_outbox(&store, "second").await?;
+        store
+            .enqueue_gateway_delivery(
+                NewGatewayDelivery::new(
+                    "second:0",
+                    Some(unrelated),
+                    0,
+                    DeliveryRoute::new("telegram:900", "100", None, 4096, 1024)?,
+                    OutboxPayload::Text {
+                        text: "second".into(),
+                    },
+                )?,
+                Timestamp(10),
+            )
+            .await?;
+        let claimed = store
+            .claim_gateway_deliveries("telegram:900", "worker", Timestamp(11), Timestamp(41), 10)
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].intent_key, "second:0");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn gateway_stream_state_round_trips_and_closes() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         let work_item = crate::runtime::model::WorkItemId::new();
@@ -543,6 +801,18 @@ mod tests {
             .await?;
         assert_eq!(
             store.resolve_gateway_stream(&work_item, &route).await?,
+            None
+        );
+        assert_eq!(
+            store
+                .claim_gateway_stream_for_final(&work_item, &route, Timestamp(3))
+                .await?,
+            Some("77".into())
+        );
+        assert_eq!(
+            store
+                .claim_gateway_stream_for_final(&work_item, &route, Timestamp(4))
+                .await?,
             Some("77".into())
         );
         Ok(())

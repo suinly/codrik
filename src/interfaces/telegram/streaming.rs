@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
 
 use anyhow::Result;
 use tokio::sync::{broadcast, watch};
@@ -17,6 +21,34 @@ use crate::{
 const EDIT_INTERVAL: Duration = Duration::from_secs(1);
 
 type StreamKey = (WorkItemId, String, String);
+type StreamLockMap = HashMap<String, Weak<tokio::sync::Mutex<()>>>;
+
+static STREAM_LOCKS: OnceLock<Mutex<StreamLockMap>> = OnceLock::new();
+
+pub(crate) async fn lock_gateway_stream(
+    work_item: &WorkItemId,
+    route: &DeliveryRoute,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let key = format!(
+        "{}\0{}\0{}",
+        work_item.as_str(),
+        route.gateway,
+        route.address
+    );
+    let lock = {
+        let mut locks = STREAM_LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("Telegram stream locks poisoned");
+        let lock = locks
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    };
+    lock.lock_owned().await
+}
 
 struct StreamState {
     route: DeliveryRoute,
@@ -94,8 +126,9 @@ where
             let Some(mut state) = state else {
                 continue;
             };
+            let _guard = lock_gateway_stream(&key.0, &state.route).await;
             if state.last_edit.elapsed() >= EDIT_INTERVAL {
-                self.edit(&mut state).await;
+                self.edit(&key.0, &mut state).await;
             }
             self.streams
                 .lock()
@@ -113,6 +146,7 @@ where
             activity.route.gateway.clone(),
             activity.route.address.clone(),
         );
+        let _guard = lock_gateway_stream(&activity.work_item_id, &activity.route).await;
         let existing = self
             .streams
             .lock()
@@ -155,11 +189,13 @@ where
         if let GatewayActivityEvent::TextDelta(delta) = activity.event {
             state.buffer.push_str(&delta);
             if state.last_edit.elapsed() >= EDIT_INTERVAL {
-                self.edit(&mut state).await;
+                self.edit(&activity.work_item_id, &mut state).await;
             }
         }
         if terminal {
-            self.edit(&mut state).await;
+            if state.last_edit.elapsed() >= EDIT_INTERVAL {
+                self.edit(&activity.work_item_id, &mut state).await;
+            }
             let _ = self
                 .store
                 .close_gateway_stream(&activity.work_item_id, &activity.route, self.clock.now())
@@ -207,10 +243,18 @@ where
             .await;
     }
 
-    async fn edit(&self, state: &mut StreamState) {
+    async fn edit(&self, work_item: &WorkItemId, state: &mut StreamState) {
         let Some(message_id) = state.remote_message_id else {
             return;
         };
+        if !matches!(
+            self.store
+                .resolve_gateway_stream(work_item, &state.route)
+                .await,
+            Ok(Some(ref stored)) if stored == &message_id.to_string()
+        ) {
+            return;
+        }
         if state.buffer.is_empty() {
             return;
         }
@@ -296,6 +340,15 @@ mod tests {
             *self.closes.lock().unwrap() += 1;
             *self.remote.lock().unwrap() = None;
             Ok(())
+        }
+
+        async fn claim_gateway_stream_for_final(
+            &self,
+            _work_item: &WorkItemId,
+            _route: &DeliveryRoute,
+            _now: Timestamp,
+        ) -> Result<Option<String>> {
+            Ok(self.remote.lock().unwrap().take())
         }
     }
 
@@ -409,6 +462,45 @@ mod tests {
             ))
             .await;
         assert_eq!(*store.closes.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_claim_prevents_late_stream_edit() -> Result<()> {
+        let store = MemoryStreamStore::default();
+        let api = RecordingApi::default();
+        let worker = TelegramStreamingWorker::new(
+            store.clone(),
+            api.clone(),
+            ManualClock::new(10),
+            "telegram:900",
+        );
+        let work_item = WorkItemId::new();
+        let route = DeliveryRoute::new("telegram:900", "100", Some("42".into()), 4096, 1024)?;
+
+        worker
+            .handle(GatewayActivity {
+                work_item_id: work_item.clone(),
+                route: route.clone(),
+                event: GatewayActivityEvent::Activity(AgentActivityEvent::ModelStepStarted),
+            })
+            .await;
+        assert_eq!(
+            store
+                .claim_gateway_stream_for_final(&work_item, &route, Timestamp(11))
+                .await?,
+            Some("77".into())
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        worker
+            .handle(GatewayActivity {
+                work_item_id: work_item,
+                route,
+                event: GatewayActivityEvent::TextDelta("late partial".into()),
+            })
+            .await;
+
+        assert!(api.edits.lock().unwrap().is_empty());
         Ok(())
     }
 }

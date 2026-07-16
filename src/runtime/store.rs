@@ -260,6 +260,13 @@ pub trait GatewayDeliveryStore: Send + Sync {
         claim_until: Timestamp,
     ) -> Result<Option<GatewayDeliveryClaim>>;
 
+    async fn set_gateway_delivery_retry_safe(
+        &self,
+        claim: &GatewayDeliveryClaim,
+        retry_safe: bool,
+        now: Timestamp,
+    ) -> Result<bool>;
+
     async fn complete_gateway_delivery(
         &self,
         claim: &GatewayDeliveryClaim,
@@ -308,6 +315,13 @@ pub trait GatewayStreamStore: Send + Sync {
         route: &DeliveryRoute,
         now: Timestamp,
     ) -> Result<()>;
+
+    async fn claim_gateway_stream_for_final(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+        now: Timestamp,
+    ) -> Result<Option<String>>;
 }
 
 #[derive(Clone, Debug)]

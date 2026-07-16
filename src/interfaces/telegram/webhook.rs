@@ -4,13 +4,18 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::post,
 };
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{Semaphore, watch},
+};
 
 use crate::{
     interfaces::telegram::types::{TelegramInbound, TelegramUpdate},
@@ -27,6 +32,7 @@ use crate::{
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
+const MAX_WEBHOOK_CONCURRENCY: usize = 64;
 
 pub struct SecretToken(Vec<u8>);
 
@@ -210,6 +216,7 @@ where
 struct WebhookState<I> {
     secret: SecretToken,
     ingress: Arc<I>,
+    permits: Arc<Semaphore>,
 }
 
 pub struct TelegramWebhookServer<I> {
@@ -235,7 +242,11 @@ where
         Ok(Self {
             listener,
             path,
-            state: Arc::new(WebhookState { secret, ingress }),
+            state: Arc::new(WebhookState {
+                secret,
+                ingress,
+                permits: Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY)),
+            }),
         })
     }
 
@@ -243,6 +254,10 @@ where
         let router = Router::new()
             .route(&self.path, post(handle_webhook::<I>))
             .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES))
+            .layer(middleware::from_fn_with_state(
+                self.state.clone(),
+                limit_webhook_concurrency::<I>,
+            ))
             .with_state(self.state);
         axum::serve(self.listener, router)
             .with_graceful_shutdown(async move {
@@ -255,6 +270,20 @@ where
             .await?;
         Ok(())
     }
+}
+
+async fn limit_webhook_concurrency<I>(
+    State(state): State<Arc<WebhookState<I>>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response
+where
+    I: TelegramIngress,
+{
+    let Ok(_permit) = state.permits.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    next.run(request).await
 }
 
 async fn handle_webhook<I>(

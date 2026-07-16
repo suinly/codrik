@@ -20,12 +20,13 @@ mod outbox;
 pub mod recovery;
 mod retry;
 
-pub const RUNTIME_SCHEMA_VERSION: u32 = 4;
+pub const RUNTIME_SCHEMA_VERSION: u32 = 5;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");
 const SERVE_MIGRATION: &str = include_str!("migrations/0002_serve.sql");
 const IDENTITY_LINKING_MIGRATION: &str = include_str!("migrations/0003_identity_linking.sql");
 const GATEWAY_MIGRATION: &str = include_str!("migrations/0004_gateway.sql");
+const GATEWAY_FENCING_MIGRATION: &str = include_str!("migrations/0005_gateway_fencing.sql");
 
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
@@ -83,18 +84,25 @@ impl SqliteRuntimeStore {
                         migrate_to_v2(connection)?;
                         migrate_to_v3(connection)?;
                         migrate_to_v4(connection)?;
+                        migrate_to_v5(connection)?;
                     }
                     1 => {
                         migrate_to_v2(connection)?;
                         migrate_to_v3(connection)?;
                         migrate_to_v4(connection)?;
+                        migrate_to_v5(connection)?;
                     }
                     2 => {
                         migrate_to_v3(connection)?;
                         migrate_to_v4(connection)?;
+                        migrate_to_v5(connection)?;
                     }
-                    3 => migrate_to_v4(connection)?,
-                    4 => {}
+                    3 => {
+                        migrate_to_v4(connection)?;
+                        migrate_to_v5(connection)?;
+                    }
+                    4 => migrate_to_v5(connection)?,
+                    5 => {}
                     other => anyhow::bail!("unsupported runtime schema version: {other}"),
                 }
                 connection.execute_batch("PRAGMA busy_timeout = 0;")?;
@@ -262,6 +270,24 @@ fn migrate_to_v4(connection: &mut tokio_rusqlite::rusqlite::Connection) -> Resul
         anyhow::bail!("schema v4 migration left {foreign_key_errors} foreign key violations");
     }
     transaction.execute_batch("PRAGMA user_version = 4;")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_to_v5(connection: &mut tokio_rusqlite::rusqlite::Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(GATEWAY_FENCING_MIGRATION)?;
+    let foreign_key_errors = {
+        let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
+        statement
+            .query([])?
+            .mapped(|row| row.get::<_, String>(0))
+            .count()
+    };
+    if foreign_key_errors != 0 {
+        anyhow::bail!("schema v5 migration left {foreign_key_errors} foreign key violations");
+    }
+    transaction.execute_batch("PRAGMA user_version = 5;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -484,7 +510,7 @@ mod tests {
         let probe = store.v2_probe().await?;
 
         assert!(foreign_keys);
-        assert_eq!(probe.user_version, 4);
+        assert_eq!(probe.user_version, 5);
         assert_eq!(probe.foreign_key_errors, 0);
         assert!(!tables.contains(&"runtime_metadata".to_string()));
         for table in [
@@ -538,7 +564,7 @@ mod tests {
             .await?;
 
         assert!(foreign_keys);
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert!(tables.contains(&"identity_link_codes".to_string()));
         assert!(tables.contains(&"identity_link_attempts".to_string()));
         Ok(())
@@ -586,12 +612,12 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(counts, (1_i64, 1_i64, 4_i64));
+        assert_eq!(counts, (1_i64, 1_i64, 5_i64));
         Ok(())
     }
 
     #[tokio::test]
-    async fn v3_to_v4_adds_gateway_state_without_losing_identity_rows() -> Result<()> {
+    async fn v3_upgrade_adds_gateway_state_without_losing_identity_rows() -> Result<()> {
         let db = TempDb::new("gateway-v4");
         let connection = Connection::open(db.path()).await?;
         connection
@@ -652,7 +678,7 @@ mod tests {
             })
             .await?;
 
-        assert_eq!((probe.0, probe.1, probe.2), (4, 1, 1));
+        assert_eq!((probe.0, probe.1, probe.2), (5, 1, 1));
         for table in ["gateway_commands", "gateway_deliveries", "gateway_streams"] {
             assert!(probe.3.contains(&table.to_string()), "missing {table}");
         }
@@ -682,7 +708,7 @@ mod tests {
         let store = SqliteRuntimeStore::open(db.path()).await?;
         let probe = store.v2_probe().await?;
 
-        assert_eq!(probe.user_version, 4);
+        assert_eq!(probe.user_version, 5);
         assert_eq!(probe.archived_outbox, 7);
         assert_eq!(probe.archived_outbox_states, 7);
         assert_eq!(probe.archived_unmanaged_files, 1);

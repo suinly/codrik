@@ -93,10 +93,11 @@ pub struct ReplyParameters {
     pub message_id: i64,
 }
 
-#[derive(Clone)]
 pub struct SendFile {
     pub chat_id: String,
     pub path: PathBuf,
+    pub file: tokio::fs::File,
+    pub length: u64,
     pub display_name: String,
     pub caption: Option<String>,
 }
@@ -192,9 +193,9 @@ impl ReqwestTelegramApi {
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|_| {
+            .map_err(|error| {
                 api_error(
-                    if retry_safe {
+                    if retry_safe || error.is_connect() {
                         TelegramApiErrorClass::Retryable { retry_after: None }
                     } else {
                         TelegramApiErrorClass::OutcomeUnknown
@@ -203,7 +204,16 @@ impl ReqwestTelegramApi {
                     "HTTP transport failed",
                 )
             })?;
-        decode_response(method, response).await
+        decode_response(
+            method,
+            response,
+            if retry_safe {
+                TelegramApiErrorClass::Retryable { retry_after: None }
+            } else {
+                TelegramApiErrorClass::OutcomeUnknown
+            },
+        )
+        .await
     }
 
     async fn post_file(
@@ -212,28 +222,10 @@ impl ReqwestTelegramApi {
         field: &'static str,
         command: SendFile,
     ) -> Result<TelegramMessageRef, TelegramApiError> {
-        let file = tokio::fs::File::open(&command.path).await.map_err(|_| {
-            api_error(
-                TelegramApiErrorClass::Terminal,
-                method,
-                "managed file could not be opened",
-            )
-        })?;
-        let length = file
-            .metadata()
-            .await
-            .map_err(|_| {
-                api_error(
-                    TelegramApiErrorClass::Terminal,
-                    method,
-                    "managed file metadata could not be read",
-                )
-            })?
-            .len();
-        let stream = tokio_util::io::ReaderStream::new(file);
+        let stream = tokio_util::io::ReaderStream::new(command.file);
         let part = reqwest::multipart::Part::stream_with_length(
             reqwest::Body::wrap_stream(stream),
-            length,
+            command.length,
         )
         .file_name(command.display_name);
         let mut form = reqwest::multipart::Form::new()
@@ -249,14 +241,18 @@ impl ReqwestTelegramApi {
             .timeout(UPLOAD_TIMEOUT)
             .send()
             .await
-            .map_err(|_| {
+            .map_err(|error| {
                 api_error(
-                    TelegramApiErrorClass::OutcomeUnknown,
+                    if error.is_connect() {
+                        TelegramApiErrorClass::Retryable { retry_after: None }
+                    } else {
+                        TelegramApiErrorClass::OutcomeUnknown
+                    },
                     method,
                     "HTTP transport failed",
                 )
             })?;
-        decode_response(method, response).await
+        decode_response(method, response, TelegramApiErrorClass::OutcomeUnknown).await
     }
 }
 
@@ -323,21 +319,17 @@ struct TelegramErrorParameters {
 async fn decode_response<T: DeserializeOwned>(
     method: &'static str,
     response: reqwest::Response,
+    ambiguous_class: TelegramApiErrorClass,
 ) -> Result<T, TelegramApiError> {
     let status = response.status();
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| {
-            api_error(
-                TelegramApiErrorClass::Retryable { retry_after: None },
-                method,
-                "response body failed",
-            )
-        })?;
+        let chunk = chunk
+            .map_err(|_| api_error(ambiguous_class.clone(), method, "response body failed"))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(api_error(
-                TelegramApiErrorClass::Terminal,
+                ambiguous_class.clone(),
                 method,
                 "response body exceeds limit",
             ));
@@ -346,7 +338,7 @@ async fn decode_response<T: DeserializeOwned>(
     }
     let envelope: TelegramEnvelope<T> = serde_json::from_slice(&bytes).map_err(|_| {
         api_error(
-            TelegramApiErrorClass::Retryable { retry_after: None },
+            ambiguous_class.clone(),
             method,
             "response envelope is invalid",
         )
@@ -354,7 +346,7 @@ async fn decode_response<T: DeserializeOwned>(
     if envelope.ok {
         return envelope.result.ok_or_else(|| {
             api_error(
-                TelegramApiErrorClass::Retryable { retry_after: None },
+                ambiguous_class,
                 method,
                 "successful response omitted result",
             )
@@ -403,7 +395,7 @@ mod tests {
         net::TcpListener,
     };
 
-    use super::{ReqwestTelegramApi, TelegramApi, TelegramApiErrorClass};
+    use super::{ReqwestTelegramApi, SendMessage, TelegramApi, TelegramApiErrorClass};
 
     #[tokio::test]
     async fn get_me_decodes_successful_envelope() -> Result<()> {
@@ -465,6 +457,63 @@ mod tests {
         );
         assert!(!error.to_string().contains("secret-token"));
         server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_send_response_is_outcome_unknown() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await?;
+            let body = r#"{"ok":true,"result":"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            anyhow::Ok(())
+        });
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &base)?;
+
+        let error = api
+            .send_message(SendMessage {
+                chat_id: "100".into(),
+                text: "hello".into(),
+                reply_parameters: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.class(), TelegramApiErrorClass::OutcomeUnknown);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_connect_failure_is_retryable() -> Result<()> {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = probe.local_addr()?;
+        drop(probe);
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &format!("http://{address}"))?;
+
+        let error = api
+            .send_message(SendMessage {
+                chat_id: "100".into(),
+                text: "hello".into(),
+                reply_parameters: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.class(),
+            TelegramApiErrorClass::Retryable { retry_after: None }
+        );
         Ok(())
     }
 }
