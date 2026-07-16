@@ -18,8 +18,10 @@ Official references:
 
 ## Scope
 
-This change applies rich Markdown rendering to durable final text deliveries
-sent through the Telegram gateway.
+This change applies rich Markdown rendering to durable text deliveries sent
+through the Telegram gateway. This includes assistant replies, link responses,
+and projected terminal error text because the durable delivery record carries
+the text payload but does not carry the originating intent class.
 
 It does not change:
 
@@ -63,7 +65,7 @@ failure after request transmission therefore remains `outcome_unknown`.
 
 ## Delivery Flow
 
-For an `OutboxPayload::Text` Telegram delivery:
+For any `OutboxPayload::Text` Telegram delivery:
 
 1. Call `sendRichMessage` with the chunk's original Markdown.
 2. If it succeeds, complete the durable delivery using the returned Telegram
@@ -79,8 +81,8 @@ message methods, and other definitive rejections without risking duplicate
 delivery. If the plain send also fails, its error classification controls the
 durable delivery transition.
 
-Tool statuses remain plain `sendMessage` calls because they are transient UI,
-not assistant-authored Markdown.
+Tool statuses remain plain `sendMessage` calls because they are transient UI
+and do not pass through the durable text delivery path.
 
 ## Chunking and Limits
 
@@ -141,9 +143,9 @@ remain intact.
 
 ## Documentation
 
-Update the Telegram section in `README.md` to state that final assistant text
-uses Telegram Rich Messages and that terminal formatting rejection falls back
-to readable plain text. Mention that the durable 4096-character chunk limit
+Update the Telegram section in `README.md` to state that durable text uses
+Telegram Rich Messages and that terminal formatting rejection falls back to
+readable plain text. Mention that the durable 4096-character chunk limit
 remains in place.
 
 ## Non-Goals
