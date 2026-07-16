@@ -368,12 +368,33 @@ install_serve_service() {
 
 authorization_has_actors() {
   users_file="$1"
-  [ -s "$users_file" ] || return 1
-  compact="$(tr -d ' \t\r\n' <"$users_file")"
-  case "$compact" in
-    *'"actors":{}'*) return 1 ;;
-    *) return 0 ;;
-  esac
+  validator="$(installer_validator_binary)"
+  [ -n "$validator" ] && [ -x "$validator" ] || return 1
+  "$validator" __installer_has_actors "$users_file" >/dev/null 2>&1
+}
+
+installer_validator_binary() {
+  if [ -n "${CODRIK_VALIDATOR_BIN:-}" ]; then
+    printf '%s\n' "$CODRIK_VALIDATOR_BIN"
+  else
+    printf '%s\n' "${INSTALLER_BINARY:-}"
+  fi
+}
+
+installer_validate_config() {
+  config_file="$1"
+  users_file="$2"
+  validator="$(installer_validator_binary)"
+  [ -n "$validator" ] && [ -x "$validator" ] || return 1
+  "$validator" __installer_validate "$config_file" "$users_file"
+}
+
+installer_validate_actor() {
+  users_file="$1"
+  actor_id="$2"
+  validator="$(installer_validator_binary)"
+  [ -n "$validator" ] && [ -x "$validator" ] || return 1
+  "$validator" __installer_validate_actor "$users_file" "$actor_id"
 }
 
 bootstrap_or_select_actor() {
@@ -388,7 +409,12 @@ bootstrap_or_select_actor() {
     actor_id=""
     while [ -z "$actor_id" ]; do
       actor_id="$(ask "Existing authorization actor ID" "")"
-      [ -n "$actor_id" ] || echo "An explicit actor ID is required." >&2
+      if [ -z "$actor_id" ]; then
+        echo "An explicit actor ID is required." >&2
+      elif ! installer_validate_actor "$users_file" "$actor_id" >/dev/null 2>&1; then
+        echo "Actor ID is absent or disabled in users.json." >&2
+        actor_id=""
+      fi
     done
     printf '%s\n' "$actor_id"
     return
@@ -420,49 +446,12 @@ USERS
   printf '%s\n' "actor:local:owner"
 }
 
-runtime_actor_from_config() {
-  config_file="$1"
-  raw="$(sed -n '/^[[:space:]]*runtime:[[:space:]]*\(#.*\)\{0,1\}$/,/^[^[:space:]]/ {
-    /^[[:space:]]*actor_id[[:space:]]*:/ {
-      s/^[[:space:]]*actor_id[[:space:]]*:[[:space:]]*//
-      p
-      q
-    }
-  }' "$config_file")"
-  raw="$(printf '%s' "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [ -n "$raw" ] || return 1
-
-  case "$raw" in
-    \"*)
-      value="$(printf '%s' "$raw" | sed -n 's/^"\([^"]*\)"[[:space:]]*\(#.*\)\{0,1\}$/\1/p')"
-      ;;
-    \'*)
-      value="$(printf '%s' "$raw" | sed -n "s/^'\([^']*\)'[[:space:]]*\(#.*\)\{0,1\}$/\1/p")"
-      ;;
-    *)
-      value="$(printf '%s' "$raw" | sed 's/[[:space:]]#.*$//;s/[[:space:]]*$//')"
-      case "$value" in
-        \#* | *'['* | *']'* | *'{'* | *'}'*) return 1 ;;
-      esac
-      ;;
-  esac
-  value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [ -n "$value" ] || return 1
-  lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-  case "$lower" in null | '~') return 1 ;; esac
-  printf '%s\n' "$value"
-}
-
-config_has_runtime_actor() {
-  runtime_actor_from_config "$1" >/dev/null 2>&1
-}
-
 capture_install_state() {
   config_dir="$1"
   runtime_dir="$2"
+  installed_binary="${3:-}"
   config_file="$config_dir/config.yml"
   legacy_config_file="$config_dir/codrik.config.yml"
-  users_file="$runtime_dir/users.json"
   service_present=0
   case "$(uname -s)" in
     Linux)
@@ -474,8 +463,10 @@ capture_install_state() {
       [ -f "$HOME/Library/LaunchAgents/com.suinly.codrik.telegram.plist" ] && service_present=1
       ;;
   esac
-  if [ ! -f "$config_file" ] && [ ! -f "$legacy_config_file" ] \
-    && [ "$service_present" = "0" ] && ! authorization_has_actors "$users_file"; then
+  if [ ! -e "$config_dir" ] && [ ! -e "$runtime_dir" ] \
+    && { [ -z "$installed_binary" ] || [ ! -e "$installed_binary" ]; } \
+    && [ ! -f "$config_file" ] && [ ! -f "$legacy_config_file" ] \
+    && [ "$service_present" = "0" ]; then
     CLEAN_INTERACTIVE_INSTALL=1
   else
     CLEAN_INTERACTIVE_INSTALL=0
@@ -518,17 +509,11 @@ configure_codrik() {
 
   if [ -f "$config_file" ] && ! ask_yes_no "$config_file already exists. Overwrite it?" "n"; then
     echo "Keeping existing config: $config_file"
-    if config_has_runtime_actor "$config_file" && authorization_has_actors "$runtime_dir/users.json"; then
+    if actor_id="$(installer_validate_config "$config_file" "$runtime_dir/users.json" 2>/dev/null)"; then
       CONFIGURED_RUNTIME_READY=1
     else
-      if ! config_has_runtime_actor "$config_file"; then
-        print_missing_runtime_actor
-      else
-        cat >&2 <<'GUIDANCE'
-Existing config names runtime.actor_id, but users.json has no usable authorization actors.
-Create or restore users.json explicitly. Codrik service was not started.
-GUIDANCE
-      fi
+      print_missing_runtime_actor
+      echo "Config or authorization failed production validation; fix both files before starting Codrik." >&2
     fi
     return
   fi
@@ -581,7 +566,6 @@ need_command mkdir
 need_command mv
 need_command sed
 need_command dirname
-need_command tr
 need_command rm
 
 repo_url="${CODRIK_REPO_URL:-$DEFAULT_REPO_URL}"
@@ -591,7 +575,7 @@ install_dir="${CODRIK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 config_dir="${CODRIK_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"
 runtime_dir="${CODRIK_HOME:-$config_dir}"
 
-capture_install_state "$config_dir" "$runtime_dir"
+capture_install_state "$config_dir" "$runtime_dir" "$install_dir/$BIN_NAME"
 
 [ -n "$install_dir" ] || die "could not determine install directory; set CODRIK_INSTALL_DIR"
 
@@ -620,6 +604,7 @@ curl -fsSLo "$tmp_dir/$asset.sha256" "$download_url.sha256" \
 chmod 755 "$tmp_dir/$asset"
 mkdir -p "$install_dir"
 mv "$tmp_dir/$asset" "$install_dir/$BIN_NAME"
+INSTALLER_BINARY="$install_dir/$BIN_NAME"
 
 echo "Installed $BIN_NAME $tag to $install_dir/$BIN_NAME"
 

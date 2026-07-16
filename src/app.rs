@@ -5,6 +5,7 @@ use crate::{
     runtime::{
         artifacts::ArtifactManager,
         dispatcher::ActorDispatcher,
+        hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
         instance_lock::InstanceLock,
         ipc::{
             security::{create_secure_directory, validate_secure_directory},
@@ -79,6 +80,32 @@ where
     .await
 }
 
+pub async fn serve_with_dependencies_and_hooks<C, L, F>(
+    config: AppConfig,
+    home: PathBuf,
+    clock: C,
+    llm: L,
+    hooks: Arc<dyn RuntimeBoundaryHooks>,
+    shutdown: F,
+) -> Result<()>
+where
+    C: Clock,
+    L: LlmStreamClient + Send + Sync + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    serve_at_until_with_hooks(
+        config,
+        Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+        &NoopStartupTrace,
+        home,
+        clock,
+        llm,
+        hooks,
+        shutdown,
+    )
+    .await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupPhase {
     PathsValidated,
@@ -110,6 +137,34 @@ async fn serve_at_until<C, L, F>(
     home: PathBuf,
     clock: C,
     llm: L,
+    shutdown: F,
+) -> Result<()>
+where
+    C: Clock,
+    L: LlmStreamClient + Send + Sync + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    serve_at_until_with_hooks(
+        config,
+        logger,
+        trace,
+        home,
+        clock,
+        llm,
+        Arc::new(NoopRuntimeBoundaryHooks),
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_at_until_with_hooks<C, L, F>(
+    config: AppConfig,
+    logger: Arc<dyn RuntimeLogger>,
+    trace: &dyn StartupTrace,
+    home: PathBuf,
+    clock: C,
+    llm: L,
+    hooks: Arc<dyn RuntimeBoundaryHooks>,
     shutdown: F,
 ) -> Result<()>
 where
@@ -150,12 +205,13 @@ where
         clock.clone(),
         outbox_owner.clone(),
     ));
-    let server = LocalIpcServer::bind(
+    let server = LocalIpcServer::bind_with_hooks(
         &paths.socket,
         actor_id.clone(),
         Arc::new(store.clone()),
         outbox.clone(),
         hub.clone(),
+        hooks.clone(),
     )?;
     trace.record(StartupPhase::SocketBound);
     let recovery = store.recover_startup(clock.now()).await?;
@@ -174,7 +230,8 @@ where
         artifacts,
     )
     .with_system_instructions(instructions)
-    .with_logger(logger.clone());
+    .with_logger(logger.clone())
+    .with_boundary_hooks(hooks);
     let dispatcher = ActorDispatcher::new(
         actor_id.clone(),
         dispatcher_owner.clone(),

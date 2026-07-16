@@ -1,8 +1,9 @@
-use std::{env, future::Future, io::Write};
+use std::{env, future::Future, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::{
+    auth::AuthorizationStore,
     config::{AppConfig, codrik_dir},
     interfaces::{
         local_renderer::{LocalRenderer, RenderAction},
@@ -23,6 +24,34 @@ pub async fn run() -> Result<()> {
         CliCommand::Submit(prompt) => submit(prompt).await,
         CliCommand::Resume(request) => resume(request).await,
         CliCommand::Cancel(request) => cancel(request).await,
+        CliCommand::InstallerValidate { config, users } => {
+            let config = AppConfig::load(config)?;
+            let actor = config.required_runtime()?.actor_id.trim();
+            if !AuthorizationStore::new(users)
+                .actor_is_enabled(actor)
+                .await?
+            {
+                bail!("configured runtime actor is absent or disabled in users.json")
+            }
+            println!("{actor}");
+            Ok(())
+        }
+        CliCommand::InstallerHasActors { users } => {
+            if !AuthorizationStore::new(users).has_actors().await? {
+                bail!("users.json contains no actors")
+            }
+            Ok(())
+        }
+        CliCommand::InstallerValidateActor { users, actor } => {
+            if !AuthorizationStore::new(users)
+                .actor_is_enabled(&actor)
+                .await?
+            {
+                bail!("authorization actor is absent or disabled")
+            }
+            println!("{actor}");
+            Ok(())
+        }
     }
 }
 
@@ -164,6 +193,9 @@ enum CliCommand {
     Resume(RequestId),
     Cancel(RequestId),
     Submit(String),
+    InstallerValidate { config: PathBuf, users: PathBuf },
+    InstallerHasActors { users: PathBuf },
+    InstallerValidateActor { users: PathBuf, actor: String },
 }
 
 impl CliCommand {
@@ -181,6 +213,20 @@ impl CliCommand {
             "cancel" => {
                 let request_id = args.next().context("missing request id")?;
                 Self::Cancel(RequestId::parse(&request_id)?)
+            }
+            "__installer_validate" => {
+                let config = PathBuf::from(args.next().context("missing config path")?);
+                let users = PathBuf::from(args.next().context("missing users path")?);
+                Self::InstallerValidate { config, users }
+            }
+            "__installer_has_actors" => {
+                let users = PathBuf::from(args.next().context("missing users path")?);
+                Self::InstallerHasActors { users }
+            }
+            "__installer_validate_actor" => {
+                let users = PathBuf::from(args.next().context("missing users path")?);
+                let actor = args.next().context("missing actor id")?;
+                Self::InstallerValidateActor { users, actor }
             }
             "gateway" | "--session" | "--stream" => {
                 bail!("legacy local command is unsupported; use serve, resume, or cancel")

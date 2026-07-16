@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use crate::runtime::{
+    hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
     ipc::{
         protocol::{
             ClientRequestBody, FrameReader, FrameWriter, ProtocolFailure, ServerEvent,
@@ -208,6 +209,7 @@ pub struct LocalIpcServer {
     connections: Arc<Semaphore>,
     active: ActiveConnections,
     decodes: DecodeRegistry,
+    hooks: Arc<dyn RuntimeBoundaryHooks>,
 }
 
 impl LocalIpcServer {
@@ -218,8 +220,34 @@ impl LocalIpcServer {
         outbox: Arc<dyn IpcOutbox>,
         hub: Arc<StreamHub>,
     ) -> Result<Self> {
+        Self::bind_with_hooks(
+            socket_path,
+            actor,
+            ingress,
+            outbox,
+            hub,
+            Arc::new(NoopRuntimeBoundaryHooks),
+        )
+    }
+
+    pub fn bind_with_hooks(
+        socket_path: &std::path::Path,
+        actor: ActorId,
+        ingress: Arc<dyn LocalIngressStore>,
+        outbox: Arc<dyn IpcOutbox>,
+        hub: Arc<StreamHub>,
+        hooks: Arc<dyn RuntimeBoundaryHooks>,
+    ) -> Result<Self> {
         let listener = crate::runtime::ipc::security::bind_secure_listener(socket_path)?;
-        Ok(Self::new(listener, actor, ingress, outbox, hub))
+        Ok(Self::with_credentials_and_hooks(
+            listener,
+            actor,
+            ingress,
+            outbox,
+            hub,
+            Arc::new(OsPeerCredentials),
+            hooks,
+        ))
     }
 
     pub fn new(
@@ -247,6 +275,26 @@ impl LocalIpcServer {
         hub: Arc<StreamHub>,
         credentials: Arc<dyn PeerCredentials>,
     ) -> Self {
+        Self::with_credentials_and_hooks(
+            listener,
+            actor,
+            ingress,
+            outbox,
+            hub,
+            credentials,
+            Arc::new(NoopRuntimeBoundaryHooks),
+        )
+    }
+
+    pub fn with_credentials_and_hooks(
+        listener: UnixListener,
+        actor: ActorId,
+        ingress: Arc<dyn LocalIngressStore>,
+        outbox: Arc<dyn IpcOutbox>,
+        hub: Arc<StreamHub>,
+        credentials: Arc<dyn PeerCredentials>,
+        hooks: Arc<dyn RuntimeBoundaryHooks>,
+    ) -> Self {
         Self {
             listener,
             actor,
@@ -258,6 +306,7 @@ impl LocalIpcServer {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             active: ActiveConnections::default(),
             decodes: DecodeRegistry::default(),
+            hooks,
         }
     }
 
@@ -303,6 +352,7 @@ impl LocalIpcServer {
                 submissions: self.submissions.clone(),
                 active: self.active.clone(),
                 decodes: self.decodes.clone(),
+                hooks: self.hooks.clone(),
             };
             let decode = self.decodes.register();
             handlers.spawn(async move {
@@ -327,6 +377,7 @@ struct ConnectionHandler {
     submissions: SubmissionRegistry,
     active: ActiveConnections,
     decodes: DecodeRegistry,
+    hooks: Arc<dyn RuntimeBoundaryHooks>,
 }
 
 impl ConnectionHandler {
@@ -464,6 +515,9 @@ impl ConnectionHandler {
                 SystemClock.now(),
             )
             .await;
+        if outcome.is_ok() {
+            self.hooks.ingress_committed(&request).await;
+        }
         drop(guard); // publish completion after commit or rollback, before any durable lookup can proceed.
         match outcome? {
             LocalSubmitOutcome::Accepted {
@@ -1267,6 +1321,7 @@ mod tests {
             submissions,
             active: Default::default(),
             decodes: Default::default(),
+            hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
         }
     }
 
@@ -1296,6 +1351,7 @@ mod tests {
                 submissions,
                 active: Default::default(),
                 decodes: Default::default(),
+                hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             },
             ingress,
             outbox,
@@ -1336,6 +1392,7 @@ mod tests {
             submissions,
             active: Default::default(),
             decodes: Default::default(),
+            hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
         }
     }
 
@@ -1365,6 +1422,7 @@ mod tests {
                 submissions,
                 active: Default::default(),
                 decodes: Default::default(),
+                hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             },
             ingress,
             outbox,

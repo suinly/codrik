@@ -104,6 +104,19 @@ impl AuthorizationStore {
         Ok(LegacyAuthorizationSnapshot::from(self.read_users().await?))
     }
 
+    pub async fn has_actors(&self) -> Result<bool> {
+        Ok(!self.read_users().await?.actors.is_empty())
+    }
+
+    pub async fn actor_is_enabled(&self, actor_id: &str) -> Result<bool> {
+        Ok(self
+            .read_users()
+            .await?
+            .actors
+            .get(actor_id)
+            .is_some_and(|actor| actor.enabled))
+    }
+
     async fn read_users(&self) -> Result<StoredUsers> {
         if !fs::try_exists(&self.path)
             .await

@@ -17,10 +17,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -28,6 +25,14 @@ use tokio::{
     task::JoinHandle,
 };
 use uuid::Uuid;
+
+use codrik::{
+    interfaces::local_renderer::{FinalBundleVerifier, VerifiedFinalBundle},
+    runtime::{
+        hooks::RuntimeBoundaryHooks, ipc::protocol::ServerEvent, model::RequestId,
+        store::FinalPayload,
+    },
+};
 
 const ACTOR: &str = "actor:local:owner";
 static ACCEPTANCE_LOCK: Mutex<()> = Mutex::new(());
@@ -459,6 +464,67 @@ impl codrik::llm::client::LlmStreamClient for InjectedLlm {
     }
 }
 
+#[derive(Default)]
+struct BoundaryHooks {
+    block_dispatch: std::sync::atomic::AtomicBool,
+    block_incorporation: std::sync::atomic::AtomicBool,
+    ingress_reached: Notify,
+    incorporation_reached: Notify,
+    release_dispatch: Notify,
+    release_incorporation: Notify,
+}
+
+impl BoundaryHooks {
+    fn ingress_gate() -> Arc<Self> {
+        Arc::new(Self {
+            block_dispatch: std::sync::atomic::AtomicBool::new(true),
+            ..Self::default()
+        })
+    }
+
+    fn incorporation_gate() -> Arc<Self> {
+        Arc::new(Self {
+            block_incorporation: std::sync::atomic::AtomicBool::new(true),
+            ..Self::default()
+        })
+    }
+
+    async fn wait_ingress(&self) {
+        self.ingress_reached.notified().await;
+    }
+
+    async fn wait_incorporation(&self) {
+        self.incorporation_reached.notified().await;
+    }
+
+    fn disable(&self) {
+        self.block_dispatch.store(false, Ordering::SeqCst);
+        self.block_incorporation.store(false, Ordering::SeqCst);
+        self.release_dispatch.notify_waiters();
+        self.release_incorporation.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl RuntimeBoundaryHooks for BoundaryHooks {
+    async fn before_dispatch(&self) {
+        if self.block_dispatch.load(Ordering::SeqCst) {
+            self.release_dispatch.notified().await;
+        }
+    }
+
+    async fn ingress_committed(&self, _request_id: &RequestId) {
+        self.ingress_reached.notify_waiters();
+    }
+
+    async fn incorporation_committed(&self, _request_ids: &[RequestId]) {
+        self.incorporation_reached.notify_waiters();
+        if self.block_incorporation.load(Ordering::SeqCst) {
+            self.release_incorporation.notified().await;
+        }
+    }
+}
+
 struct InjectedHarness {
     test_roots: PathBuf,
     root: PathBuf,
@@ -467,16 +533,39 @@ struct InjectedHarness {
     database: PathBuf,
     clock: codrik::runtime::model::ManualClock,
     llm: InjectedLlm,
+    hooks: Arc<dyn RuntimeBoundaryHooks>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
 }
 
 impl InjectedHarness {
     async fn start(replies: Vec<InjectedReply>) -> Result<Self> {
-        Self::start_with_llm(InjectedLlm::new(replies)).await
+        Self::start_with_llm_and_hooks(
+            InjectedLlm::new(replies),
+            Arc::new(codrik::runtime::hooks::NoopRuntimeBoundaryHooks),
+        )
+        .await
     }
 
     async fn start_with_llm(llm: InjectedLlm) -> Result<Self> {
+        Self::start_with_llm_and_hooks(
+            llm,
+            Arc::new(codrik::runtime::hooks::NoopRuntimeBoundaryHooks),
+        )
+        .await
+    }
+
+    async fn start_with_hooks(
+        replies: Vec<InjectedReply>,
+        hooks: Arc<dyn RuntimeBoundaryHooks>,
+    ) -> Result<Self> {
+        Self::start_with_llm_and_hooks(InjectedLlm::new(replies), hooks).await
+    }
+
+    async fn start_with_llm_and_hooks(
+        llm: InjectedLlm,
+        hooks: Arc<dyn RuntimeBoundaryHooks>,
+    ) -> Result<Self> {
         let test_roots = std::env::current_dir()?.join(".t");
         fs::create_dir_all(&test_roots)?;
         fs::set_permissions(&test_roots, fs::Permissions::from_mode(0o700))?;
@@ -507,6 +596,7 @@ impl InjectedHarness {
             database,
             clock: codrik::runtime::model::ManualClock::new(1_000),
             llm,
+            hooks,
             shutdown: None,
             task: None,
         };
@@ -521,10 +611,18 @@ impl InjectedHarness {
         let root = self.root.clone();
         let clock = self.clock.clone();
         let llm = self.llm.clone();
+        let hooks = self.hooks.clone();
         self.task = Some(tokio::spawn(async move {
-            codrik::app::serve_with_dependencies(config, root, clock, llm, async move {
-                let _ = stopped.await;
-            })
+            codrik::app::serve_with_dependencies_and_hooks(
+                config,
+                root,
+                clock,
+                llm,
+                hooks,
+                async move {
+                    let _ = stopped.await;
+                },
+            )
             .await
         }));
         let probe_request = request_id();
@@ -662,156 +760,76 @@ fn wait_for_type(stream: &mut UnixStream, expected: &str) -> Result<Value> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct VerifiedManifestEntry {
-    delivery_id: String,
-    payload_kind: String,
-    decoded_bytes: usize,
-    sha256: String,
-    chunk_count: usize,
-}
-
-#[derive(Debug)]
-struct VerifiedDelivery {
-    manifest: VerifiedManifestEntry,
-    bytes: Vec<u8>,
-    payload: Value,
-}
-
 #[derive(Debug)]
 struct VerifiedBundle {
-    request_id: String,
-    bundle_id: String,
-    replay: bool,
-    manifest_sha256: String,
+    verified: VerifiedFinalBundle,
     chunk_frames: usize,
-    deliveries: Vec<VerifiedDelivery>,
+}
+
+impl std::ops::Deref for VerifiedBundle {
+    type Target = VerifiedFinalBundle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.verified
+    }
 }
 
 impl VerifiedBundle {
-    fn delivery_ids(&self) -> Vec<String> {
-        self.deliveries
-            .iter()
-            .map(|delivery| delivery.manifest.delivery_id.clone())
-            .collect()
+    fn delivery_ids(&self) -> Vec<codrik::runtime::DeliveryId> {
+        self.verified.delivery_ids()
     }
 
     fn text(&self) -> Option<&str> {
-        self.deliveries.iter().find_map(|delivery| {
-            (delivery.manifest.payload_kind == "text")
-                .then(|| delivery.payload["text"].as_str())
-                .flatten()
-        })
+        self.deliveries
+            .iter()
+            .find_map(|delivery| match &delivery.payload {
+                FinalPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
     }
 }
 
 fn final_bundle(stream: &mut UnixStream, expected_request: &str) -> Result<VerifiedBundle> {
-    let begin = wait_for_type(stream, "final_begin")?;
-    let request_id = begin["body"]["request_id"]
-        .as_str()
-        .context("request id")?
-        .to_owned();
-    assert_eq!(request_id, expected_request);
-    let bundle_id = begin["body"]["bundle_id"]
-        .as_str()
-        .context("bundle id")?
-        .to_owned();
-    let replay = begin["body"]["replay"].as_bool().unwrap_or(false);
-    let manifest: Vec<VerifiedManifestEntry> =
-        serde_json::from_value(begin["body"]["manifest"].clone())?;
-    assert!(!manifest.is_empty());
-    let mut deliveries = manifest
-        .iter()
-        .cloned()
-        .map(|manifest| VerifiedDelivery {
-            manifest,
-            bytes: Vec::new(),
-            payload: Value::Null,
-        })
-        .collect::<Vec<_>>();
-    let mut delivery_index = 0;
-    let mut next_chunk = 0;
+    let request = codrik::runtime::RequestId::parse(expected_request)?;
+    let mut verifier = FinalBundleVerifier::for_request(request);
     let mut chunk_frames = 0;
     loop {
-        let event = read_frame(stream)?;
-        let body = &event["body"];
-        match body["type"].as_str() {
-            Some("final_chunk") => {
-                assert_eq!(body["request_id"], expected_request);
-                assert_eq!(body["bundle_id"], bundle_id);
-                let delivery = deliveries
-                    .get_mut(delivery_index)
-                    .context("extra final chunk")?;
-                assert_eq!(body["delivery_id"], delivery.manifest.delivery_id);
-                assert_eq!(body["chunk_index"], next_chunk);
-                let encoded = body["bytes_base64"].as_str().context("chunk base64")?;
-                let offset = next_chunk * codrik::runtime::MAX_FINAL_CHUNK_BYTES;
-                let expected_bytes = (delivery.manifest.decoded_bytes - offset)
-                    .min(codrik::runtime::MAX_FINAL_CHUNK_BYTES);
-                assert_eq!(encoded.len(), expected_bytes.div_ceil(3) * 4);
-                let decoded = STANDARD.decode(encoded)?;
-                assert_eq!(decoded.len(), expected_bytes);
-                delivery.bytes.extend_from_slice(&decoded);
-                chunk_frames += 1;
-                next_chunk += 1;
-                if next_chunk == delivery.manifest.chunk_count {
-                    delivery_index += 1;
-                    next_chunk = 0;
-                }
+        let wire = read_frame(stream)?;
+        if wire["body"]["type"] == "final_chunk" {
+            chunk_frames += 1;
+        }
+        if !matches!(
+            wire["body"]["type"].as_str(),
+            Some("final_begin" | "final_chunk" | "final_end")
+        ) {
+            if verifier.is_in_progress() {
+                bail!("non-final event arrived while final verification was in progress");
             }
-            Some("final_end") => {
-                assert_eq!(body["request_id"], expected_request);
-                assert_eq!(body["bundle_id"], bundle_id);
-                assert_eq!(delivery_index, deliveries.len());
-                assert_eq!(next_chunk, 0);
-                let manifest_sha256 = body["manifest_sha256"]
-                    .as_str()
-                    .context("manifest hash")?
-                    .to_owned();
-                assert_eq!(
-                    manifest_sha256,
-                    format!("{:x}", Sha256::digest(serde_json::to_vec(&manifest)?))
-                );
-                for delivery in &mut deliveries {
-                    assert_eq!(delivery.bytes.len(), delivery.manifest.decoded_bytes);
-                    assert_eq!(
-                        format!("{:x}", Sha256::digest(&delivery.bytes)),
-                        delivery.manifest.sha256
-                    );
-                    delivery.payload = serde_json::from_slice(&delivery.bytes)?;
-                    assert_eq!(delivery.payload["type"], delivery.manifest.payload_kind);
-                    match delivery.manifest.payload_kind.as_str() {
-                        "text" => assert!(delivery.payload["text"].is_string()),
-                        "file" => assert!(delivery.payload["artifact"].is_object()),
-                        "terminal_error" => {
-                            assert!(delivery.payload["code"].is_string());
-                            assert!(delivery.payload["message"].is_string());
-                        }
-                        kind => bail!("unknown final payload kind {kind}"),
-                    }
-                }
-                return Ok(VerifiedBundle {
-                    request_id,
-                    bundle_id,
-                    replay,
-                    manifest_sha256,
-                    chunk_frames,
-                    deliveries,
-                });
-            }
-            event_type => bail!("unexpected event inside final bundle: {event_type:?}"),
+            continue;
+        }
+        let event: ServerEvent = serde_json::from_value(wire)?;
+        if let Some(verified) = verifier.handle(event)? {
+            return Ok(VerifiedBundle {
+                verified,
+                chunk_frames,
+            });
         }
     }
 }
 
-fn ack(socket: &Path, request: &str, bundle: &str, deliveries: &[String]) -> Result<()> {
+fn ack(
+    socket: &Path,
+    request: &str,
+    bundle: &codrik::runtime::BundleId,
+    deliveries: &[codrik::runtime::DeliveryId],
+) -> Result<()> {
     let mut stream = connect(socket)?;
     send_frame(
         &mut stream,
         json!({"type":"ack_final","request_id":request,"bundle_id":bundle,"delivery_ids":deliveries}),
     )?;
     let event = wait_for_type(&mut stream, "ack_accepted")?;
-    assert_eq!(event["body"]["bundle_id"], bundle);
+    assert_eq!(event["body"]["bundle_id"].as_str(), Some(bundle.as_str()));
     Ok(())
 }
 
@@ -839,14 +857,14 @@ async fn scenario_01_submit_streams_verified_final_and_acks_delivery() -> Result
             fs::read_to_string(&harness.log).unwrap_or_default()
         )
     })?;
-    assert_eq!(verified.request_id, request);
+    assert_eq!(verified.request_id.as_str(), request);
     assert_eq!(verified.text(), Some("hello world"));
     assert!(!verified.replay);
     assert_eq!(
         harness
             .scalar("SELECT id FROM result_bundles LIMIT 1")
             .await?,
-        verified.bundle_id
+        verified.bundle_id.as_str()
     );
     ack(
         &harness.socket,
@@ -1006,7 +1024,7 @@ async fn scenario_06_multiple_incorporated_requests_receive_final_rows() -> Resu
                 "SELECT result_bundle_id FROM local_requests WHERE request_id='{first_id}'"
             ))
             .await?,
-        first_bundle.bundle_id
+        first_bundle.bundle_id.as_str()
     );
     assert_eq!(
         harness
@@ -1014,7 +1032,7 @@ async fn scenario_06_multiple_incorporated_requests_receive_final_rows() -> Resu
                 "SELECT result_bundle_id FROM local_requests WHERE request_id='{second_id}'"
             ))
             .await?,
-        second_bundle.bundle_id
+        second_bundle.bundle_id.as_str()
     );
     assert_eq!(harness.count("outbox_deliveries").await?, 2);
     assert_eq!(harness.count("outbox").await?, 1);
@@ -1025,37 +1043,26 @@ async fn scenario_06_multiple_incorporated_requests_receive_final_rows() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_07_restart_after_ingress_preserves_durable_state() -> Result<()> {
     let _serial = serialize_acceptance();
-    use codrik::runtime::{
-        model::{ActorId, RequestId, Timestamp},
-        sqlite::SqliteRuntimeStore,
-        store::{
-            CheckpointRun, CheckpointStore, DispatchStore, LocalIngressStore, LocalSubmission,
-        },
-    };
 
     // Boundary A: ingress is durable, but no run has attached it yet.
-    let mut ingress =
-        InjectedHarness::start(vec![InjectedReply::Text("after ingress".into())]).await?;
-    ingress.crash().await;
+    let ingress_hooks = BoundaryHooks::ingress_gate();
+    let mut ingress = InjectedHarness::start_with_hooks(
+        vec![InjectedReply::Text("after ingress".into())],
+        ingress_hooks.clone(),
+    )
+    .await?;
     let request = request_id();
-    let store = SqliteRuntimeStore::open(&ingress.database).await?;
-    store
-        .submit_for_actor(
-            &ActorId::from_string(ACTOR),
-            LocalSubmission {
-                request_id: RequestId::parse(&request)?,
-                text: "durable ingress".into(),
-                prompt_sha256: format!("{:x}", Sha256::digest(b"durable ingress")),
-            },
-            Timestamp(1_000),
+    let _submitted = submit(&ingress.socket, &request, "durable ingress")?;
+    tokio::time::timeout(Duration::from_secs(10), ingress_hooks.wait_ingress()).await?;
+    ingress
+        .wait_scalar(
+            "SELECT CASE WHEN COUNT(*)=1 AND (SELECT COUNT(*) FROM runs)=0 THEN 'ingress-only' ELSE 'not-ready' END FROM local_requests",
+            "ingress-only",
         )
         .await?;
-    assert_eq!(
-        ingress
-            .scalar("SELECT CAST(COUNT(*) AS TEXT) FROM runs")
-            .await?,
-        "0"
-    );
+    assert_eq!(ingress.llm.calls.load(Ordering::SeqCst), 0);
+    ingress.crash().await;
+    ingress_hooks.disable();
     ingress.spawn().await.context("boundary A restart")?;
     let mut resumed = resume(&ingress.socket, &request)?;
     assert_eq!(
@@ -1066,52 +1073,29 @@ async fn scenario_07_restart_after_ingress_preserves_durable_state() -> Result<(
 
     // Boundary B: a run is attached and its source event is incorporated, but
     // no model checkpoint or terminal result exists.
-    let mut incorporated =
-        InjectedHarness::start(vec![InjectedReply::Text("after incorporation".into())]).await?;
-    incorporated.crash().await;
+    let incorporation_hooks = BoundaryHooks::incorporation_gate();
+    let mut incorporated = InjectedHarness::start_with_hooks(
+        vec![InjectedReply::Text("after incorporation".into())],
+        incorporation_hooks.clone(),
+    )
+    .await?;
     let request = request_id();
-    let store = SqliteRuntimeStore::open(&incorporated.database).await?;
-    store
-        .submit_for_actor(
-            &ActorId::from_string(ACTOR),
-            LocalSubmission {
-                request_id: RequestId::parse(&request)?,
-                text: "incorporated".into(),
-                prompt_sha256: format!("{:x}", Sha256::digest(b"incorporated")),
-            },
-            Timestamp(1_000),
+    let mut submitted = submit(&incorporated.socket, &request, "incorporated")?;
+    wait_for_type(&mut submitted, "accepted")?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        incorporation_hooks.wait_incorporation(),
+    )
+    .await?;
+    incorporated
+        .wait_scalar(
+            "SELECT CASE WHEN runs.state='active' AND COUNT(run_events.event_id)=1 AND SUM(run_events.incorporated)=1 THEN 'incorporated' ELSE 'not-ready' END FROM runs JOIN run_events ON run_events.run_id=runs.id GROUP BY runs.id",
+            "incorporated",
         )
         .await?;
-    let lease = store
-        .acquire_ready_actor_for(
-            &ActorId::from_string(ACTOR),
-            "boundary-b",
-            Timestamp(1_000),
-            Timestamp(31_000),
-        )
-        .await?
-        .context("boundary B lease")?;
-    let run = store
-        .attach_next_run(&lease, 8, Timestamp(1_000))
-        .await?
-        .context("boundary B attached run")?;
-    store
-        .checkpoint_run(
-            CheckpointRun {
-                run: run.clone(),
-                incorporated_event_ids: run.source_event_ids.clone(),
-                checkpointed_attempt_ids: Vec::new(),
-                messages: Vec::new(),
-            },
-            Timestamp(1_000),
-        )
-        .await?;
-    assert_eq!(
-        incorporated
-            .scalar("SELECT CAST(COUNT(*) AS TEXT) FROM run_events WHERE incorporated=1")
-            .await?,
-        "1"
-    );
+    assert_eq!(incorporated.llm.calls.load(Ordering::SeqCst), 0);
+    incorporated.crash().await;
+    incorporation_hooks.disable();
     incorporated.clock.advance(31_000);
     incorporated.spawn().await.context("boundary B restart")?;
     let mut resumed = resume(&incorporated.socket, &request)?;
@@ -1308,14 +1292,10 @@ async fn scenario_12_fifth_runtime_failure_delivers_terminal_error() -> Result<(
     let mut resumed = resume(&harness.socket, &request)?;
     let terminal = final_bundle(&mut resumed, &request)?;
     assert_eq!(terminal.deliveries.len(), 1);
-    assert_eq!(
-        terminal.deliveries[0].manifest.payload_kind,
-        "terminal_error"
-    );
-    assert_eq!(
-        terminal.deliveries[0].payload["code"],
-        "dispatcher_failure_limit"
-    );
+    assert!(matches!(
+        &terminal.deliveries[0].payload,
+        FinalPayload::TerminalError { code, .. } if code == "dispatcher_failure_limit"
+    ));
     assert_eq!(
         harness
             .scalar("SELECT state FROM local_requests LIMIT 1")
@@ -1387,7 +1367,7 @@ async fn scenario_15_large_text_and_more_than_32_routes_replay_completely() -> R
         delivered
             .deliveries
             .iter()
-            .filter(|delivery| delivery.manifest.payload_kind == "file")
+            .filter(|delivery| matches!(delivery.payload, FinalPayload::File { .. }))
             .count(),
         33
     );
@@ -1409,7 +1389,7 @@ async fn scenario_15_large_text_and_more_than_32_routes_replay_completely() -> R
     assert_eq!(replayed.text(), Some(text.as_str()));
     assert_eq!(replayed.delivery_ids(), delivered.delivery_ids());
     for (actual, expected) in replayed.deliveries.iter().zip(&delivered.deliveries) {
-        assert_eq!(actual.bytes, expected.bytes);
+        assert_eq!(actual.payload, expected.payload);
     }
     assert_eq!(harness.provider.calls.load(Ordering::SeqCst), 2);
     Ok(())
@@ -1446,8 +1426,10 @@ async fn scenario_16_cancel_terminalizes_every_active_request_on_work_item() -> 
     let second_bundle = final_bundle(&mut second, &second_id)?;
     for bundle in [&first_bundle, &second_bundle] {
         assert_eq!(bundle.deliveries.len(), 1);
-        assert_eq!(bundle.deliveries[0].manifest.payload_kind, "terminal_error");
-        assert_eq!(bundle.deliveries[0].payload["code"], "cancelled");
+        assert!(matches!(
+            &bundle.deliveries[0].payload,
+            FinalPayload::TerminalError { code, .. } if code == "cancelled"
+        ));
     }
     assert_eq!(
         harness
@@ -1461,7 +1443,7 @@ async fn scenario_16_cancel_terminalizes_every_active_request_on_work_item() -> 
                 "SELECT result_bundle_id FROM local_requests WHERE request_id='{first_id}'"
             ))
             .await?,
-        first_bundle.bundle_id
+        first_bundle.bundle_id.as_str()
     );
     assert_eq!(
         harness
@@ -1469,7 +1451,7 @@ async fn scenario_16_cancel_terminalizes_every_active_request_on_work_item() -> 
                 "SELECT result_bundle_id FROM local_requests WHERE request_id='{second_id}'"
             ))
             .await?,
-        second_bundle.bundle_id
+        second_bundle.bundle_id.as_str()
     );
     ack(
         &harness.socket,

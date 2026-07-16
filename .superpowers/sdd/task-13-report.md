@@ -27,7 +27,7 @@ the legacy gateway installer: it still generated gateway service names and
 arguments, did not bootstrap the runtime owner/config, did not preserve the
 required old-config behavior, and retained polling-gateway installation.
 
-After implementation and review correction, all 15 textual, golden, and sourced-shell
+After implementation and review correction, all 17 textual, golden, and sourced-shell
 behavior tests pass. They verify:
 
 - systemd `codrik.service` runs only `<binary> serve`;
@@ -38,11 +38,16 @@ behavior tests pass. They verify:
 - pre-write config, authorization, and service state distinguishes a clean
   install from an upgrade; an upgrade with absent/empty authorization never
   silently grants wildcard tools and never starts the service;
+- any existing installed binary, service, config directory, users/runtime
+  artifact, or legacy config makes the run an upgrade; a two-run binary-only
+  install cannot gain wildcard authorization on its second run;
 - the runtime directory is mode 0700 and `users.json` is mode 0600;
 - existing authorization remains byte-for-byte unchanged and requires an
   explicit actor-ID prompt;
-- valid quoted/unquoted runtime actor IDs are accepted, while empty, whitespace,
-  null, comment-only, collection, and malformed scalars block service startup;
+- hidden installer validation commands delegate to production `AppConfig` and
+  `AuthorizationStore` parsers; valid quoted/unquoted actor strings are accepted,
+  while YAML bool/number/null/duplicate fields and malformed/actorless JSON
+  block service startup;
 - a retained old config prints the exact `runtime.actor_id` YAML instruction
   and prevents service startup.
 
@@ -58,9 +63,9 @@ behavior tests pass. They verify:
 5. Resume joins a live run or replays its completion.
 6. Two requests share one work item and one active/terminal incorporated run,
    produce request-specific bundles/intents, and invoke the provider once.
-7. Four deterministic crash boundaries recover: durable ingress before
-   attachment, attachment/incorporation, committed model/tool checkpoint, and
-   terminal finalization before delivery ACK.
+7. Four deterministic crash boundaries recover: a live IPC ingress commit
+   before dispatch, live attachment/incorporation before the model, committed
+   model/tool checkpoint, and terminal finalization before delivery ACK.
 8. Lost final ACK redelivers the same bundle without model recomputation.
 9. A second daemon fails lock acquisition without removing the live socket.
 10. SIGTERM preserves resumable active state.
@@ -76,21 +81,28 @@ behavior tests pass. They verify:
 17. Ninety-six slow and 32 malformed clients remain bounded, after which a
     valid client succeeds.
 
-The final collector requires FinalBegin, every canonical ordered FinalChunk,
-and FinalEnd. Before returning typed payload bytes it verifies request, bundle,
-and delivery IDs; contiguous chunk order; canonical base64 partition and sizes;
-decoded totals; per-payload SHA-256 and kind; and the canonical manifest hash.
-No acceptance ACK is sent before this verification completes.
+`FinalBundleVerifier` is the production LocalRenderer assembler and verifier,
+not an acceptance copy. Both rendering and acceptance require FinalBegin, every
+canonical ordered FinalChunk, and FinalEnd through this same component. It
+checks request, bundle, and delivery IDs; duplicate IDs; aggregate limits;
+contiguous chunk order and exact chunk formula; canonical base64 partition and
+sizes; decoded totals; per-payload SHA-256 and kind; canonical manifest hash;
+exact JSON object shape; Unicode; artifact UUID/path/hash/u64 semantics; and
+missing/unknown/duplicate fields. It returns typed `FinalPayload` deliveries and
+ACK coordinates. No output or acceptance ACK occurs before verification.
 
 The harness uses short private temporary roots and non-recursive last-guard
 cleanup. Binary scenarios use a loopback-only scripted Responses API. Recovery
 scenarios use the production `app::serve` composition seam with an injected
 ManualClock and scripted `LlmStreamClient`, while still running the real
 supervisor, Unix server/socket, and on-disk SQLite. Production uses the same seam
-with SystemClock and OpenAI. It uses no hidden environment hooks, external
-network, or credentials. Expiry, backoff, and the fifth failure are driven by
-clock advancement and DB/provider rendezvous rather than raw timestamp rewrites
-or sleep-only crash boundaries.
+with SystemClock and OpenAI. Injectable runtime boundary hooks are zero-op in
+production; acceptance uses them to pause actual orchestration after ingress
+commit and after incorporation commit, proving scenario 7 A/B with running
+servers rather than direct database synthesis. It uses no hidden environment
+hooks, external network, or credentials. Expiry, backoff, and the fifth failure
+are driven by clock advancement and DB/provider rendezvous rather than raw
+timestamp rewrites or sleep-only crash boundaries.
 
 Focused RED tests also captured both production bugs before their fixes: the
 paused-time Unix-socket client test failed with `frame header deadline
@@ -105,6 +117,17 @@ cancellation Resume timed out while bundles were already claimed on Submit
 streams; and the initial deterministic in-process crash restart hit a stale
 component lifetime until the aborted supervisor task was awaited. Each now has
 a green focused regression path.
+
+The third review correction also followed RED/GREEN:
+
+- the shared verifier test first failed because `FinalBundleVerifier` did not
+  exist, then passed with LocalRenderer and acceptance on the same code path;
+- scenario 7 failed to compile until injectable runtime boundary hooks and the
+  hook-aware composition seam existed; the genuine live A/B crash scenario then
+  passed with zero model calls before each crash;
+- installer validator tests initially failed because the hidden command was
+  parsed as an ordinary prompt; production-parser commands and binary-aware
+  clean-state capture now pass all 17 installer tests.
 
 ## Ledger Minor Resolutions
 
@@ -162,7 +185,7 @@ The required commands were run in order:
 
 ```text
 rtk cargo fmt --check                              PASS
-rtk cargo test                                    PASS: 442 passed, 1 ignored, 0 failed
+rtk cargo test                                    PASS: 446 passed, 1 ignored, 0 failed
 rtk cargo check                                   PASS: 0 errors
 rtk cargo clippy --all-targets --all-features     PASS: 0 errors
 rtk git diff --check                              PASS
@@ -178,5 +201,9 @@ Original commit: `4c8ae2eefa63c451c34e1a1c6696916f2d6bf0a2`
 (`feat(runtime): ship the serve workflow`).
 
 Review-correction subject: `fix(runtime): harden serve acceptance and upgrades`.
+Commit: `71698d0aa671fcd1cd03531ceed2a97bd5932f3f`.
+
+Third-review correction subject:
+`fix(runtime): share final verification and validate upgrades`.
 Its resulting SHA is recorded in the handoff because this report is part of the
 correction commit.

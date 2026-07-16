@@ -20,11 +20,79 @@ fn run_library(script: &str, args: &[&Path]) -> std::process::Output {
         .arg(format!(". \"$1\"\n{script}"))
         .arg("sh")
         .arg(installer)
-        .env("CODRIK_INSTALL_LIBRARY_ONLY", "1");
+        .env("CODRIK_INSTALL_LIBRARY_ONLY", "1")
+        .env("CODRIK_VALIDATOR_BIN", env!("CARGO_BIN_EXE_codrik"));
     for arg in args {
         command.arg(arg);
     }
     command.output().unwrap()
+}
+
+fn run_validator(config: &Path, users: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_codrik"))
+        .arg("__installer_validate")
+        .arg(config)
+        .arg(users)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn installer_validator_uses_production_config_and_authorization_parsers() {
+    let root = temp_dir();
+    let config = root.join("config.yml");
+    let users = root.join("users.json");
+    fs::write(
+        &users,
+        br#"{"version":1,"actors":{"actor:existing:7":{"enabled":true,"display_name":null,"identities":[],"tools":[]}}}"#,
+    )
+    .unwrap();
+
+    for yaml in [
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: actor:existing:7\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: \"actor:existing:7\"\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: 'actor:existing:7'\n",
+    ] {
+        fs::write(&config, yaml).unwrap();
+        let output = run_validator(&config, &users);
+        assert!(
+            output.status.success(),
+            "{yaml}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "actor:existing:7\n"
+        );
+    }
+
+    for yaml in [
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: true\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: 7\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: null\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: actor:first\n  actor_id: actor:existing:7\n",
+    ] {
+        fs::write(&config, yaml).unwrap();
+        assert!(
+            !run_validator(&config, &users).status.success(),
+            "accepted invalid YAML: {yaml}"
+        );
+    }
+
+    fs::write(
+        &config,
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: actor:existing:7\n",
+    )
+    .unwrap();
+    for invalid_users in [
+        b"{}".as_slice(),
+        br#"{"version":1,"actors":{}}"#.as_slice(),
+        b"not-json".as_slice(),
+    ] {
+        fs::write(&users, invalid_users).unwrap();
+        assert!(!run_validator(&config, &users).status.success());
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -157,8 +225,7 @@ fn clean_and_empty_authorization_create_private_local_owner() {
 fn existing_authorization_remains_byte_for_byte_unchanged() {
     let root = temp_dir();
     let users = root.join("users.json");
-    let original =
-        b"{ \"version\": 1, \"actors\": { \"actor:existing:7\": {\"enabled\":true} } }\n";
+    let original = b"{ \"version\": 1, \"actors\": { \"actor:existing:7\": {\"enabled\":true,\"display_name\":null,\"identities\":[],\"tools\":[]} } }\n";
     fs::write(&users, original).unwrap();
     let selected = root.join("selected");
     let output = run_library(
@@ -263,30 +330,93 @@ printf 'clean=%s ready=%s\n' "$CLEAN_INTERACTIVE_INSTALL" "$CONFIGURED_RUNTIME_R
 }
 
 #[test]
-fn runtime_actor_parser_matches_valid_and_broken_yaml_scalars() {
+fn binary_only_first_run_makes_second_run_an_upgrade_without_wildcard_bootstrap() {
+    let root = temp_dir();
+    let install_dir = root.join("bin");
+    let installed = install_dir.join("codrik");
+    let config_dir = root.join("config");
+    let runtime_dir = root.join("runtime");
+    let service = root.join("service-started");
+    fs::create_dir_all(&install_dir).unwrap();
+    let output = run_library(
+        r#"
+is_interactive() { return 0; }
+ask_yes_no() { return 0; }
+ask_secret() { printf '%s\n' test-key; }
+ask() { printf '%s\n' "$2"; }
+SERVICE_MARKER="$6"
+install_serve_service() { touch "$SERVICE_MARKER"; }
+
+# First run used CODRIK_SKIP_CONFIG=1: only the downloaded binary exists.
+capture_install_state "$3" "$4" "$2"
+printf 'first_clean=%s\n' "$CLEAN_INTERACTIVE_INSTALL"
+cp "$5" "$2"
+chmod 755 "$2"
+
+# Second run sees the prior binary before replacing it and must be an upgrade.
+capture_install_state "$3" "$4" "$2"
+configure_codrik "$3" "$4"
+maybe_install_serve_service "$2"
+printf 'second_clean=%s ready=%s\n' "$CLEAN_INTERACTIVE_INSTALL" "$CONFIGURED_RUNTIME_READY"
+"#,
+        &[
+            &installed,
+            &config_dir,
+            &runtime_dir,
+            Path::new(env!("CARGO_BIN_EXE_codrik")),
+            &service,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("first_clean=1"));
+    assert!(stdout.contains("second_clean=0 ready=0"));
+    assert!(!runtime_dir.join("users.json").exists());
+    assert!(!service.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("did not grant tools"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn installer_shell_helper_delegates_runtime_validation_to_codrik() {
     let root = temp_dir();
     let config = root.join("config.yml");
-    for (yaml, expected) in [
-        ("runtime:\n  actor_id: actor:one\n", "actor:one"),
-        ("runtime:\n  actor_id: \"actor:two\"\n", "actor:two"),
-        ("runtime:\n  actor_id: 'actor:three'\n", "actor:three"),
+    let users = root.join("users.json");
+    fs::write(
+        &users,
+        br#"{"version":1,"actors":{"actor:existing:7":{"enabled":true,"display_name":null,"identities":[],"tools":[]}}}"#,
+    )
+    .unwrap();
+    for yaml in [
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: actor:existing:7\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: \"actor:existing:7\"\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: 'actor:existing:7'\n",
     ] {
         fs::write(&config, yaml).unwrap();
-        let output = run_library("runtime_actor_from_config \"$2\"", &[&config]);
+        let output = run_library(
+            "installer_validate_config \"$2\" \"$3\"",
+            &[&config, &users],
+        );
         assert!(output.status.success(), "{yaml}");
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "actor:existing:7"
+        );
     }
     for yaml in [
-        "runtime:\n  actor_id:\n",
-        "runtime:\n  actor_id: \"   \"\n",
-        "runtime:\n  actor_id: null\n",
-        "runtime:\n  actor_id: ~\n",
-        "runtime:\n  actor_id: # only a comment\n",
-        "runtime:\n  actor_id: [actor:bad]\n",
-        "runtime:\n  actor_id: \"unterminated\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: true\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: 7\n",
+        "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nruntime:\n  actor_id: null\n",
     ] {
         fs::write(&config, yaml).unwrap();
-        let output = run_library("runtime_actor_from_config \"$2\"", &[&config]);
+        let output = run_library(
+            "installer_validate_config \"$2\" \"$3\"",
+            &[&config, &users],
+        );
         assert!(!output.status.success(), "accepted invalid YAML: {yaml}");
     }
     fs::remove_dir_all(root).unwrap();
@@ -304,7 +434,7 @@ fn keeping_semantically_invalid_actor_config_preserves_bytes_and_refuses_service
     fs::write(config_dir.join("config.yml"), original).unwrap();
     fs::write(
         runtime_dir.join("users.json"),
-        br#"{"version":1,"actors":{"actor:existing:7":{"enabled":true}}}"#,
+        br#"{"version":1,"actors":{"actor:existing:7":{"enabled":true,"display_name":null,"identities":[],"tools":[]}}}"#,
     )
     .unwrap();
     let output = run_library(
@@ -335,8 +465,8 @@ fn keeping_valid_upgrade_config_preserves_authorization_and_allows_service() {
     let service = root.join("service-started");
     fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
-    let config = b"api_key: old\nruntime:\n  actor_id: 'actor:existing:7'\n";
-    let users = br#"{ "version": 1, "actors": { "actor:existing:7": {"enabled":true,"tools":[]} } }
+    let config = b"api_key: old\nbase_url: https://example.test/v1\nmodel: old\nruntime:\n  actor_id: 'actor:existing:7'\n";
+    let users = br#"{ "version": 1, "actors": { "actor:existing:7": {"enabled":true,"display_name":null,"identities":[],"tools":[]} } }
 "#;
     fs::write(config_dir.join("config.yml"), config).unwrap();
     fs::write(runtime_dir.join("users.json"), users).unwrap();

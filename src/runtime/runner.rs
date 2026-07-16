@@ -14,6 +14,7 @@ use crate::{
     },
     runtime::{
         artifacts::ArtifactManager,
+        hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
         model::{AttemptId, Clock, EventKind, OutboxId},
         observability::{
             NoopRuntimeLogger, RuntimeComponent, RuntimeErrorClass, RuntimeLogEvent, RuntimeLogger,
@@ -74,6 +75,7 @@ pub struct ActorRunner<L, T, S, C> {
     artifacts: ArtifactManager<S, C>,
     system_instructions: Option<String>,
     logger: Arc<dyn RuntimeLogger>,
+    hooks: Arc<dyn RuntimeBoundaryHooks>,
 }
 
 impl<L, T, S, C> ActorRunner<L, T, S, C>
@@ -104,6 +106,7 @@ where
             artifacts,
             system_instructions: None,
             logger: Arc::new(NoopRuntimeLogger),
+            hooks: Arc::new(NoopRuntimeBoundaryHooks),
         }
     }
 
@@ -120,7 +123,13 @@ where
         self
     }
 
+    pub fn with_boundary_hooks(mut self, hooks: Arc<dyn RuntimeBoundaryHooks>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
     pub async fn run_once(&self, owner: &str) -> Result<RunOnceOutcome> {
+        self.hooks.before_dispatch().await;
         let now = self.clock.now();
         let lease_until = now.plus_millis(duration_millis(self.limits.lease_duration)?);
         let Some(lease) = self
@@ -181,6 +190,7 @@ where
                 self.clock.now(),
             )
             .await?;
+        self.hooks.incorporation_committed(&run.request_ids).await;
 
         let context = RunContext::new();
         let mut tool_steps = 0;
