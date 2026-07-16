@@ -262,3 +262,11 @@ fn missing_runtime_actor_message_is_exact() {
         "Existing config is missing runtime.actor_id. Add exactly:\nruntime:\n  actor_id: <existing-actor-id>\nCodrik service was not started.\n"
     );
 }
+
+#[test]
+fn active_documentation_has_no_users_json_instructions() {
+    let readme = include_str!("../README.md");
+    assert!(!readme.contains("users.json"));
+    assert!(readme.contains("automatically creates the first actor"));
+    assert!(readme.contains(r#"tools: ["*"]"#));
+}

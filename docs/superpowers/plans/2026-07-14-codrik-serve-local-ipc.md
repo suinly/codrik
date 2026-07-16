@@ -1,5 +1,9 @@
 # Codrik Serve and Local IPC Implementation Plan
 
+> Superseded for actor bootstrap by
+> `docs/superpowers/specs/2026-07-16-sqlite-actor-bootstrap-design.md`.
+> `users.json` and legacy authorization import are no longer implemented.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `codrik serve` the single durable agent runtime and route local prompt, resume, cancel, streaming, and final delivery through an authenticated Unix-socket protocol.

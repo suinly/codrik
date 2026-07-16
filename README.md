@@ -15,11 +15,10 @@ The installer verifies the release checksum, installs `codrik` into
 `~/.local/bin`, and can create a user-level systemd or launchd service. The
 service runs `codrik serve`; Codrik never daemonizes itself.
 
-On a clean interactive install, `~/.codrik` is mode `0700`, `users.json` is
-mode `0600`, and the installer creates the enabled actor
-`actor:local:owner` with standard-tool authorization `tools: ["*"]`. Existing
-authorization is user-owned and is never rewritten; the installer asks which
-existing actor ID the runtime should use.
+On a clean interactive install, the installer writes
+`runtime.actor_id: actor:local:owner`. The first `codrik serve` run
+automatically creates the first actor in SQLite as enabled with standard-tool
+authorization `tools: ["*"]`.
 
 ## Configuration
 
@@ -65,7 +64,7 @@ runtime:
 | `model` | Yes | None | Model name sent to the configured provider. |
 | `attachments.max_file_size_mb` | No | `20` | Maximum accepted attachment size in MiB. |
 | `attachments.image_detail` | No | `auto` | Image detail: `auto`, `low`, or `high`. |
-| `runtime.actor_id` | For `serve` | None | Enabled actor configured in `users.json`. |
+| `runtime.actor_id` | For `serve` | None | Actor selected by the runtime; automatically created only when the actors table is empty. |
 | `runtime.database_path` | No | `<CODRIK_HOME>/runtime.sqlite` | Durable SQLite database. |
 | `runtime.socket_path` | No | `<CODRIK_HOME>/codrik.sock` | Private Unix socket. |
 | `runtime.lock_path` | No | `<CODRIK_HOME>/runtime.lock` | Exclusive server instance lock. |
@@ -87,20 +86,23 @@ Other relative paths remain relative to the working directory of
 `codrik serve`. Prefer the defaults or absolute paths when Codrik is managed
 by systemd, launchd, or another service manager.
 
-### Actor authorization
+### Actor bootstrap
 
 The `runtime` section is required by `codrik serve`, and `runtime.actor_id`
-must not be blank. The selected actor must exist in `users.json` and be
-enabled. On first startup, authorization is imported into SQLite. Codrik does
-not rewrite `users.json`, and subsequent startups use the durable imported
-authorization.
+must not be blank. On an empty SQLite database, Codrik creates the configured
+actor as enabled with `tools: ["*"]` before starting the runtime.
+
+Once any actor exists, bootstrap never creates another one. If
+`runtime.actor_id` names an absent actor in a nonempty database, startup fails
+instead of silently granting a new actor access. Disabled configured actors
+also prevent startup.
 
 ### Common configuration errors
 
 - `runtime configuration is required`: add `runtime.actor_id`.
 - `runtime.actor_id must not be blank`: configure a nonempty actor ID.
-- `configured runtime actor ... does not exist`: select an actor present in
-  `users.json`.
+- `configured runtime actor ... does not exist`: correct `runtime.actor_id` or
+  add the actor through an authorized runtime management path.
 - `configured runtime actor ... is disabled`: enable the selected actor or
   choose another one.
 - Unsafe, writable, or symlinked runtime directories are rejected before the

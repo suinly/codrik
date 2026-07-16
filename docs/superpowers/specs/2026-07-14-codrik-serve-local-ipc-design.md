@@ -1,5 +1,9 @@
 # Codrik Serve, Local IPC, and Durable Delivery Design
 
+> Superseded for actor bootstrap by
+> `docs/superpowers/specs/2026-07-16-sqlite-actor-bootstrap-design.md`.
+> `users.json` and legacy authorization import are no longer implemented.
+
 ## Goal
 
 Turn the internal durable kernel into the only interactive execution path for
