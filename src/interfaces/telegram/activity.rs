@@ -301,8 +301,8 @@ mod tests {
     use super::TelegramActivityWorker;
     use crate::{
         interfaces::telegram::api::{
-            EditMessageText, SendChatAction, SendFile, SendMessage, SetWebhook, TelegramApi,
-            TelegramApiError, TelegramMessageRef, WebhookInfo,
+            EditMessageText, SendChatAction, SendFile, SendMessage, SendRichMessage, SetWebhook,
+            TelegramApi, TelegramApiError, TelegramMessageRef, WebhookInfo,
         },
         llm::client::AgentActivityEvent,
         runtime::{
@@ -346,6 +346,13 @@ mod tests {
             assert!(command.reply_parameters.is_none());
             self.sent.lock().unwrap().push(command.text);
             Ok(TelegramMessageRef { message_id: 77 })
+        }
+
+        async fn send_rich_message(
+            &self,
+            _command: SendRichMessage,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
         }
 
         async fn send_chat_action(

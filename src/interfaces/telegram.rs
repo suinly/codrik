@@ -197,8 +197,8 @@ mod tests {
 
     use super::{
         api::{
-            EditMessageText, SendFile, SendMessage, SetWebhook, TelegramApi, TelegramApiError,
-            TelegramMessageRef, WebhookInfo,
+            EditMessageText, SendFile, SendMessage, SendRichMessage, SetWebhook, TelegramApi,
+            TelegramApiError, TelegramMessageRef, WebhookInfo,
         },
         prepare_with_api,
         types::TelegramBot,
@@ -261,6 +261,13 @@ mod tests {
         async fn send_message(
             &self,
             _command: SendMessage,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn send_rich_message(
+            &self,
+            _command: SendRichMessage,
         ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
             unreachable!()
         }

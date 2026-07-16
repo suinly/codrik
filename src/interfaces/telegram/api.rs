@@ -82,6 +82,17 @@ pub struct SendMessage {
 }
 
 #[derive(Clone, Serialize)]
+pub struct InputRichMessage {
+    pub markdown: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SendRichMessage {
+    pub chat_id: String,
+    pub rich_message: InputRichMessage,
+}
+
+#[derive(Clone, Serialize)]
 pub struct EditMessageText {
     pub chat_id: String,
     pub message_id: i64,
@@ -127,6 +138,10 @@ pub trait TelegramApi: Send + Sync {
     async fn send_message(
         &self,
         command: SendMessage,
+    ) -> Result<TelegramMessageRef, TelegramApiError>;
+    async fn send_rich_message(
+        &self,
+        command: SendRichMessage,
     ) -> Result<TelegramMessageRef, TelegramApiError>;
     async fn send_chat_action(&self, command: SendChatAction) -> Result<(), TelegramApiError>;
     async fn edit_message_text(&self, command: EditMessageText) -> Result<(), TelegramApiError>;
@@ -292,6 +307,13 @@ impl TelegramApi for ReqwestTelegramApi {
         self.post_json("sendMessage", &command, false).await
     }
 
+    async fn send_rich_message(
+        &self,
+        command: SendRichMessage,
+    ) -> Result<TelegramMessageRef, TelegramApiError> {
+        self.post_json("sendRichMessage", &command, false).await
+    }
+
     async fn send_chat_action(&self, command: SendChatAction) -> Result<(), TelegramApiError> {
         let _: bool = self.post_json("sendChatAction", &command, true).await?;
         Ok(())
@@ -414,8 +436,8 @@ mod tests {
     };
 
     use super::{
-        ReqwestTelegramApi, SendChatAction, SendMessage, TelegramApi, TelegramApiErrorClass,
-        TelegramChatAction,
+        InputRichMessage, ReqwestTelegramApi, SendChatAction, SendMessage, SendRichMessage,
+        TelegramApi, TelegramApiErrorClass, TelegramChatAction,
     };
 
     #[tokio::test]
@@ -479,6 +501,48 @@ mod tests {
             action: TelegramChatAction::Typing,
         })
         .await?;
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_rich_message_posts_original_markdown() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 8192];
+            let read = socket.read(&mut request).await?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /botsecret-token/sendRichMessage "));
+            assert!(request.contains(r#""chat_id":"100""#));
+            assert!(request.contains(r##""rich_message":{"markdown":"# Title\n\n| A | B |"}"##));
+            assert!(!request.contains("parse_mode"));
+            assert!(!request.contains("reply_parameters"));
+            let body = r#"{"ok":true,"result":{"message_id":88}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            anyhow::Ok(())
+        });
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &base)?;
+
+        let sent = api
+            .send_rich_message(SendRichMessage {
+                chat_id: "100".into(),
+                rich_message: InputRichMessage {
+                    markdown: "# Title\n\n| A | B |".into(),
+                },
+            })
+            .await?;
+
+        assert_eq!(sent.message_id, 88);
         server.await??;
         Ok(())
     }

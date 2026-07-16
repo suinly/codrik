@@ -1591,8 +1591,8 @@ mod telegram_acceptance {
         interfaces::telegram::{
             activity::TelegramActivityWorker,
             api::{
-                EditMessageText, SendChatAction, SendFile, SendMessage, SetWebhook, TelegramApi,
-                TelegramApiError, TelegramMessageRef, WebhookInfo,
+                EditMessageText, SendChatAction, SendFile, SendMessage, SendRichMessage,
+                SetWebhook, TelegramApi, TelegramApiError, TelegramMessageRef, WebhookInfo,
             },
             delivery::TelegramDeliveryWorker,
             prepare_with_api,
@@ -1659,6 +1659,13 @@ mod telegram_acceptance {
             }
             self.sent.lock().unwrap().push(command.text);
             Ok(TelegramMessageRef { message_id: 77 })
+        }
+
+        async fn send_rich_message(
+            &self,
+            _command: SendRichMessage,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
         }
 
         async fn send_chat_action(

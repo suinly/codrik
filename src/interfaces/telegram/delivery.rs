@@ -378,8 +378,8 @@ mod tests {
     use crate::{
         interfaces::telegram::{
             api::{
-                EditMessageText, SendFile, SendMessage, SetWebhook, TelegramApi, TelegramApiError,
-                TelegramApiErrorClass, TelegramMessageRef, WebhookInfo,
+                EditMessageText, SendFile, SendMessage, SendRichMessage, SetWebhook, TelegramApi,
+                TelegramApiError, TelegramApiErrorClass, TelegramMessageRef, WebhookInfo,
             },
             types::TelegramBot,
         },
@@ -458,6 +458,13 @@ mod tests {
                 .unwrap()
                 .push((command.chat_id, command.text));
             self.response().await
+        }
+
+        async fn send_rich_message(
+            &self,
+            _command: SendRichMessage,
+        ) -> Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
         }
 
         async fn send_chat_action(
