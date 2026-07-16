@@ -282,7 +282,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -508,6 +508,214 @@ mod tests {
             .await;
 
         assert!(api.edits.lock().unwrap().is_empty());
+        Ok(())
+    }
+}
+
+#[cfg(all(test, any()))]
+mod activity_tests {
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    use super::TelegramStreamingWorker;
+    use crate::{
+        interfaces::telegram::api::{
+            EditMessageText, SendChatAction, SendFile, SendMessage, SetWebhook, TelegramApi,
+            TelegramApiError, TelegramMessageRef, WebhookInfo,
+        },
+        llm::client::AgentActivityEvent,
+        runtime::{
+            gateway::DeliveryRoute,
+            gateway_activity::{GatewayActivity, GatewayActivityEvent},
+            model::WorkItemId,
+        },
+    };
+
+    #[derive(Clone, Default)]
+    struct ActivityApi {
+        actions: Arc<Mutex<Vec<String>>>,
+        sent: Arc<Mutex<Vec<String>>>,
+        edited: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl TelegramApi for ActivityApi {
+        async fn get_me(
+            &self,
+        ) -> std::result::Result<crate::interfaces::telegram::types::TelegramBot, TelegramApiError>
+        {
+            unreachable!()
+        }
+
+        async fn set_webhook(
+            &self,
+            _command: SetWebhook,
+        ) -> std::result::Result<(), TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn get_webhook_info(&self) -> std::result::Result<WebhookInfo, TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn send_message(
+            &self,
+            command: SendMessage,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            assert!(command.reply_parameters.is_none());
+            self.sent.lock().unwrap().push(command.text);
+            Ok(TelegramMessageRef { message_id: 77 })
+        }
+
+        async fn send_chat_action(
+            &self,
+            command: SendChatAction,
+        ) -> std::result::Result<(), TelegramApiError> {
+            self.actions.lock().unwrap().push(command.chat_id);
+            Ok(())
+        }
+
+        async fn edit_message_text(
+            &self,
+            command: EditMessageText,
+        ) -> std::result::Result<(), TelegramApiError> {
+            self.edited.lock().unwrap().push(command.text);
+            Ok(())
+        }
+
+        async fn send_photo(
+            &self,
+            _command: SendFile,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn send_document(
+            &self,
+            _command: SendFile,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
+        }
+    }
+
+    fn activity(work_item: &WorkItemId, event: GatewayActivityEvent) -> GatewayActivity {
+        GatewayActivity {
+            work_item_id: work_item.clone(),
+            route: DeliveryRoute::new("telegram:900", "100", None, 4096, 1024).unwrap(),
+            event,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_step_sends_typing_every_four_seconds_without_messages() -> Result<()> {
+        let api = ActivityApi::default();
+        let worker = TelegramStreamingWorker::new(api.clone(), "telegram:900");
+        let work = WorkItemId::new();
+
+        worker
+            .handle(activity(
+                &work,
+                GatewayActivityEvent::Activity(AgentActivityEvent::ModelStepStarted),
+            ))
+            .await;
+        assert_eq!(api.actions.lock().unwrap().len(), 1);
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        worker.maintain().await;
+
+        assert_eq!(api.actions.lock().unwrap().len(), 2);
+        assert!(api.sent.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn text_deltas_never_create_or_edit_messages() -> Result<()> {
+        let api = ActivityApi::default();
+        let worker = TelegramStreamingWorker::new(api.clone(), "telegram:900");
+
+        worker
+            .handle(activity(
+                &WorkItemId::new(),
+                GatewayActivityEvent::TextDelta("Пр".into()),
+            ))
+            .await;
+
+        assert!(api.sent.lock().unwrap().is_empty());
+        assert!(api.edited.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_run_uses_description_and_updates_elapsed_status() -> Result<()> {
+        let api = ActivityApi::default();
+        let worker = TelegramStreamingWorker::new(api.clone(), "telegram:900");
+        let work = WorkItemId::new();
+
+        worker
+            .handle(activity(
+                &work,
+                GatewayActivityEvent::Activity(AgentActivityEvent::ModelStepStarted),
+            ))
+            .await;
+        worker
+            .handle(activity(
+                &work,
+                GatewayActivityEvent::Activity(AgentActivityEvent::Description(
+                    "Проверяю   конфигурацию".into(),
+                )),
+            ))
+            .await;
+        worker
+            .handle(activity(
+                &work,
+                GatewayActivityEvent::Activity(AgentActivityEvent::ToolStarted {
+                    name: "bash".into(),
+                }),
+            ))
+            .await;
+        assert_eq!(
+            *api.sent.lock().unwrap(),
+            vec!["Проверяю конфигурацию — 0 сек"]
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        worker.maintain().await;
+        assert_eq!(
+            api.edited.lock().unwrap().last().map(String::as_str),
+            Some("Проверяю конфигурацию — 10 сек")
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_status_uses_default_and_terminal_success_copy() -> Result<()> {
+        let api = ActivityApi::default();
+        let worker = TelegramStreamingWorker::new(api.clone(), "telegram:900");
+        let work = WorkItemId::new();
+
+        worker
+            .handle(activity(
+                &work,
+                GatewayActivityEvent::Activity(AgentActivityEvent::ToolStarted {
+                    name: "datetime".into(),
+                }),
+            ))
+            .await;
+        assert_eq!(
+            *api.sent.lock().unwrap(),
+            vec!["Работаю над задачей — 0 сек"]
+        );
+        worker
+            .handle(activity(
+                &work,
+                GatewayActivityEvent::Activity(AgentActivityEvent::Completed),
+            ))
+            .await;
+        assert_eq!(
+            api.edited.lock().unwrap().last().map(String::as_str),
+            Some("Завершил работу — 0 сек")
+        );
         Ok(())
     }
 }

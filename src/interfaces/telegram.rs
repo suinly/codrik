@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod api;
 pub mod delivery;
 pub mod streaming;
@@ -15,9 +16,9 @@ use tokio::{net::TcpListener, sync::watch};
 use crate::{
     config::ValidatedTelegramConfig,
     interfaces::telegram::{
+        activity::TelegramActivityWorker,
         api::{ReqwestTelegramApi, SetWebhook, TelegramApi},
         delivery::TelegramDeliveryWorker,
-        streaming::TelegramStreamingWorker,
         webhook::{SecretToken, TelegramIngressService, TelegramWebhookServer},
     },
     runtime::{
@@ -96,14 +97,9 @@ where
     }
 
     pub async fn streaming(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
-        TelegramStreamingWorker::new(
-            self.store.clone(),
-            self.api.clone(),
-            self.clock.clone(),
-            self.gateway.clone(),
-        )
-        .run(self.activity.subscribe(), shutdown)
-        .await
+        TelegramActivityWorker::new(self.api.clone(), self.gateway.clone())
+            .run(self.activity.subscribe(), shutdown)
+            .await
     }
 }
 
