@@ -220,12 +220,17 @@ attachments are ignored. Outbound replies support text and managed files.
 JPEG, PNG, and WebP files up to 10 MiB use Telegram photo delivery; other
 managed files up to 50 MiB use document delivery.
 
-Streaming updates such as `Thinking…` and partial text edits are transient and
-best effort. They may be dropped during overload, restart, or a Telegram API
-failure. Final text chunks and files are stored in SQLite before transport and
-are delivered by a separate durable worker. Final text is split at Unicode
-boundaries to Telegram's 4096-character limit; captions use a 1024-character
-limit.
+While the model is generating, Codrik sends Telegram's `typing` chat action
+every four seconds. Text deltas are not posted or edited into the chat. When
+the agent starts a tool, Codrik posts a transient elapsed-time status such as
+`Работаю над задачей — 10 сек`; an LLM-provided activity description replaces
+the default text when available.
+
+Only the durable final assistant text and files are delivered. In private chats
+these messages do not use Telegram's reply-to UI because the conversation
+target is already unambiguous. Final text is stored in SQLite before transport
+and split at Unicode boundaries to Telegram's 4096-character limit; captions
+use a 1024-character limit.
 
 Telegram API retryable failures use bounded exponential backoff. A Telegram
 `429 retry_after` value takes precedence. Terminal API responses are recorded

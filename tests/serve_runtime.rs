@@ -401,6 +401,7 @@ impl Drop for RuntimeHarness {
 #[derive(Clone)]
 enum InjectedReply {
     Text(String),
+    PartialThenFinal { delta: String, final_text: String },
     ToolCall,
     Failure,
 }
@@ -477,6 +478,14 @@ impl codrik::llm::client::LlmStreamClient for InjectedLlm {
                     .await?;
                 Ok(codrik::llm::client::LlmResponse {
                     content: text,
+                    tool_calls: Vec::new(),
+                })
+            }
+            InjectedReply::PartialThenFinal { delta, final_text } => {
+                sink.on_event(codrik::llm::client::LlmStreamEvent::TextDelta(delta))
+                    .await?;
+                Ok(codrik::llm::client::LlmResponse {
+                    content: final_text,
                     tool_calls: Vec::new(),
                 })
             }
@@ -1580,13 +1589,13 @@ mod telegram_acceptance {
     use codrik::{
         config::ValidatedTelegramConfig,
         interfaces::telegram::{
+            activity::TelegramActivityWorker,
             api::{
-                EditMessageText, SendFile, SendMessage, SetWebhook, TelegramApi, TelegramApiError,
-                TelegramMessageRef, WebhookInfo,
+                EditMessageText, SendChatAction, SendFile, SendMessage, SetWebhook, TelegramApi,
+                TelegramApiError, TelegramMessageRef, WebhookInfo,
             },
             delivery::TelegramDeliveryWorker,
             prepare_with_api,
-            streaming::TelegramStreamingWorker,
         },
         runtime::{
             artifacts::ArtifactManager,
@@ -1606,6 +1615,8 @@ mod telegram_acceptance {
     struct TelegramApiMock {
         sent: Arc<Mutex<Vec<String>>>,
         edited: Arc<Mutex<Vec<String>>>,
+        actions: Arc<Mutex<Vec<String>>>,
+        reply_message_ids: Arc<Mutex<Vec<i64>>>,
     }
 
     #[async_trait]
@@ -1640,14 +1651,21 @@ mod telegram_acceptance {
             &self,
             command: SendMessage,
         ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            if let Some(reply) = command.reply_parameters {
+                self.reply_message_ids
+                    .lock()
+                    .unwrap()
+                    .push(reply.message_id);
+            }
             self.sent.lock().unwrap().push(command.text);
             Ok(TelegramMessageRef { message_id: 77 })
         }
 
         async fn send_chat_action(
             &self,
-            _command: codrik::interfaces::telegram::api::SendChatAction,
+            command: SendChatAction,
         ) -> std::result::Result<(), TelegramApiError> {
+            self.actions.lock().unwrap().push(command.chat_id);
             Ok(())
         }
 
@@ -1808,12 +1826,7 @@ mod telegram_acceptance {
         assert_eq!(text_response.status(), reqwest::StatusCode::OK);
         assert_eq!(counts(&database).await?, (1, 1, 1, 1, 1));
 
-        let streaming = Arc::new(TelegramStreamingWorker::new(
-            store.clone(),
-            api.clone(),
-            clock.clone(),
-            "telegram:900",
-        ));
+        let streaming = Arc::new(TelegramActivityWorker::new(api.clone(), "telegram:900"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let streaming_task = {
             let streaming = streaming.clone();
@@ -1825,7 +1838,10 @@ mod telegram_acceptance {
             activity,
         ));
         let runner = ActorRunner::new(
-            InjectedLlm::new(vec![InjectedReply::Text("durable final".into())]),
+            InjectedLlm::new(vec![InjectedReply::PartialThenFinal {
+                delta: "Пр".into(),
+                final_text: "Привет! Полный ответ.".into(),
+            }]),
             ToolRegistry::new(),
             signals,
             events,
@@ -1846,21 +1862,18 @@ mod telegram_acceptance {
             root.join("artifacts"),
         );
         assert_eq!(restarted_delivery.run_once().await?, 1);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if api
-                    .edited
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|text| text == "durable final")
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
+        let sent = api.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            vec![
+                "This channel is now linked.".to_owned(),
+                "Привет! Полный ответ.".to_owned()
+            ]
+        );
+        assert!(!sent.iter().any(|text| text == "Пр" || text == "Thinking…"));
+        assert!(api.edited.lock().unwrap().is_empty());
+        assert!(api.reply_message_ids.lock().unwrap().is_empty());
+        assert!(!api.actions.lock().unwrap().is_empty());
 
         for replay in [&link_update, &text_update] {
             let response = client

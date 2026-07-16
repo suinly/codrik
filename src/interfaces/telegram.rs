@@ -1,7 +1,6 @@
 pub mod activity;
 pub mod api;
 pub mod delivery;
-pub mod streaming;
 pub mod types;
 pub mod webhook;
 
@@ -26,7 +25,7 @@ use crate::{
         identity_link::IdentityLinkManager,
         model::Clock,
         signals::ActorSignals,
-        store::{ActorStore, GatewayDeliveryStore, GatewayStreamStore, IngressStore},
+        store::{ActorStore, GatewayDeliveryStore, IngressStore},
     },
 };
 
@@ -47,14 +46,7 @@ pub struct PreparedTelegramGateway<S, A, C> {
 
 impl<S, A, C> PreparedTelegramGateway<S, A, C>
 where
-    S: ActorStore
-        + IngressStore
-        + GatewayDeliveryStore
-        + GatewayStreamStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    S: ActorStore + IngressStore + GatewayDeliveryStore + Clone + Send + Sync + 'static,
     A: TelegramApi + Clone + Send + Sync + 'static,
     C: Clock,
 {
@@ -143,14 +135,7 @@ pub async fn prepare_with_api<S, A, C>(
     api: A,
 ) -> Result<PreparedTelegramGateway<S, A, C>>
 where
-    S: ActorStore
-        + IngressStore
-        + GatewayDeliveryStore
-        + GatewayStreamStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    S: ActorStore + IngressStore + GatewayDeliveryStore + Clone + Send + Sync + 'static,
     A: TelegramApi + Clone + Send + Sync + 'static,
     C: Clock,
 {

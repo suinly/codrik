@@ -7,17 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
 use crate::{
-    interfaces::telegram::{
-        api::{
-            EditMessageText, ReplyParameters, SendFile, SendMessage, TelegramApi, TelegramApiError,
-            TelegramApiErrorClass, TelegramMessageRef,
-        },
-        streaming::lock_gateway_stream,
+    interfaces::telegram::api::{
+        SendFile, SendMessage, TelegramApi, TelegramApiError, TelegramApiErrorClass,
+        TelegramMessageRef,
     },
     runtime::{
         gateway::{ClaimedGatewayDelivery, GatewayDeliveryState},
         model::Clock,
-        store::{GatewayDeliveryStore, GatewayStreamStore, OutboxPayload},
+        store::{GatewayDeliveryStore, OutboxPayload},
     },
 };
 
@@ -33,12 +30,6 @@ const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
 enum DeliveryError {
     Api(TelegramApiError),
     Terminal(&'static str),
-    StreamEditTerminal,
-}
-
-struct DeliverySuccess {
-    message: TelegramMessageRef,
-    edited_stream: bool,
 }
 
 pub struct TelegramDeliveryWorker<S, A, C> {
@@ -52,7 +43,7 @@ pub struct TelegramDeliveryWorker<S, A, C> {
 
 impl<S, A, C> TelegramDeliveryWorker<S, A, C>
 where
-    S: GatewayDeliveryStore + GatewayStreamStore,
+    S: GatewayDeliveryStore,
     A: TelegramApi,
     C: Clock,
 {
@@ -132,66 +123,20 @@ where
             return Ok(());
         };
 
-        let _stream_guard = if delivery.ordinal == 0
-            && let Some(work_item) = &delivery.work_item_id
-        {
-            Some(lock_gateway_stream(work_item, &delivery.route).await)
-        } else {
-            None
-        };
-        let stream_message_id = if delivery.ordinal == 0 {
-            match &delivery.work_item_id {
-                Some(work_item) => self
-                    .store
-                    .claim_gateway_stream_for_final(work_item, &delivery.route, self.clock.now())
-                    .await?
-                    .and_then(|value| value.parse::<i64>().ok()),
-                None => None,
-            }
-        } else {
-            None
-        };
-        if stream_message_id.is_some()
-            && !self
-                .store
-                .set_gateway_delivery_retry_safe(&claim, true, self.clock.now())
-                .await?
-        {
-            bail!("Telegram delivery claim was lost before retry-safe edit");
-        }
-        let (mut claim, mut result) = self
-            .send_with_renewals(claim, &delivery, stream_message_id)
-            .await?;
-        if matches!(result, Err(DeliveryError::StreamEditTerminal)) {
-            if !self
-                .store
-                .set_gateway_delivery_retry_safe(&claim, false, self.clock.now())
-                .await?
-            {
-                bail!("Telegram delivery claim was lost before send fallback");
-            }
-            (claim, result) = self.send_with_renewals(claim, &delivery, None).await?;
-        }
+        let (claim, result) = self.send_with_renewals(claim, &delivery).await?;
         let transition_time = self.clock.now();
         match result {
-            Ok(success) => {
+            Ok(message) => {
                 if !self
                     .store
                     .complete_gateway_delivery(
                         &claim,
-                        Some(success.message.message_id.to_string()),
+                        Some(message.message_id.to_string()),
                         transition_time,
                     )
                     .await?
                 {
                     bail!("Telegram delivery claim was lost after transport completed");
-                }
-                if success.edited_stream
-                    && let Some(work_item) = &delivery.work_item_id
-                {
-                    self.store
-                        .close_gateway_stream(work_item, &delivery.route, transition_time)
-                        .await?;
                 }
             }
             Err(DeliveryError::Terminal(summary)) => {
@@ -209,7 +154,6 @@ where
                     bail!("Telegram delivery claim was lost before terminal transition");
                 }
             }
-            Err(DeliveryError::StreamEditTerminal) => unreachable!("fallback handled above"),
             Err(DeliveryError::Api(error)) => match error.class() {
                 TelegramApiErrorClass::Retryable { retry_after } => {
                     if !self
@@ -270,12 +214,11 @@ where
         &self,
         mut claim: crate::runtime::gateway::GatewayDeliveryClaim,
         delivery: &ClaimedGatewayDelivery,
-        stream_message_id: Option<i64>,
     ) -> Result<(
         crate::runtime::gateway::GatewayDeliveryClaim,
-        std::result::Result<DeliverySuccess, DeliveryError>,
+        std::result::Result<TelegramMessageRef, DeliveryError>,
     )> {
-        let transport = self.send_payload(delivery, stream_message_id);
+        let transport = self.send_payload(delivery);
         tokio::pin!(transport);
         let mut renewal =
             tokio::time::interval_at(tokio::time::Instant::now() + RENEW_INTERVAL, RENEW_INTERVAL);
@@ -301,49 +244,17 @@ where
     async fn send_payload(
         &self,
         delivery: &ClaimedGatewayDelivery,
-        stream_message_id: Option<i64>,
-    ) -> std::result::Result<DeliverySuccess, DeliveryError> {
+    ) -> std::result::Result<TelegramMessageRef, DeliveryError> {
         match &delivery.payload {
-            OutboxPayload::Text { text } => {
-                if let Some(message_id) = stream_message_id {
-                    match self
-                        .api
-                        .edit_message_text(EditMessageText {
-                            chat_id: delivery.route.address.clone(),
-                            message_id,
-                            text: text.clone(),
-                        })
-                        .await
-                        .map(|()| DeliverySuccess {
-                            message: TelegramMessageRef { message_id },
-                            edited_stream: true,
-                        }) {
-                        Ok(success) => return Ok(success),
-                        Err(error) if !matches!(error.class(), TelegramApiErrorClass::Terminal) => {
-                            return Err(DeliveryError::Api(error));
-                        }
-                        Err(_) => return Err(DeliveryError::StreamEditTerminal),
-                    }
-                }
-                let reply_parameters = delivery
-                    .route
-                    .reply_to_external_id
-                    .as_deref()
-                    .and_then(|value| value.parse::<i64>().ok())
-                    .map(|message_id| ReplyParameters { message_id });
-                self.api
-                    .send_message(SendMessage {
-                        chat_id: delivery.route.address.clone(),
-                        text: text.clone(),
-                        reply_parameters,
-                    })
-                    .await
-                    .map(|message| DeliverySuccess {
-                        message,
-                        edited_stream: false,
-                    })
-                    .map_err(DeliveryError::Api)
-            }
+            OutboxPayload::Text { text } => self
+                .api
+                .send_message(SendMessage {
+                    chat_id: delivery.route.address.clone(),
+                    text: text.clone(),
+                    reply_parameters: None,
+                })
+                .await
+                .map_err(DeliveryError::Api),
             OutboxPayload::File {
                 managed_path,
                 display_name,
@@ -380,10 +291,6 @@ where
                 } else {
                     self.api.send_document(command).await
                 }
-                .map(|message| DeliverySuccess {
-                    message,
-                    edited_stream: false,
-                })
                 .map_err(DeliveryError::Api)
             }
             OutboxPayload::TerminalError { .. } => Err(DeliveryError::Terminal(
@@ -457,7 +364,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -493,7 +400,6 @@ mod tests {
         delay: Duration,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
-        terminal_edit: Arc<AtomicBool>,
     }
 
     impl RecordingApi {
@@ -565,13 +471,6 @@ mod tests {
             &self,
             command: EditMessageText,
         ) -> Result<(), TelegramApiError> {
-            if self.terminal_edit.load(Ordering::SeqCst) {
-                return Err(TelegramApiError::classified(
-                    TelegramApiErrorClass::Terminal,
-                    "editMessageText",
-                    "message not found",
-                ));
-            }
             self.edits
                 .lock()
                 .unwrap()
@@ -919,7 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_final_text_edits_known_stream_and_later_text_sends() -> Result<()> {
+    async fn final_text_ignores_legacy_stream_and_sends_new_message() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         let api = RecordingApi::default();
         let worker = TelegramDeliveryWorker::new(
@@ -948,73 +847,32 @@ mod tests {
             remote_message_id: None,
         };
 
-        let edited = worker
-            .send_payload(&delivery, Some(77))
+        let sent = worker
+            .send_payload(&delivery)
             .await
-            .expect("stream edit succeeds");
-        assert!(edited.edited_stream);
-        assert_eq!(*api.edits.lock().unwrap(), vec![(77, "final".into())]);
-        assert!(api.messages.lock().unwrap().is_empty());
+            .expect("final send succeeds");
+        assert_eq!(sent.message_id, 77);
+        assert!(api.edits.lock().unwrap().is_empty());
+        assert_eq!(
+            *api.messages.lock().unwrap(),
+            vec![("100".into(), "final".into())]
+        );
 
         delivery.ordinal = 1;
         delivery.payload = OutboxPayload::Text {
             text: "continued".into(),
         };
         let sent = worker
-            .send_payload(&delivery, None)
+            .send_payload(&delivery)
             .await
             .expect("later chunk send succeeds");
-        assert!(!sent.edited_stream);
+        assert_eq!(sent.message_id, 77);
         assert_eq!(
             *api.messages.lock().unwrap(),
-            vec![("100".into(), "continued".into())]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn terminal_stream_edit_failure_falls_back_to_durable_send() -> Result<()> {
-        let store = SqliteRuntimeStore::open_in_memory().await?;
-        let api = RecordingApi::default();
-        api.terminal_edit.store(true, Ordering::SeqCst);
-        let worker = TelegramDeliveryWorker::new(
-            store,
-            api.clone(),
-            ManualClock::new(10),
-            "telegram:900",
-            "worker-1",
-            std::env::temp_dir(),
-        );
-        let delivery = crate::runtime::gateway::ClaimedGatewayDelivery {
-            claim: crate::runtime::gateway::GatewayDeliveryClaim {
-                id: crate::runtime::model::GatewayDeliveryId::new(),
-                owner: "worker-1".into(),
-                expires_at: Timestamp(1_000),
-            },
-            intent_key: "final:fallback".into(),
-            source_outbox_id: None,
-            work_item_id: Some(crate::runtime::model::WorkItemId::new()),
-            ordinal: 0,
-            route: route("100")?,
-            payload: OutboxPayload::Text {
-                text: "durable fallback".into(),
-            },
-            attempt_count: 1,
-            remote_message_id: None,
-        };
-
-        assert!(matches!(
-            worker.send_payload(&delivery, Some(77)).await,
-            Err(super::DeliveryError::StreamEditTerminal)
-        ));
-        let sent = worker
-            .send_payload(&delivery, None)
-            .await
-            .expect("terminal edit failure falls back to send");
-        assert!(!sent.edited_stream);
-        assert_eq!(
-            *api.messages.lock().unwrap(),
-            vec![("100".into(), "durable fallback".into())]
+            vec![
+                ("100".into(), "final".into()),
+                ("100".into(), "continued".into())
+            ]
         );
         Ok(())
     }
