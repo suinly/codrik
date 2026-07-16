@@ -355,6 +355,7 @@ fn is_stale_provider_file_error(message: &str) -> bool {
 struct StreamAccumulator {
     completed: Option<Response>,
     text: std::collections::BTreeMap<(u32, u32), String>,
+    tool_calls: std::collections::BTreeMap<u32, LlmToolCall>,
 }
 
 impl StreamAccumulator {
@@ -378,6 +379,14 @@ impl StreamAccumulator {
             }
             ResponseStreamEvent::ResponseOutputItemAdded(event) => {
                 if let OutputItem::FunctionCall(function_call) = event.item {
+                    self.tool_calls.insert(
+                        event.output_index,
+                        LlmToolCall {
+                            id: function_call.call_id.clone(),
+                            name: function_call.name.clone(),
+                            arguments: function_call.arguments,
+                        },
+                    );
                     sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
                         index: event.output_index,
                         id: Some(function_call.call_id),
@@ -390,6 +399,15 @@ impl StreamAccumulator {
             ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event)
                 if !event.delta.is_empty() =>
             {
+                self.tool_calls
+                    .entry(event.output_index)
+                    .or_insert_with(|| LlmToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    })
+                    .arguments
+                    .push_str(&event.delta);
                 sink.on_event(LlmStreamEvent::ToolCallDelta(LlmToolCallDelta {
                     index: event.output_index,
                     id: None,
@@ -397,6 +415,32 @@ impl StreamAccumulator {
                     arguments: Some(event.delta),
                 }))
                 .await?;
+            }
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDone(event) => {
+                let tool_call = self
+                    .tool_calls
+                    .entry(event.output_index)
+                    .or_insert_with(|| LlmToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                if let Some(name) = event.name {
+                    tool_call.name = name;
+                }
+                tool_call.arguments = event.arguments;
+            }
+            ResponseStreamEvent::ResponseOutputItemDone(event) => {
+                if let OutputItem::FunctionCall(function_call) = event.item {
+                    self.tool_calls.insert(
+                        event.output_index,
+                        LlmToolCall {
+                            id: function_call.call_id,
+                            name: function_call.name,
+                            arguments: function_call.arguments,
+                        },
+                    );
+                }
             }
             ResponseStreamEvent::ResponseCompleted(event) => {
                 self.completed = Some(event.response);
@@ -427,6 +471,9 @@ impl StreamAccumulator {
         let fallback = self.text.into_values().collect::<String>();
         if response.content.is_empty() && !fallback.is_empty() {
             response.content = fallback;
+        }
+        if response.tool_calls.is_empty() {
+            response.tool_calls = self.tool_calls.into_values().collect();
         }
         Ok(response)
     }
@@ -716,6 +763,73 @@ mod tests {
         assert_eq!(
             accumulator.into_response()?.content,
             "Привет! Полный ответ."
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_done_function_call_fills_empty_completed_response() -> Result<()> {
+        let mut accumulator = StreamAccumulator::default();
+        let mut sink = RecordingSink::default();
+        for event in [
+            json!({
+                "type": "response.output_text.done",
+                "sequence_number": 1,
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "Сейчас уточню время.",
+                "logprobs": null
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 2,
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "item_1",
+                    "call_id": "call_1",
+                    "name": "datetime",
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": 3,
+                "item_id": "item_1",
+                "output_index": 1,
+                "delta": "{}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 4,
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "item_1",
+                    "call_id": "call_1",
+                    "name": "datetime",
+                    "arguments": "{}",
+                    "status": "completed"
+                }
+            }),
+        ] {
+            accumulator.push(stream_event(event)?, &mut sink).await?;
+        }
+        accumulator
+            .push(empty_completed_event(5)?, &mut sink)
+            .await?;
+
+        let response = accumulator.into_response()?;
+        assert_eq!(response.content, "Сейчас уточню время.");
+        assert_eq!(
+            response.tool_calls,
+            vec![LlmToolCall {
+                id: "call_1".into(),
+                name: "datetime".into(),
+                arguments: "{}".into(),
+            }]
         );
         Ok(())
     }
