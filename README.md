@@ -23,8 +23,13 @@ existing actor ID the runtime should use.
 
 ## Configuration
 
-Codrik loads configuration from `CODRIK_CONFIG`, then `./config.yml`, then
-`~/.codrik/config.yml`. A minimal runtime configuration is:
+Codrik looks for configuration in this order:
+
+1. the path in `CODRIK_CONFIG`;
+2. `./config.yml`;
+3. `~/.codrik/config.yml`.
+
+A minimal configuration for `codrik serve` is:
 
 ```yaml
 api_key: "..."
@@ -34,16 +39,74 @@ runtime:
   actor_id: actor:local:owner
 ```
 
-Runtime paths honor `CODRIK_HOME` and default to:
+A complete configuration with every supported field is:
 
-- database: `~/.codrik/runtime.sqlite`
-- socket: `~/.codrik/codrik.sock`
-- lock: `~/.codrik/runtime.lock`
-- managed artifacts: `~/.codrik/artifacts`
+```yaml
+api_key: "..."
+base_url: "https://api.openai.com/v1"
+model: "gpt-5"
 
-The configured actor must exist in `users.json` on first startup and must be
-enabled. Authorization is imported into SQLite once without changing
-`users.json`.
+attachments:
+  max_file_size_mb: 20
+  image_detail: auto
+
+runtime:
+  actor_id: actor:local:owner
+  database_path: /absolute/path/to/runtime.sqlite
+  socket_path: /absolute/path/to/codrik.sock
+  lock_path: /absolute/path/to/runtime.lock
+  artifact_path: /absolute/path/to/artifacts
+```
+
+| Field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `api_key` | Yes | None | Provider API key. Keep the configuration file private. |
+| `base_url` | Yes | None | OpenAI-compatible API base URL. |
+| `model` | Yes | None | Model name sent to the configured provider. |
+| `attachments.max_file_size_mb` | No | `20` | Maximum accepted attachment size in MiB. |
+| `attachments.image_detail` | No | `auto` | Image detail: `auto`, `low`, or `high`. |
+| `runtime.actor_id` | For `serve` | None | Enabled actor configured in `users.json`. |
+| `runtime.database_path` | No | `<CODRIK_HOME>/runtime.sqlite` | Durable SQLite database. |
+| `runtime.socket_path` | No | `<CODRIK_HOME>/codrik.sock` | Private Unix socket. |
+| `runtime.lock_path` | No | `<CODRIK_HOME>/runtime.lock` | Exclusive server instance lock. |
+| `runtime.artifact_path` | No | `<CODRIK_HOME>/artifacts` | Managed tool-result files. |
+
+### Runtime paths
+
+`CODRIK_HOME` controls the runtime data directory and defaults to
+`~/.codrik`. Client request recovery metadata is always stored under
+`<CODRIK_HOME>/client/requests`; this path is not configurable.
+
+When a configured runtime path starts with `~/`, Codrik resolves it relative
+to `CODRIK_HOME`, not directly relative to the operating-system home
+directory. For example, with `CODRIK_HOME=/srv/codrik`,
+`~/data/runtime.sqlite` resolves to `/srv/codrik/data/runtime.sqlite`.
+Codrik does not expand `$HOME` or a `~` embedded elsewhere in a path.
+
+Other relative paths remain relative to the working directory of
+`codrik serve`. Prefer the defaults or absolute paths when Codrik is managed
+by systemd, launchd, or another service manager.
+
+### Actor authorization
+
+The `runtime` section is required by `codrik serve`, and `runtime.actor_id`
+must not be blank. The selected actor must exist in `users.json` and be
+enabled. On first startup, authorization is imported into SQLite. Codrik does
+not rewrite `users.json`, and subsequent startups use the durable imported
+authorization.
+
+### Common configuration errors
+
+- `runtime configuration is required`: add `runtime.actor_id`.
+- `runtime.actor_id must not be blank`: configure a nonempty actor ID.
+- `configured runtime actor ... does not exist`: select an actor present in
+  `users.json`.
+- `configured runtime actor ... is disabled`: enable the selected actor or
+  choose another one.
+- Unsafe, writable, or symlinked runtime directories are rejected before the
+  Unix socket is opened.
+- Malformed YAML, invalid value types, duplicate fields, and obsolete
+  unsupported top-level fields cause configuration loading to fail.
 
 ## Commands
 
