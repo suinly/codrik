@@ -1614,6 +1614,7 @@ mod telegram_acceptance {
     #[derive(Clone, Default)]
     struct TelegramApiMock {
         sent: Arc<Mutex<Vec<String>>>,
+        rich_sent: Arc<Mutex<Vec<String>>>,
         edited: Arc<Mutex<Vec<String>>>,
         actions: Arc<Mutex<Vec<String>>>,
         reply_message_ids: Arc<Mutex<Vec<i64>>>,
@@ -1663,9 +1664,13 @@ mod telegram_acceptance {
 
         async fn send_rich_message(
             &self,
-            _command: SendRichMessage,
+            command: SendRichMessage,
         ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
-            unreachable!()
+            self.rich_sent
+                .lock()
+                .unwrap()
+                .push(command.rich_message.markdown);
+            Ok(TelegramMessageRef { message_id: 78 })
         }
 
         async fn send_chat_action(
@@ -1717,6 +1722,17 @@ mod telegram_acceptance {
             }
         })
     }
+
+    const RICH_FINAL: &str = concat!(
+        "# Result\n\n",
+        "**Bold** and [link](https://example.com)\n\n",
+        "- first\n- second\n\n",
+        "| Name | Value |\n| --- | --- |\n| time | 22:45 |\n\n",
+        "```rust\nlet ready = true;\n```\n\n",
+        "> quoted\n\n",
+        "||spoiler|| and $x^2$\n\n",
+        "<details><summary>More</summary>Details</details>",
+    );
 
     async fn counts(path: &std::path::Path) -> Result<(i64, i64, i64, i64, i64)> {
         let connection = tokio_rusqlite::Connection::open(path).await?;
@@ -1817,8 +1833,9 @@ mod telegram_acceptance {
         assert_eq!(link_response.status(), reqwest::StatusCode::OK);
         assert_eq!(counts(&database).await?, (1, 1, 0, 0, 1));
         assert_eq!(delivery.run_once().await?, 1);
+        assert!(api.sent.lock().unwrap().is_empty());
         assert_eq!(
-            *api.sent.lock().unwrap(),
+            *api.rich_sent.lock().unwrap(),
             vec!["This channel is now linked."]
         );
 
@@ -1847,7 +1864,7 @@ mod telegram_acceptance {
         let runner = ActorRunner::new(
             InjectedLlm::new(vec![InjectedReply::PartialThenFinal {
                 delta: "Пр".into(),
-                final_text: "Привет! Полный ответ.".into(),
+                final_text: RICH_FINAL.into(),
             }]),
             ToolRegistry::new(),
             signals,
@@ -1870,14 +1887,20 @@ mod telegram_acceptance {
         );
         assert_eq!(restarted_delivery.run_once().await?, 1);
         let sent = api.sent.lock().unwrap().clone();
+        let rich_sent = api.rich_sent.lock().unwrap().clone();
+        assert!(sent.is_empty());
         assert_eq!(
-            sent,
+            rich_sent,
             vec![
                 "This channel is now linked.".to_owned(),
-                "Привет! Полный ответ.".to_owned()
+                RICH_FINAL.to_owned()
             ]
         );
-        assert!(!sent.iter().any(|text| text == "Пр" || text == "Thinking…"));
+        assert!(
+            !rich_sent
+                .iter()
+                .any(|text| text == "Пр" || text == "Thinking…")
+        );
         assert!(api.edited.lock().unwrap().is_empty());
         assert!(api.reply_message_ids.lock().unwrap().is_empty());
         assert!(!api.actions.lock().unwrap().is_empty());

@@ -226,11 +226,18 @@ the agent starts a tool, Codrik posts a transient elapsed-time status such as
 `Работаю над задачей — 10 сек`; an LLM-provided activity description replaces
 the default text when available.
 
-Only the durable final assistant text and files are delivered. In private chats
-these messages do not use Telegram's reply-to UI because the conversation
-target is already unambiguous. Final text is stored in SQLite before transport
-and split at Unicode boundaries to Telegram's 4096-character limit; captions
-use a 1024-character limit.
+Durable Telegram text is delivered through Rich Messages, so supported Rich
+Markdown constructs such as headings, lists, tables, fenced code, links,
+quotations, spoilers, formulas, and details blocks render natively. Codrik
+passes text to Telegram unchanged. If Telegram definitively rejects a rich
+message, Codrik sends the same chunk as readable plain text. Retryable or
+outcome-unknown rich sends never trigger fallback, avoiding duplicate messages.
+
+The durable Telegram text chunk limit remains 4096 characters. A chunk boundary
+may split Markdown syntax; if Telegram rejects that chunk, the plain-text
+fallback preserves its content. In private chats durable messages do not use
+Telegram's reply-to UI because the conversation target is already unambiguous.
+Files remain durable; captions use a 1024-character limit.
 
 Telegram API retryable failures use bounded exponential backoff. A Telegram
 `429 retry_after` value takes precedence. Terminal API responses are recorded
