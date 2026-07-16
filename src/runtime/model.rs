@@ -73,6 +73,7 @@ id_type!(WorkItemId);
 id_type!(RunId);
 id_type!(AttemptId);
 id_type!(OutboxId);
+id_type!(GatewayDeliveryId);
 uuid_id_type!(RequestId);
 uuid_id_type!(CancelId);
 uuid_id_type!(BundleId);
@@ -101,7 +102,7 @@ pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BUNDLE_DELIVERIES: usize = 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp(pub i64);
 
 impl Timestamp {

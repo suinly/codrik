@@ -19,7 +19,7 @@ use crate::{
         outbox_worker::OutboxWorker,
         runner::{ActorRunner, RunnerLimits},
         signals::ActorSignals,
-        sqlite::SqliteRuntimeStore,
+        sqlite::{RUNTIME_SCHEMA_VERSION, SqliteRuntimeStore},
         store::{ActorStore, RuntimeStore},
         stream_hub::StreamHub,
         supervisor::{ServeRuntime, Supervisor},
@@ -266,7 +266,7 @@ where
     startup.actor_id = Some(actor_id);
     startup.database_path = Some(paths.database.clone());
     startup.socket_path = Some(paths.socket.clone());
-    startup.schema_version = Some(3);
+    startup.schema_version = Some(RUNTIME_SCHEMA_VERSION);
     startup.recovery = Some(RuntimeRecoveryCounts {
         expired_actor_leases: recovery.expired_actor_leases,
         expired_bundle_claims: recovery.expired_bundle_claims,

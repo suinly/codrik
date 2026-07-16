@@ -19,9 +19,12 @@ mod outbox;
 pub mod recovery;
 mod retry;
 
+pub const RUNTIME_SCHEMA_VERSION: u32 = 4;
+
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");
 const SERVE_MIGRATION: &str = include_str!("migrations/0002_serve.sql");
 const IDENTITY_LINKING_MIGRATION: &str = include_str!("migrations/0003_identity_linking.sql");
+const GATEWAY_MIGRATION: &str = include_str!("migrations/0004_gateway.sql");
 
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
@@ -78,13 +81,19 @@ impl SqliteRuntimeStore {
                         transaction.commit()?;
                         migrate_to_v2(connection)?;
                         migrate_to_v3(connection)?;
+                        migrate_to_v4(connection)?;
                     }
                     1 => {
                         migrate_to_v2(connection)?;
                         migrate_to_v3(connection)?;
+                        migrate_to_v4(connection)?;
                     }
-                    2 => migrate_to_v3(connection)?,
-                    3 => {}
+                    2 => {
+                        migrate_to_v3(connection)?;
+                        migrate_to_v4(connection)?;
+                    }
+                    3 => migrate_to_v4(connection)?,
+                    4 => {}
                     other => anyhow::bail!("unsupported runtime schema version: {other}"),
                 }
                 connection.execute_batch("PRAGMA busy_timeout = 0;")?;
@@ -234,6 +243,24 @@ fn migrate_to_v3(connection: &mut tokio_rusqlite::rusqlite::Connection) -> Resul
         anyhow::bail!("schema v3 migration left {foreign_key_errors} foreign key violations");
     }
     transaction.execute_batch("PRAGMA user_version = 3;")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_to_v4(connection: &mut tokio_rusqlite::rusqlite::Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(GATEWAY_MIGRATION)?;
+    let foreign_key_errors = {
+        let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
+        statement
+            .query([])?
+            .mapped(|row| row.get::<_, String>(0))
+            .count()
+    };
+    if foreign_key_errors != 0 {
+        anyhow::bail!("schema v4 migration left {foreign_key_errors} foreign key violations");
+    }
+    transaction.execute_batch("PRAGMA user_version = 4;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -456,7 +483,7 @@ mod tests {
         let probe = store.v2_probe().await?;
 
         assert!(foreign_keys);
-        assert_eq!(probe.user_version, 3);
+        assert_eq!(probe.user_version, 4);
         assert_eq!(probe.foreign_key_errors, 0);
         assert!(!tables.contains(&"runtime_metadata".to_string()));
         for table in [
@@ -499,7 +526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_database_applies_identity_linking_schema_v3() -> Result<()> {
+    async fn fresh_database_includes_identity_linking_schema() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         let (foreign_keys, tables) = store.schema_probe().await?;
         let version = store
@@ -510,14 +537,14 @@ mod tests {
             .await?;
 
         assert!(foreign_keys);
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(tables.contains(&"identity_link_codes".to_string()));
         assert!(tables.contains(&"identity_link_attempts".to_string()));
         Ok(())
     }
 
     #[tokio::test]
-    async fn v2_to_v3_preserves_actor_and_identity_rows() -> Result<()> {
+    async fn v2_upgrade_preserves_actor_and_identity_rows() -> Result<()> {
         let db = TempDb::new("identity-link-v3");
         let connection = Connection::open(db.path()).await?;
         connection
@@ -558,7 +585,92 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(counts, (1_i64, 1_i64, 3_i64));
+        assert_eq!(counts, (1_i64, 1_i64, 4_i64));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v3_to_v4_adds_gateway_state_without_losing_identity_rows() -> Result<()> {
+        let db = TempDb::new("gateway-v4");
+        let connection = Connection::open(db.path()).await?;
+        connection
+            .call(|connection| -> Result<()> {
+                connection.execute_batch(INITIAL_MIGRATION)?;
+                connection.execute_batch("PRAGMA user_version = 1;")?;
+                super::migrate_to_v2(connection)?;
+                super::migrate_to_v3(connection)?;
+                connection.execute(
+                    "INSERT INTO actors(id, enabled, tools_json, created_at)
+                     VALUES ('actor', 1, '[\"*\"]', 1)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO identities(provider, subject, actor_id, username)
+                     VALUES ('telegram', '123', 'actor', 'owner')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(super::map_call_error)?;
+        connection.close().await?;
+
+        let store = SqliteRuntimeStore::open(db.path()).await?;
+        let probe = store
+            .connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
+                let scalar = |sql: &str| connection.query_row(sql, [], |row| row.get::<_, i64>(0));
+                let tables = {
+                    let mut statement = connection.prepare(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                    )?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                let event_columns = {
+                    let mut statement = connection.prepare("PRAGMA table_info(events)")?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                let run_columns = {
+                    let mut statement = connection.prepare("PRAGMA table_info(runs)")?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                Ok((
+                    scalar("PRAGMA user_version")?,
+                    scalar("SELECT COUNT(*) FROM actors")?,
+                    scalar("SELECT COUNT(*) FROM identities")?,
+                    tables,
+                    event_columns,
+                    run_columns,
+                ))
+            })
+            .await?;
+
+        assert_eq!((probe.0, probe.1, probe.2), (4, 1, 1));
+        for table in ["gateway_commands", "gateway_deliveries", "gateway_streams"] {
+            assert!(probe.3.contains(&table.to_string()), "missing {table}");
+        }
+        for column in [
+            "delivery_gateway",
+            "delivery_address",
+            "reply_to_external_id",
+            "delivery_max_text_chars",
+            "delivery_max_caption_chars",
+        ] {
+            assert!(
+                probe.4.contains(&column.to_string()),
+                "event missing {column}"
+            );
+            assert!(
+                probe.5.contains(&column.to_string()),
+                "run missing {column}"
+            );
+        }
         Ok(())
     }
 
@@ -569,7 +681,7 @@ mod tests {
         let store = SqliteRuntimeStore::open(db.path()).await?;
         let probe = store.v2_probe().await?;
 
-        assert_eq!(probe.user_version, 3);
+        assert_eq!(probe.user_version, 4);
         assert_eq!(probe.archived_outbox, 7);
         assert_eq!(probe.archived_outbox_states, 7);
         assert_eq!(probe.archived_unmanaged_files, 1);

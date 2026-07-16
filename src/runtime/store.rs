@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::{
     agent::{message::Message, tool::ToolCapabilities},
-    runtime::model::*,
+    runtime::{gateway::*, model::*},
 };
 
 use super::runner::RunOnceOutcome;
@@ -217,6 +217,56 @@ pub trait IdentityLinkStore: Send + Sync {
     ) -> Result<StoreLinkRedemption>;
 
     async fn collect_expired_link_state(&self, now: Timestamp, limit: usize) -> Result<usize>;
+}
+
+#[async_trait]
+pub trait GatewayDeliveryStore: Send + Sync {
+    async fn enqueue_gateway_delivery(
+        &self,
+        delivery: NewGatewayDelivery,
+        now: Timestamp,
+    ) -> Result<GatewayDeliveryId>;
+
+    async fn claim_gateway_deliveries(
+        &self,
+        gateway: &str,
+        owner: &str,
+        now: Timestamp,
+        claim_until: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<ClaimedGatewayDelivery>>;
+
+    async fn renew_gateway_delivery(
+        &self,
+        claim: &GatewayDeliveryClaim,
+        now: Timestamp,
+        claim_until: Timestamp,
+    ) -> Result<Option<GatewayDeliveryClaim>>;
+
+    async fn complete_gateway_delivery(
+        &self,
+        claim: &GatewayDeliveryClaim,
+        remote_message_id: Option<String>,
+        now: Timestamp,
+    ) -> Result<bool>;
+
+    async fn retry_gateway_delivery(
+        &self,
+        claim: &GatewayDeliveryClaim,
+        next_attempt_at: Timestamp,
+        error_class: &str,
+        error: &str,
+        now: Timestamp,
+    ) -> Result<bool>;
+
+    async fn fail_gateway_delivery(
+        &self,
+        claim: &GatewayDeliveryClaim,
+        state: GatewayDeliveryState,
+        error_class: &str,
+        error: &str,
+        now: Timestamp,
+    ) -> Result<bool>;
 }
 
 #[derive(Clone, Debug)]
