@@ -468,6 +468,8 @@ impl codrik::llm::client::LlmStreamClient for InjectedLlm {
 struct BoundaryHooks {
     block_dispatch: std::sync::atomic::AtomicBool,
     block_incorporation: std::sync::atomic::AtomicBool,
+    ingress_seen: std::sync::atomic::AtomicBool,
+    incorporation_seen: std::sync::atomic::AtomicBool,
     ingress_reached: Notify,
     incorporation_reached: Notify,
     release_dispatch: Notify,
@@ -490,11 +492,11 @@ impl BoundaryHooks {
     }
 
     async fn wait_ingress(&self) {
-        self.ingress_reached.notified().await;
+        wait_latched(&self.ingress_seen, &self.ingress_reached).await;
     }
 
     async fn wait_incorporation(&self) {
-        self.incorporation_reached.notified().await;
+        wait_latched(&self.incorporation_seen, &self.incorporation_reached).await;
     }
 
     fn disable(&self) {
@@ -502,6 +504,19 @@ impl BoundaryHooks {
         self.block_incorporation.store(false, Ordering::SeqCst);
         self.release_dispatch.notify_waiters();
         self.release_incorporation.notify_waiters();
+    }
+}
+
+async fn wait_latched(seen: &std::sync::atomic::AtomicBool, changed: &Notify) {
+    loop {
+        if seen.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = changed.notified();
+        if seen.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -514,10 +529,12 @@ impl RuntimeBoundaryHooks for BoundaryHooks {
     }
 
     async fn ingress_committed(&self, _request_id: &RequestId) {
+        self.ingress_seen.store(true, Ordering::Release);
         self.ingress_reached.notify_waiters();
     }
 
     async fn incorporation_committed(&self, _request_ids: &[RequestId]) {
+        self.incorporation_seen.store(true, Ordering::Release);
         self.incorporation_reached.notify_waiters();
         if self.block_incorporation.load(Ordering::SeqCst) {
             self.release_incorporation.notified().await;
@@ -1043,6 +1060,27 @@ async fn scenario_06_multiple_incorporated_requests_receive_final_rows() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_07_restart_after_ingress_preserves_durable_state() -> Result<()> {
     let _serial = serialize_acceptance();
+
+    // Boundary rendezvous are latched: a production callback that wins the
+    // race before the test registers its waiter must still be observed.
+    let early_ingress = BoundaryHooks::ingress_gate();
+    early_ingress.ingress_committed(&RequestId::new()).await;
+    tokio::time::timeout(Duration::from_millis(50), early_ingress.wait_ingress()).await?;
+    let early_incorporation = BoundaryHooks::incorporation_gate();
+    let callback = {
+        let hooks = early_incorporation.clone();
+        tokio::spawn(async move {
+            hooks.incorporation_committed(&[RequestId::new()]).await;
+        })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        early_incorporation.wait_incorporation(),
+    )
+    .await?;
+    early_incorporation.disable();
+    callback.await?;
 
     // Boundary A: ingress is durable, but no run has attached it yet.
     let ingress_hooks = BoundaryHooks::ingress_gate();

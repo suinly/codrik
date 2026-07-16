@@ -129,6 +129,14 @@ The third review correction also followed RED/GREEN:
   parsed as an ordinary prompt; production-parser commands and binary-aware
   clean-state capture now pass all 17 installer tests.
 
+The final rendezvous review added a signal-before-wait RED inside scenario 7.
+Both ingress and incorporation callbacks used `Notify::notify_waiters`, which
+does not retain a permit, so the focused test timed out in 50 ms when the signal
+won the race. `BoundaryHooks` now stores monotonic atomic latch state and waits
+with check-register-recheck around `Notify`. The focused scenario passed, then
+passed ten consecutive stability runs; the full 17-scenario suite also passed.
+Production boundary hook defaults remain zero-op and nonblocking.
+
 ## Ledger Minor Resolutions
 
 - Task 6: protocol round-trip tests now assert exact frozen JSON bytes for all
@@ -205,5 +213,9 @@ Commit: `71698d0aa671fcd1cd03531ceed2a97bd5932f3f`.
 
 Third-review correction subject:
 `fix(runtime): share final verification and validate upgrades`.
+Commit: `aa7095d4e8b5e0a634a17d421b59c046c067c1ef`.
+
+Final rendezvous correction subject:
+`fix(test): latch runtime boundary rendezvous`.
 Its resulting SHA is recorded in the handoff because this report is part of the
 correction commit.
