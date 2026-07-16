@@ -37,6 +37,8 @@ use anyhow::{Context, Result, bail};
 
 const MAX_SKILL_INDEX_CHARS: usize = 8_000;
 const ARTIFACT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+const IDENTITY_LINK_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+const IDENTITY_LINK_GC_BATCH: usize = 256;
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     let home = codrik_dir()?;
@@ -226,12 +228,15 @@ where
         hooks.clone(),
     )?
     .with_actor_signals(signals.clone())
-    .with_identity_linking(identity_linking);
+    .with_identity_linking(identity_linking.clone());
     trace.record(StartupPhase::SocketBound);
     let recovery = store.recover_startup(clock.now()).await?;
     trace.record(StartupPhase::Recovered);
     let artifacts = ArtifactManager::new(paths.artifacts.clone(), store.clone(), clock.clone());
     artifacts.collect_garbage(clock.now()).await?;
+    identity_linking
+        .collect_expired(IDENTITY_LINK_GC_BATCH)
+        .await?;
     trace.record(StartupPhase::ArtifactsCollected);
     let tool_config =
         tool_config_for_actor_workspace(actor_workspace_path_in(&home, actor.id.as_str())?)?;
@@ -296,6 +301,11 @@ where
         let clock = clock.clone();
         let shutdown = shutdown_rx.clone();
         async move { run_artifact_gc(artifacts, clock, shutdown).await }
+    });
+    service.component("identity-link-gc", {
+        let identity_linking = identity_linking.clone();
+        let shutdown = shutdown_rx.clone();
+        async move { run_identity_link_gc(identity_linking, shutdown).await }
     });
     service.component("dispatcher", async move {
         dispatcher.run_with_shutdown(shutdown_rx).await
@@ -367,6 +377,32 @@ where
             }
             _ = tokio::time::sleep(interval) => {
                 manager.collect_garbage(clock.now()).await?;
+            }
+        }
+    }
+}
+
+async fn run_identity_link_gc(
+    manager: Arc<dyn IdentityLinkManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    run_identity_link_gc_at_interval(manager, shutdown, IDENTITY_LINK_GC_INTERVAL).await
+}
+
+async fn run_identity_link_gc_at_interval(
+    manager: Arc<dyn IdentityLinkManager>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    interval: std::time::Duration,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(interval) => {
+                manager.collect_expired(IDENTITY_LINK_GC_BATCH).await?;
             }
         }
     }
@@ -523,9 +559,38 @@ mod tests {
     use super::*;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    type RuntimeWorkCounts = (i64, i64, i64, i64, i64, i64);
+    type LinkRuntimeSnapshot = (Vec<u8>, RuntimeWorkCounts);
 
     #[derive(Default)]
     struct RecordingStartupTrace(Mutex<Vec<StartupPhase>>);
+
+    #[derive(Default)]
+    struct CountingLinkManager(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl IdentityLinkManager for CountingLinkManager {
+        async fn issue_code(
+            &self,
+            _actor: &ActorId,
+        ) -> Result<crate::runtime::identity_link::IssuedLinkCode> {
+            unreachable!("GC test never issues codes")
+        }
+
+        async fn redeem_code(
+            &self,
+            _identity: crate::runtime::store::LinkIdentity,
+            _code: &str,
+        ) -> Result<crate::runtime::identity_link::LinkRedemption> {
+            unreachable!("GC test never redeems codes")
+        }
+
+        async fn collect_expired(&self, limit: usize) -> Result<usize> {
+            assert_eq!(limit, IDENTITY_LINK_GC_BATCH);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
 
     impl StartupTrace for RecordingStartupTrace {
         fn record(&self, phase: StartupPhase) {
@@ -687,6 +752,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serving_runtime_issues_link_code_without_creating_agent_work() -> Result<()> {
+        let home = short_runtime_root("link-ipc")?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: actor:local:owner\n",
+        )?;
+        let paths = config.required_runtime()?.resolve_paths(&home)?;
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_waiter = shutdown.clone();
+        let serve_config = config.clone();
+        let serve_home = home.clone();
+        let server = tokio::spawn(async move {
+            serve_with_dependencies(
+                serve_config.clone(),
+                serve_home,
+                crate::runtime::model::ManualClock::new(12_345),
+                OpenAiClient::new(
+                    serve_config.model,
+                    serve_config.api_key,
+                    serve_config.base_url,
+                ),
+                async move { shutdown_waiter.notified().await },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !paths.socket.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        let client = crate::runtime::ipc::client::LocalIpcClient::new(paths.socket.clone());
+        let issued = client
+            .issue_link_code(crate::runtime::RequestId::new())
+            .await?;
+        assert_eq!(issued.code.len(), 9);
+        assert_eq!(issued.expires_at.0, 612_345);
+        let connection = tokio_rusqlite::Connection::open(&paths.database).await?;
+        let first_hash: Vec<u8> = connection
+            .call(|database| {
+                database.query_row("SELECT code_hash FROM identity_link_codes", [], |row| {
+                    row.get(0)
+                })
+            })
+            .await?;
+        assert_eq!(first_hash.len(), 32);
+
+        let replacement = client
+            .issue_link_code(crate::runtime::RequestId::new())
+            .await?;
+        assert_ne!(replacement.code, issued.code);
+
+        shutdown.notify_one();
+        server.await??;
+        let (replacement_hash, counts): LinkRuntimeSnapshot = connection
+            .call(
+                |database| -> tokio_rusqlite::rusqlite::Result<LinkRuntimeSnapshot> {
+                    Ok((
+                        database.query_row(
+                            "SELECT code_hash FROM identity_link_codes",
+                            [],
+                            |row| row.get(0),
+                        )?,
+                        (
+                            database
+                                .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?,
+                            database.query_row("SELECT COUNT(*) FROM work_items", [], |row| {
+                                row.get(0)
+                            })?,
+                            database
+                                .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?,
+                            database
+                                .query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))?,
+                            database.query_row(
+                                "SELECT COUNT(*) FROM result_bundles",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                            database.query_row(
+                                "SELECT COUNT(*) FROM local_requests",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                        ),
+                    ))
+                },
+            )
+            .await?;
+        assert_ne!(replacement_hash, first_hash);
+        assert_eq!(counts, (0, 0, 0, 0, 0, 0));
+        let database_bytes = std::fs::read(&paths.database)?;
+        assert!(
+            !database_bytes
+                .windows(issued.code.len())
+                .any(|window| window == issued.code.as_bytes())
+        );
+        assert!(
+            !database_bytes
+                .windows(replacement.code.len())
+                .any(|window| window == replacement.code.as_bytes())
+        );
+        std::fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn production_startup_is_ordered_and_ready_only_after_recovery() -> Result<()> {
         let home = short_runtime_root("order")?;
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
@@ -750,6 +922,52 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("artifacts"));
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn periodic_identity_link_gc_propagates_authority_failure() -> Result<()> {
+        let root = short_runtime_root("link-gc-authority")?;
+        let database = root.join("runtime.sqlite");
+        let store = SqliteRuntimeStore::open(&database).await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store,
+            crate::runtime::model::ManualClock::new(1),
+            SystemLinkCodeGenerator,
+        ));
+        let connection = tokio_rusqlite::Connection::open(&database).await?;
+        connection
+            .call(|database| database.execute_batch("DROP TABLE identity_link_codes;"))
+            .await?;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let error = run_identity_link_gc_at_interval(
+            manager,
+            shutdown_rx,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("identity_link_codes"));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_link_gc_runs_after_interval_and_exits_on_shutdown() -> Result<()> {
+        let manager = Arc::new(CountingLinkManager::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let gc_manager: Arc<dyn IdentityLinkManager> = manager.clone();
+        let task = tokio::spawn(run_identity_link_gc_at_interval(
+            gc_manager,
+            shutdown_rx,
+            std::time::Duration::from_secs(5),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(manager.0.load(Ordering::SeqCst), 1);
+        shutdown_tx.send_replace(true);
+        task.await??;
         Ok(())
     }
 

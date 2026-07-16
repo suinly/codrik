@@ -199,7 +199,15 @@ mod tests {
         ))
         .unwrap();
         assert!(json.contains(request.as_str()));
-        for forbidden in ["prompt", "model_text", "tool_payload", "outbox_payload"] {
+        for forbidden in [
+            "prompt",
+            "model_text",
+            "tool_payload",
+            "outbox_payload",
+            "link_code",
+            "code_hash",
+            "identity_subject",
+        ] {
             assert!(!json.contains(forbidden));
         }
     }
@@ -245,6 +253,10 @@ mod tests {
             "model_text",
             "tool_payload",
             "outbox_payload",
+            "link_code",
+            "code_hash",
+            "identity_subject",
+            "/link ABCD-EFGH",
         ] {
             assert!(!line.contains(forbidden));
         }
