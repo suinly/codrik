@@ -91,7 +91,18 @@ pub struct Timestamp(pub i64);
 
 impl Timestamp {
     pub fn plus_millis(self, millis: i64) -> Self {
-        Self(self.0 + millis)
+        Self(self.0.saturating_add(millis))
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::Timestamp;
+
+    #[test]
+    fn plus_millis_saturates_synthetic_overflow() {
+        assert_eq!(Timestamp(i64::MAX).plus_millis(1), Timestamp(i64::MAX));
+        assert_eq!(Timestamp(i64::MIN).plus_millis(-1), Timestamp(i64::MIN));
     }
 }
 

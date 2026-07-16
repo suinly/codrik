@@ -1,4 +1,4 @@
-use std::{fmt, io, time::Duration};
+use std::{fmt, io, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
@@ -648,16 +648,61 @@ impl fmt::Display for BundleLimitError {
 
 impl std::error::Error for BundleLimitError {}
 
+#[derive(Clone)]
 struct EncodedDelivery {
     id: DeliveryId,
     bytes: Vec<u8>,
     entry: FinalManifestEntry,
 }
 
-pub fn encode_bundle(
+#[derive(Clone)]
+pub(crate) struct PreparedBundle {
+    request_id: RequestId,
+    bundle_id: BundleId,
+    replay: bool,
+    manifest: Vec<FinalManifestEntry>,
+    manifest_sha256: String,
+    deliveries: Arc<Vec<EncodedDelivery>>,
+}
+
+impl PreparedBundle {
+    pub(crate) fn events(&self) -> impl Iterator<Item = ServerEvent> + '_ {
+        let begin = ServerEvent::new(ServerEventBody::FinalBegin {
+            request_id: self.request_id.clone(),
+            bundle_id: self.bundle_id.clone(),
+            replay: self.replay,
+            manifest: self.manifest.clone(),
+        });
+        let chunks = self.deliveries.iter().flat_map(|delivery| {
+            delivery
+                .bytes
+                .chunks(MAX_FINAL_CHUNK_BYTES)
+                .enumerate()
+                .map(|(chunk_index, chunk)| {
+                    ServerEvent::new(ServerEventBody::FinalChunk {
+                        request_id: self.request_id.clone(),
+                        bundle_id: self.bundle_id.clone(),
+                        delivery_id: delivery.id.clone(),
+                        chunk_index,
+                        bytes_base64: STANDARD.encode(chunk),
+                    })
+                })
+        });
+        let end = ServerEvent::new(ServerEventBody::FinalEnd {
+            request_id: self.request_id.clone(),
+            bundle_id: self.bundle_id.clone(),
+            manifest_sha256: self.manifest_sha256.clone(),
+        });
+        std::iter::once(begin)
+            .chain(chunks)
+            .chain(std::iter::once(end))
+    }
+}
+
+pub(crate) fn prepare_bundle(
     bundle: &ResultBundle,
     replay: bool,
-) -> Result<Vec<ServerEvent>, BundleLimitError> {
+) -> Result<PreparedBundle, BundleLimitError> {
     let count = bundle.deliveries.len();
     if count == 0 || count > MAX_BUNDLE_DELIVERIES {
         return Err(BundleLimitError::DeliveryCount {
@@ -717,32 +762,16 @@ pub fn encode_bundle(
     }
     let manifest_sha256 = incremental_sha256(&canonical_manifest);
 
-    let chunk_capacity = decoded_total.div_ceil(MAX_FINAL_CHUNK_BYTES);
-    let mut frames = Vec::with_capacity(chunk_capacity + 2);
-    frames.push(ServerEvent::new(ServerEventBody::FinalBegin {
+    let prepared = PreparedBundle {
         request_id: bundle.request_id.clone(),
         bundle_id: bundle.id.clone(),
         replay,
         manifest,
-    }));
-    for delivery in encoded {
-        for (chunk_index, chunk) in delivery.bytes.chunks(MAX_FINAL_CHUNK_BYTES).enumerate() {
-            frames.push(ServerEvent::new(ServerEventBody::FinalChunk {
-                request_id: bundle.request_id.clone(),
-                bundle_id: bundle.id.clone(),
-                delivery_id: delivery.id.clone(),
-                chunk_index,
-                bytes_base64: STANDARD.encode(chunk),
-            }));
-        }
-    }
-    frames.push(ServerEvent::new(ServerEventBody::FinalEnd {
-        request_id: bundle.request_id.clone(),
-        bundle_id: bundle.id.clone(),
         manifest_sha256,
-    }));
-    for frame in &frames {
-        let actual = serde_json::to_vec(frame)
+        deliveries: Arc::new(encoded),
+    };
+    for frame in prepared.events() {
+        let actual = serde_json::to_vec(&frame)
             .map_err(|error| BundleLimitError::PayloadEncoding(error.to_string()))?
             .len();
         if actual >= MAX_FRAME_BYTES {
@@ -752,7 +781,14 @@ pub fn encode_bundle(
             });
         }
     }
-    Ok(frames)
+    Ok(prepared)
+}
+
+pub fn encode_bundle(
+    bundle: &ResultBundle,
+    replay: bool,
+) -> Result<Vec<ServerEvent>, BundleLimitError> {
+    Ok(prepare_bundle(bundle, replay)?.events().collect())
 }
 
 fn payload_kind(payload: &FinalPayload) -> &'static str {
@@ -773,6 +809,8 @@ fn incremental_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use std::time::Duration;
 
     use anyhow::Result;
@@ -783,6 +821,7 @@ mod tests {
     use super::{
         ActivityEvent, BundleLimitError, ClientRequest, ClientRequestBody, FinalManifestEntry,
         FrameReader, FrameWriter, ProtocolErrorCode, ServerEvent, ServerEventBody, encode_bundle,
+        prepare_bundle,
     };
     use crate::runtime::{
         ArtifactId, BundleId, BundleState, CancelId, DeliveryId, RequestId,
@@ -1343,6 +1382,20 @@ mod tests {
                 .iter()
                 .all(|frame| serde_json::to_vec(frame).unwrap().len() < MAX_FRAME_BYTES)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_bundle_clones_share_canonical_payload_storage() -> Result<()> {
+        let prepared = prepare_bundle(
+            &bundle(FinalPayload::Text {
+                text: "x".repeat(MAX_BUNDLE_BYTES - 32),
+            }),
+            false,
+        )?;
+        let clone = prepared.clone();
+        assert!(Arc::ptr_eq(&prepared.deliveries, &clone.deliveries));
+        assert_eq!(prepared.events().count(), prepared.clone().events().count());
         Ok(())
     }
 

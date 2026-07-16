@@ -19,8 +19,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["raw_value"] }
 sha2 = "0.10"
-telegram-markdown-v2 = "0.2.0"
-teloxide = { version = "0.17.0", default-features = false, features = ["rustls", "ctrlc_handler"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 tokio-util = "0.7.17"

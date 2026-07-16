@@ -59,8 +59,19 @@ async fn submit(prompt: String) -> Result<()> {
     let (client, metadata) = local_context()?;
     let request = RequestId::new();
     metadata.create(&request, SystemClock.now().0, &prompt)?;
-    let stream = client.submit(request.clone(), prompt).await?;
-    metadata.set_state(&request, RequestMetadataState::SentUnconfirmed)?;
+    let stream = match client.submit(request.clone(), prompt).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("request id: {request}");
+            eprintln!("{}", recovery_command(&request));
+            return Err(error);
+        }
+    };
+    if let Err(error) = metadata.set_state(&request, RequestMetadataState::SentUnconfirmed) {
+        eprintln!("request id: {request}");
+        eprintln!("{}", recovery_command(&request));
+        return Err(error);
+    }
     run_rendered(&client, &metadata, request, stream).await
 }
 
@@ -79,8 +90,15 @@ async fn cancel(request: RequestId) -> Result<()> {
         };
         match event.body {
             crate::runtime::ipc::protocol::ServerEventBody::CancelAccepted {
-                request_id, ..
-            } if request_id == request => return Ok(()),
+                request_id,
+                affected_request_ids,
+                ..
+            } if request_id == request => {
+                for affected in affected_request_ids {
+                    println!("{affected}");
+                }
+                return Ok(());
+            }
             crate::runtime::ipc::protocol::ServerEventBody::RequestError {
                 code, message, ..
             } => bail!("daemon rejected cancellation ({code}): {message}"),
@@ -144,22 +162,45 @@ where
                 writeln!(recovery, "{}", recovery_command(request))?;
                 return Ok(());
             }
-            event = stream.next_event() => event?,
+            event = stream.next_event() => match event {
+                Ok(event) => event,
+                Err(error) => {
+                    writeln!(recovery, "{}", recovery_command(request))?;
+                    return Err(error);
+                }
+            },
         };
         let Some(event) = event else {
             writeln!(recovery, "{}", recovery_command(request))?;
             return Ok(());
         };
-        match renderer.handle(event)? {
+        let action = match renderer.handle(event) {
+            Ok(action) => action,
+            Err(error) => {
+                writeln!(recovery, "{}", recovery_command(request))?;
+                return Err(error);
+            }
+        };
+        match action {
             RenderAction::Continue => {}
             RenderAction::Accepted => {
-                metadata.set_state_if_present(request, RequestMetadataState::Accepted)?;
+                if let Err(error) =
+                    metadata.set_state_if_present(request, RequestMetadataState::Accepted)
+                {
+                    writeln!(recovery, "{}", recovery_command(request))?;
+                    return Err(error);
+                }
             }
             RenderAction::FinalVerified {
                 request_id,
                 bundle_id,
                 delivery_ids,
             } => {
+                if let Err(error) = stream.close_write().await {
+                    writeln!(recovery, "{}", recovery_command(request))?;
+                    return Err(error);
+                }
+                drop(stream);
                 let acknowledgement = client.acknowledge_final(request_id, bundle_id, delivery_ids);
                 tokio::pin!(acknowledgement);
                 let acknowledgement = tokio::select! {
@@ -173,14 +214,22 @@ where
                     writeln!(recovery, "{}", recovery_command(request))?;
                     return Err(error);
                 }
-                metadata.set_state_if_present(request, RequestMetadataState::Terminal)?;
+                if let Err(error) =
+                    metadata.set_state_if_present(request, RequestMetadataState::Terminal)
+                {
+                    writeln!(recovery, "{}", recovery_command(request))?;
+                    return Err(error);
+                }
                 return Ok(());
             }
             RenderAction::Recover => {
                 writeln!(recovery, "{}", recovery_command(request))?;
                 return Ok(());
             }
-            RenderAction::DaemonError(message) => bail!(message),
+            RenderAction::DaemonError(message) => {
+                writeln!(recovery, "{}", recovery_command(request))?;
+                bail!(message)
+            }
             RenderAction::CancelAccepted => bail!("unexpected cancellation response"),
         }
     }
@@ -259,6 +308,7 @@ mod tests {
             ipc::{
                 client::LocalIpcClient,
                 protocol::{ClientRequestBody, FrameReader, FrameWriter, encode_bundle},
+                server::MAX_CONNECTIONS,
             },
             store::{BundleManifest, FinalPayload, ResultBundle},
         },
@@ -332,6 +382,13 @@ mod tests {
             for event in events {
                 writer.write_server_event(&event).await?;
             }
+            let mut eof = [0_u8; 1];
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), operation.read(&mut eof),)
+                    .await??,
+                0,
+                "operation connection must close before the separate ACK connection"
+            );
 
             let (mut ack, _) = listener.accept().await?;
             let ack_request = FrameReader::new(&mut ack).read_client_request().await?;
@@ -381,6 +438,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sixty_four_final_streams_release_operation_connections_before_ack() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let coordinates = (0..MAX_CONNECTIONS)
+            .map(|_| (RequestId::new(), BundleId::new(), DeliveryId::new()))
+            .collect::<Vec<_>>();
+        let server_coordinates = coordinates.clone();
+        let server = tokio::spawn(async move {
+            let mut operations = Vec::with_capacity(MAX_CONNECTIONS);
+            for (request, bundle, delivery) in &server_coordinates {
+                let (mut operation, _) = listener.accept().await?;
+                let request_frame = FrameReader::new(&mut operation)
+                    .read_client_request()
+                    .await?;
+                assert!(matches!(
+                    request_frame.body,
+                    ClientRequestBody::Resume { request_id } if request_id == *request
+                ));
+                let events = encode_bundle(
+                    &ResultBundle {
+                        id: bundle.clone(),
+                        request_id: request.clone(),
+                        state: BundleState::Delivered,
+                        manifest: BundleManifest {
+                            entries: vec![],
+                            sha256: String::new(),
+                        },
+                        deliveries: vec![(
+                            delivery.clone(),
+                            FinalPayload::Text {
+                                text: "done".into(),
+                            },
+                        )],
+                    },
+                    true,
+                )?;
+                for event in events {
+                    FrameWriter::new(&mut operation)
+                        .write_server_event(&event)
+                        .await?;
+                }
+                operations.push(operation);
+            }
+            for operation in &mut operations {
+                let mut eof = [0_u8; 1];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), operation.read(&mut eof))
+                        .await??,
+                    0
+                );
+            }
+            drop(operations);
+            for (request, bundle, delivery) in server_coordinates {
+                let (mut ack, _) = listener.accept().await?;
+                let ack_request = FrameReader::new(&mut ack).read_client_request().await?;
+                assert!(matches!(
+                    ack_request.body,
+                    ClientRequestBody::AckFinal { request_id, bundle_id, delivery_ids }
+                        if request_id == request
+                            && bundle_id == bundle
+                            && delivery_ids == vec![delivery]
+                ));
+                FrameWriter::new(&mut ack)
+                    .write_server_event(&crate::runtime::ipc::protocol::ServerEvent::new(
+                        crate::runtime::ipc::protocol::ServerEventBody::AckAccepted {
+                            request_id: request,
+                            bundle_id: bundle,
+                        },
+                    ))
+                    .await?;
+            }
+            anyhow::Ok(())
+        });
+
+        let metadata_root = temp_root();
+        let metadata = Arc::new(RequestMetadataStore::new(metadata_root.clone()));
+        let client = Arc::new(LocalIpcClient::new(socket.clone()));
+        let mut clients = Vec::new();
+        for (request, _, _) in &coordinates {
+            metadata.create(request, 1, "secret")?;
+            metadata.set_state(request, RequestMetadataState::Accepted)?;
+            let client = client.clone();
+            let metadata = metadata.clone();
+            let request = request.clone();
+            clients.push(tokio::spawn(async move {
+                let stream = client.resume(request.clone()).await?;
+                let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+                let mut recovery = Vec::new();
+                drive_operation(
+                    &client,
+                    &request,
+                    stream,
+                    &metadata,
+                    &mut renderer,
+                    &mut recovery,
+                    pending(),
+                )
+                .await?;
+                anyhow::Ok(())
+            }));
+        }
+        for client in clients {
+            client.await??;
+        }
+        server.await??;
+        assert!(coordinates.iter().all(|(request, _, _)| {
+            metadata
+                .load(request)
+                .ok()
+                .flatten()
+                .is_some_and(|entry| entry.state == RequestMetadataState::Terminal)
+        }));
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn eof_keeps_metadata_nonterminal_and_prints_exact_resume_command() -> Result<()> {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket)?;
@@ -419,6 +594,68 @@ mod tests {
             String::from_utf8(recovery)?,
             format!("codrik resume {request}\n")
         );
+        std::fs::remove_file(socket)?;
+        std::fs::remove_dir_all(metadata_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_metadata_write_failure_prints_exact_resume_command() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let expected = request.clone();
+        let server = tokio::spawn(async move {
+            let (mut operation, _) = listener.accept().await?;
+            FrameReader::new(&mut operation)
+                .read_client_request()
+                .await?;
+            FrameWriter::new(&mut operation)
+                .write_server_event(&crate::runtime::ipc::protocol::ServerEvent::new(
+                    crate::runtime::ipc::protocol::ServerEventBody::Accepted {
+                        request_id: expected,
+                        work_item_id: crate::runtime::model::WorkItemId::new(),
+                        sequence: 1,
+                    },
+                ))
+                .await?;
+            anyhow::Ok(())
+        });
+        let metadata_root = temp_root();
+        let metadata = RequestMetadataStore::new(metadata_root.clone());
+        metadata.create(&request, 1, "secret")?;
+        std::fs::set_permissions(
+            metadata.path(&request),
+            std::fs::Permissions::from_mode(0o400),
+        )?;
+        let client = LocalIpcClient::new(socket.clone());
+        let stream = client.resume(request.clone()).await?;
+        let mut renderer = LocalRenderer::for_request(Vec::new(), false, request.clone());
+        let mut recovery = Vec::new();
+        assert!(
+            drive_operation(
+                &client,
+                &request,
+                stream,
+                &metadata,
+                &mut renderer,
+                &mut recovery,
+                pending(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            String::from_utf8(recovery)?,
+            format!("codrik resume {request}\n")
+        );
+        server.await??;
+        std::fs::set_permissions(
+            metadata.path(&request),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
         std::fs::remove_file(socket)?;
         std::fs::remove_dir_all(metadata_root)?;
         Ok(())

@@ -7,14 +7,14 @@ use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 
 use crate::runtime::{
     model::{
-        BundleId, BundleState, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES,
+        ActorId, BundleId, BundleState, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES,
         MAX_FINAL_CHUNK_BYTES, MAX_MANIFEST_BYTES, RequestId, Timestamp,
     },
     sqlite::{SqliteRuntimeStore, map_call_error},
     store::{
-        AckOutcome, BundleAck, BundleClaim, BundleManifest, BundleManifestEntry, BundleStore,
-        ClaimRenewal, ClaimTransition, ClaimedBundle, ClaimedBundleLoad, ClaimedBundleRef,
-        FinalPayload, ManagedArtifact, OutboxPayload, ResultBundle,
+        AckOutcome, AckRejected, BundleAck, BundleClaim, BundleManifest, BundleManifestEntry,
+        BundleStore, ClaimRenewal, ClaimTransition, ClaimedBundle, ClaimedBundleLoad,
+        ClaimedBundleRef, FinalPayload, ManagedArtifact, OutboxPayload, ResultBundle,
     },
 };
 
@@ -279,10 +279,10 @@ impl BundleStore for SqliteRuntimeStore {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
-                let (request_id, state, reciprocal_bundle_id) = transaction
+                let (request_id, state, reciprocal_bundle_id, actor_id) = transaction
                     .query_row(
                         "SELECT result_bundles.request_id, result_bundles.state,
-                                local_requests.result_bundle_id
+                                local_requests.result_bundle_id, local_requests.actor_id
                          FROM result_bundles
                          JOIN local_requests
                            ON local_requests.request_id = result_bundles.request_id
@@ -293,22 +293,35 @@ impl BundleStore for SqliteRuntimeStore {
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
                                 row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
                             ))
                         },
                     )
                     .optional()?
-                    .ok_or_else(|| anyhow!("bundle was not found"))?;
+                    .ok_or_else(|| anyhow!(AckRejected("bundle was not found".into())))?;
                 if request_id != ack.request_id.as_str() {
-                    bail!("bundle does not belong to request");
+                    return Err(anyhow!(AckRejected(
+                        "bundle does not belong to request".into()
+                    )));
+                }
+                if actor_id != ack.actor_id.as_str() {
+                    return Err(anyhow!(AckRejected(
+                        "bundle does not belong to actor".into()
+                    )));
                 }
                 if reciprocal_bundle_id.as_deref() != Some(ack.bundle_id.as_str()) {
-                    bail!("request does not reciprocally own the acknowledged bundle");
+                    return Err(anyhow!(AckRejected(
+                        "request does not reciprocally own the acknowledged bundle".into()
+                    )));
                 }
                 let canonical_bundle = load_bundle_row(&transaction, ack.bundle_id.as_str())?;
                 let durable = {
                     let mut statement = transaction.prepare(
-                        "SELECT id, transport, address FROM outbox_deliveries
-                         WHERE bundle_id = ?1 ORDER BY ordinal",
+                        "SELECT outbox_deliveries.id, outbox_deliveries.transport,
+                                outbox_deliveries.address, outbox.actor_id
+                         FROM outbox_deliveries
+                         JOIN outbox ON outbox.id = outbox_deliveries.outbox_id
+                         WHERE outbox_deliveries.bundle_id = ?1 ORDER BY ordinal",
                     )?;
                     statement
                         .query_map([ack.bundle_id.as_str()], |row| {
@@ -316,14 +329,19 @@ impl BundleStore for SqliteRuntimeStore {
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
                                 row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
                             ))
                         })?
                         .collect::<std::result::Result<Vec<_>, _>>()?
                 };
-                if durable.iter().any(|(_, transport, address)| {
-                    transport != "local_ipc" || address != ack.request_id.as_str()
+                if durable.iter().any(|(_, transport, address, actor_id)| {
+                    transport != "local_ipc"
+                        || address != ack.request_id.as_str()
+                        || actor_id != ack.actor_id.as_str()
                 }) {
-                    bail!("bundle route does not belong to request");
+                    return Err(anyhow!(AckRejected(
+                        "bundle route does not belong to request".into()
+                    )));
                 }
                 let expected = canonical_bundle
                     .manifest
@@ -340,7 +358,9 @@ impl BundleStore for SqliteRuntimeStore {
                     || supplied.len() != ack.delivery_ids.len()
                     || expected != supplied
                 {
-                    bail!("ACK delivery IDs do not exactly match the bundle manifest");
+                    return Err(anyhow!(AckRejected(
+                        "ACK delivery IDs do not exactly match the bundle manifest".into()
+                    )));
                 }
                 let outcome = match state.as_str() {
                     "delivered" => AckOutcome::AlreadyDelivered,
@@ -354,13 +374,25 @@ impl BundleStore for SqliteRuntimeStore {
                             params![ack.bundle_id.as_str(), now.0],
                         )?;
                         if changed != 1 {
-                            bail!("bundle changed during ACK");
+                            return Err(anyhow!(AckRejected("bundle changed during ACK".into())));
                         }
                         AckOutcome::Delivered
                     }
-                    "pending" => bail!("pending bundle cannot be acknowledged"),
-                    "failed_terminal" => bail!("terminally failed bundle cannot be acknowledged"),
-                    other => bail!("invalid bundle state: {other}"),
+                    "pending" => {
+                        return Err(anyhow!(AckRejected(
+                            "pending bundle cannot be acknowledged".into()
+                        )));
+                    }
+                    "failed_terminal" => {
+                        return Err(anyhow!(AckRejected(
+                            "terminally failed bundle cannot be acknowledged".into()
+                        )));
+                    }
+                    other => {
+                        return Err(anyhow!(AckRejected(format!(
+                            "invalid bundle state: {other}"
+                        ))));
+                    }
                 };
                 transaction.commit()?;
                 Ok(outcome)
@@ -405,15 +437,24 @@ impl BundleStore for SqliteRuntimeStore {
             .map_err(map_call_error)
     }
 
-    async fn replay_bundle(&self, request: &RequestId) -> Result<Option<ResultBundle>> {
+    async fn replay_bundle(
+        &self,
+        actor: &ActorId,
+        request: &RequestId,
+    ) -> Result<Option<ResultBundle>> {
+        let actor = actor.to_string();
         let request = request.to_string();
         self.connection
             .call(move |connection| -> Result<Option<ResultBundle>> {
                 let bundle_id = connection
                     .query_row(
-                        "SELECT id FROM result_bundles
-                         WHERE request_id = ?1 AND state = 'delivered'",
-                        [request],
+                        "SELECT result_bundles.id FROM result_bundles
+                         JOIN local_requests
+                           ON local_requests.request_id = result_bundles.request_id
+                         WHERE result_bundles.request_id = ?1
+                           AND local_requests.actor_id = ?2
+                           AND result_bundles.state = 'delivered'",
+                        params![request, actor],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?;
@@ -737,6 +778,24 @@ mod tests {
                 .unwrap(),
             AckOutcome::AlreadyDelivered
         );
+    }
+
+    #[tokio::test]
+    async fn replay_and_ack_reject_another_actor_in_the_same_transaction() {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        let seeded = seed_bundle(&store, "delivering", 1, false).await.unwrap();
+        let other = ActorId::from_string("actor:other");
+        assert!(
+            store
+                .replay_bundle(&other, &seeded.request_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut ack = seeded.ack();
+        ack.actor_id = other;
+        assert!(store.acknowledge_bundle(ack, Timestamp(2)).await.is_err());
+        assert_eq!(bundle_state(&store, &seeded.bundle_id).await, "delivering");
     }
 
     #[tokio::test]
@@ -1182,6 +1241,7 @@ mod tests {
     impl SeededBundle {
         fn ack(&self) -> BundleAck {
             BundleAck {
+                actor_id: ActorId::from_string("bundle-actor"),
                 request_id: self.request_id.clone(),
                 bundle_id: self.bundle_id.clone(),
                 delivery_ids: self.delivery_ids.clone(),

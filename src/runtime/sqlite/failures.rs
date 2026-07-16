@@ -502,7 +502,7 @@ mod tests {
         );
         for request_id in requests {
             let request = store
-                .resolve_local_request(&request_id)
+                .resolve_local_request(&fence.lease.actor_id, &request_id)
                 .await
                 .unwrap()
                 .unwrap();
@@ -588,7 +588,7 @@ mod tests {
         store.release_lease(&lease).await.unwrap();
         assert_eq!(
             store
-                .resolve_local_request(&first)
+                .resolve_local_request(&fence.lease.actor_id, &first)
                 .await
                 .unwrap()
                 .unwrap()
@@ -597,7 +597,7 @@ mod tests {
         );
         assert!(
             store
-                .resolve_local_request(&second)
+                .resolve_local_request(&fence.lease.actor_id, &second)
                 .await
                 .unwrap()
                 .unwrap()
@@ -618,7 +618,7 @@ mod tests {
         assert_ne!(replacement.work_item_id, old_work);
         assert_eq!(
             store
-                .resolve_local_request(&second)
+                .resolve_local_request(&fence.lease.actor_id, &second)
                 .await
                 .unwrap()
                 .unwrap()
@@ -759,7 +759,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .resolve_local_request(&request)
+                .resolve_local_request(&old_run.lease.actor_id, &request)
                 .await
                 .unwrap()
                 .unwrap()

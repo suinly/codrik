@@ -27,9 +27,10 @@ use crate::runtime::{
     },
     model::{ActorId, BundleId, BundleState, Clock, LocalRequestState, RequestId, SystemClock},
     outbox_worker::{BundleDeliverySink, OutboxWorker},
+    signals::ActorSignals,
     store::{
-        AckOutcome, BundleAck, BundleStore, CancelOutcome, LocalCancel, LocalIngressStore,
-        LocalSubmission, LocalSubmitOutcome,
+        AckOutcome, AckRejected, BundleAck, BundleStore, CancelOutcome, LocalCancel,
+        LocalIngressStore, LocalSubmission, LocalSubmitOutcome,
     },
     stream_hub::StreamHub,
 };
@@ -179,7 +180,12 @@ impl Drop for SubmissionGuard {
 #[async_trait]
 pub trait IpcOutbox: Send + Sync {
     async fn acknowledge(&self, ack: BundleAck) -> Result<AckOutcome>;
-    async fn replay(&self, request: &RequestId, sink: Arc<dyn BundleDeliverySink>) -> Result<bool>;
+    async fn replay(
+        &self,
+        actor: &ActorId,
+        request: &RequestId,
+        sink: Arc<dyn BundleDeliverySink>,
+    ) -> Result<bool>;
 }
 
 #[async_trait]
@@ -193,8 +199,13 @@ where
         self.acknowledge(ack).await
     }
 
-    async fn replay(&self, request: &RequestId, sink: Arc<dyn BundleDeliverySink>) -> Result<bool> {
-        self.replay(request, sink).await
+    async fn replay(
+        &self,
+        actor: &ActorId,
+        request: &RequestId,
+        sink: Arc<dyn BundleDeliverySink>,
+    ) -> Result<bool> {
+        self.replay(actor, request, sink).await
     }
 }
 
@@ -210,6 +221,7 @@ pub struct LocalIpcServer {
     active: ActiveConnections,
     decodes: DecodeRegistry,
     hooks: Arc<dyn RuntimeBoundaryHooks>,
+    signals: ActorSignals,
 }
 
 impl LocalIpcServer {
@@ -307,7 +319,13 @@ impl LocalIpcServer {
             active: ActiveConnections::default(),
             decodes: DecodeRegistry::default(),
             hooks,
+            signals: ActorSignals::default(),
         }
+    }
+
+    pub fn with_actor_signals(mut self, signals: ActorSignals) -> Self {
+        self.signals = signals;
+        self
     }
 
     pub fn submissions(&self) -> SubmissionRegistry {
@@ -316,32 +334,45 @@ impl LocalIpcServer {
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut handlers = tokio::task::JoinSet::new();
-        loop {
-            while handlers.try_join_next().is_some() {}
+        'accept: loop {
+            while let Some(completed) = handlers.try_join_next() {
+                inspect_handler_result(completed)?;
+            }
             if *shutdown.borrow() {
-                shutdown_handlers(&self.active, &mut handlers).await;
+                shutdown_handlers(&self.active, &mut handlers).await?;
                 return Ok(());
             }
-            let permit = tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        shutdown_handlers(&self.active, &mut handlers).await;
-                        return Ok(());
+            let permit = loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            shutdown_handlers(&self.active, &mut handlers).await?;
+                            return Ok(());
+                        }
                     }
-                    continue;
+                    completed = handlers.join_next(), if !handlers.is_empty() => {
+                        inspect_handler_result(completed.expect("guarded nonempty JoinSet"))?;
+                    }
+                    permit = self.connections.clone().acquire_owned() => {
+                        break permit.map_err(|_| anyhow!("IPC connection limiter closed"))?;
+                    }
                 }
-                permit = self.connections.clone().acquire_owned() => permit.map_err(|_| anyhow!("IPC connection limiter closed"))?,
             };
             let (stream, _) = tokio::select! {
                 changed = shutdown.changed() => {
                     drop(permit);
                     if changed.is_err() || *shutdown.borrow() {
-                        shutdown_handlers(&self.active, &mut handlers).await;
+                        shutdown_handlers(&self.active, &mut handlers).await?;
                         return Ok(());
                     }
-                    continue;
+                    continue 'accept;
                 }
                 accepted = self.listener.accept() => accepted?,
+                completed = handlers.join_next(), if !handlers.is_empty() => {
+                    drop(permit);
+                    inspect_handler_result(completed.expect("guarded nonempty JoinSet"))?;
+                    continue 'accept;
+                }
             };
             let handler = ConnectionHandler {
                 actor: self.actor.clone(),
@@ -353,19 +384,43 @@ impl LocalIpcServer {
                 active: self.active.clone(),
                 decodes: self.decodes.clone(),
                 hooks: self.hooks.clone(),
+                signals: self.signals.clone(),
             };
             let decode = self.decodes.register();
             handlers.spawn(async move {
                 let _permit = permit;
-                let _ = handler.handle_with_decode(stream, Some(decode)).await;
+                handler.handle_with_decode(stream, Some(decode)).await
             });
         }
     }
 }
 
-async fn shutdown_handlers(active: &ActiveConnections, handlers: &mut tokio::task::JoinSet<()>) {
+fn inspect_handler_result(
+    completed: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match completed {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) if connection_scoped(&error) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(anyhow!("IPC connection handler task failed: {error}")),
+    }
+}
+
+fn connection_scoped(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<io::Error>() || cause.is::<ProtocolFailure>() || cause.is::<AckRejected>()
+    })
+}
+
+async fn shutdown_handlers(
+    active: &ActiveConnections,
+    handlers: &mut tokio::task::JoinSet<Result<()>>,
+) -> Result<()> {
     active.begin_shutdown().await;
-    while handlers.join_next().await.is_some() {}
+    while let Some(completed) = handlers.join_next().await {
+        inspect_handler_result(completed)?;
+    }
+    Ok(())
 }
 
 struct ConnectionHandler {
@@ -378,9 +433,11 @@ struct ConnectionHandler {
     active: ActiveConnections,
     decodes: DecodeRegistry,
     hooks: Arc<dyn RuntimeBoundaryHooks>,
+    signals: ActorSignals,
 }
 
 impl ConnectionHandler {
+    #[cfg(test)]
     async fn handle(&self, stream: UnixStream) -> Result<()> {
         self.handle_with_decode(stream, None).await
     }
@@ -451,6 +508,7 @@ impl ConnectionHandler {
                         SystemClock.now(),
                     )
                     .await?;
+                self.signals.notify(&self.actor, 0).await;
                 sink.send_control(cancel_accepted(request_id, outcome))
                     .await?;
                 sink.close().await
@@ -464,6 +522,7 @@ impl ConnectionHandler {
                 let result = self
                     .outbox
                     .acknowledge(BundleAck {
+                        actor_id: self.actor.clone(),
                         request_id: request_id.clone(),
                         bundle_id: bundle_id.clone(),
                         delivery_ids,
@@ -477,7 +536,7 @@ impl ConnectionHandler {
                         }))
                         .await?;
                     }
-                    Err(error) => {
+                    Err(error) if error.downcast_ref::<AckRejected>().is_some() => {
                         sink.send_control(request_error(
                             request_id,
                             "ack_failed",
@@ -485,6 +544,7 @@ impl ConnectionHandler {
                         ))
                         .await?;
                     }
+                    Err(error) => return Err(error),
                 }
                 sink.close().await
             }
@@ -525,6 +585,7 @@ impl ConnectionHandler {
                 sequence,
                 ..
             } => {
+                self.signals.notify(&self.actor, sequence).await;
                 sink.send_control(ServerEvent::new(ServerEventBody::Accepted {
                     request_id: request.clone(),
                     work_item_id,
@@ -549,9 +610,12 @@ impl ConnectionHandler {
             LocalSubmitOutcome::Duplicate {
                 work_item_id: None, ..
             } => {
-                let record = self.ingress.resolve_local_request(&request).await?;
+                let record = self
+                    .ingress
+                    .resolve_local_request(&self.actor, &request)
+                    .await?;
                 return self
-                    .serve_durable_request(request, record, sink, &mut read)
+                    .serve_durable_request(request, record, sink, &mut read, Some(subscription))
                     .await;
             }
             LocalSubmitOutcome::Conflict => {
@@ -592,17 +656,40 @@ impl ConnectionHandler {
         decode_ticket: Option<u64>,
     ) -> Result<()> {
         self.submissions.wait_for(&request).await?;
-        let delivery = self.hub.subscribe_delivery(request.clone(), sink.clone())?;
-        let mut record = self.ingress.resolve_local_request(&request).await?;
+        let mut record = self
+            .ingress
+            .resolve_local_request(&self.actor, &request)
+            .await?;
         if record.is_none()
             && let Some(ticket) = decode_ticket
         {
             self.decodes.wait_for_prior(ticket).await;
             self.submissions.wait_for(&request).await?;
-            record = self.ingress.resolve_local_request(&request).await?;
+            record = self
+                .ingress
+                .resolve_local_request(&self.actor, &request)
+                .await?;
         }
+        let delivery = record.as_ref().map(|_| {
+            self.hub
+                .subscribe_delivery(request.clone(), sink.clone())
+                .expect("delivery subscription is infallible")
+        });
         let result = self
-            .serve_durable_request(request, record, sink, &mut read)
+            .serve_durable_request(
+                request.clone(),
+                record.clone(),
+                sink,
+                &mut read,
+                record
+                    .as_ref()
+                    .filter(|record| record.state == LocalRequestState::Active)
+                    .map(|_| {
+                        self.hub
+                            .subscribe(request)
+                            .expect("subscription is infallible")
+                    }),
+            )
             .await;
         drop(delivery);
         result
@@ -614,6 +701,7 @@ impl ConnectionHandler {
         mut record: Option<crate::runtime::store::LocalRequestRecord>,
         sink: Arc<SocketDeliverySink>,
         read: &mut ReadHalf<UnixStream>,
+        mut transient: Option<crate::runtime::stream_hub::StreamSubscription>,
     ) -> Result<()> {
         let Some(mut current) = record.take() else {
             sink.send_control(request_error(
@@ -639,14 +727,25 @@ impl ConnectionHandler {
                     }))
                     .await?;
                     sink.open_delivery();
-                    wait_for_disconnect(read).await;
-                    return sink.close().await;
+                    loop {
+                        tokio::select! {
+                            event = receive_transient(&mut transient) => match event {
+                                Some(event) => sink.send(event).await?,
+                                None => return sink.close().await,
+                            },
+                            _ = wait_for_disconnect(read) => return sink.close().await,
+                        }
+                    }
                 }
                 (LocalRequestState::Active, None, _) => {
                     tokio::select! {
+                        event = receive_transient(&mut transient) => match event {
+                            Some(event) => sink.send(event).await?,
+                            None => return sink.close().await,
+                        },
                         _ = wait_for_disconnect(read) => return sink.close().await,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                            let Some(updated) = self.ingress.resolve_local_request(&request).await? else {
+                            let Some(updated) = self.ingress.resolve_local_request(&self.actor, &request).await? else {
                                 sink.send_control(request_error(request, "missing_request", "request disappeared during resume")).await?;
                                 return sink.close().await;
                             };
@@ -669,7 +768,11 @@ impl ConnectionHandler {
                         wait_for_disconnect(read).await;
                         return sink.close().await;
                     }
-                    if !self.outbox.replay(&request, sink.clone()).await? {
+                    if !self
+                        .outbox
+                        .replay(&self.actor, &request, sink.clone())
+                        .await?
+                    {
                         sink.send_control(request_error(
                             request,
                             "missing_result",
@@ -692,7 +795,7 @@ impl ConnectionHandler {
                     tokio::select! {
                         _ = wait_for_disconnect(read) => return sink.close().await,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                            let Some(updated) = self.ingress.resolve_local_request(&request).await? else {
+                            let Some(updated) = self.ingress.resolve_local_request(&self.actor, &request).await? else {
                                 sink.send_control(request_error(request, "missing_request", "request disappeared during resume")).await?;
                                 return sink.close().await;
                             };
@@ -720,6 +823,15 @@ impl ConnectionHandler {
                 }
             }
         }
+    }
+}
+
+async fn receive_transient(
+    subscription: &mut Option<crate::runtime::stream_hub::StreamSubscription>,
+) -> Option<ServerEvent> {
+    match subscription {
+        Some(subscription) => subscription.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -876,6 +988,19 @@ impl BundleDeliverySink for SocketDeliverySink {
         self.write(event).await
     }
 
+    async fn send_shared(&self, event: &ServerEvent) -> Result<()> {
+        self.wait_until_open().await;
+        let mut writer = self.writer.lock().await;
+        if let Err(error) = FrameWriter::new(&mut *writer)
+            .write_server_event(event)
+            .await
+        {
+            let _ = writer.shutdown().await;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     async fn abort(&self, _error: &str) {
         let _ = self.close().await;
     }
@@ -979,28 +1104,33 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, split},
         net::UnixStream,
+        sync::watch,
         time::timeout,
     };
 
-    use crate::runtime::{
-        ipc::{
-            protocol::{
-                ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode,
-                ServerEvent, ServerEventBody, encode_bundle,
+    use crate::{
+        auth::{LegacyActor, LegacyAuthorizationSnapshot},
+        runtime::{
+            ipc::{
+                protocol::{
+                    ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode,
+                    ServerEvent, ServerEventBody, encode_bundle,
+                },
+                security::{PeerCredentials, bind_secure_listener, create_secure_directory},
             },
-            security::{PeerCredentials, bind_secure_listener, create_secure_directory},
+            model::{
+                ActorId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState, RequestId,
+                Timestamp, WorkItemId,
+            },
+            outbox_worker::{BundleDeliverySink, DeliveryRegistry},
+            signals::ActorSignals,
+            store::{
+                AckOutcome, AckRejected, BundleAck, BundleManifest, CancelOutcome, FinalPayload,
+                LocalCancel, LocalIngressStore, LocalRequestRecord, LocalSubmission,
+                LocalSubmitOutcome, ResultBundle, RuntimeActor, RuntimeAuthorizationStore,
+            },
+            stream_hub::StreamHub,
         },
-        model::{
-            ActorId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState, RequestId,
-            Timestamp, WorkItemId,
-        },
-        outbox_worker::{BundleDeliverySink, DeliveryRegistry},
-        store::{
-            AckOutcome, BundleAck, BundleManifest, CancelOutcome, FinalPayload, LocalCancel,
-            LocalIngressStore, LocalRequestRecord, LocalSubmission, LocalSubmitOutcome,
-            ResultBundle, RuntimeActor,
-        },
-        stream_hub::StreamHub,
     };
 
     use super::{
@@ -1037,6 +1167,14 @@ mod tests {
         release: Arc<Barrier>,
     }
 
+    struct PanicCredentials;
+
+    impl PeerCredentials for PanicCredentials {
+        fn peer_uid(&self, _stream: &UnixStream) -> std::io::Result<u32> {
+            panic!("simulated credential panic")
+        }
+    }
+
     impl PeerCredentials for BlockingCredentials {
         fn peer_uid(&self, _stream: &UnixStream) -> std::io::Result<u32> {
             self.entered.store(true, Ordering::SeqCst);
@@ -1065,6 +1203,41 @@ mod tests {
         hub: Arc<StreamHub>,
         submissions: SubmissionRegistry,
         record: Mutex<Option<LocalRequestRecord>>,
+    }
+
+    struct AuthorityIngress;
+
+    #[async_trait]
+    impl LocalIngressStore for AuthorityIngress {
+        async fn submit_for_actor(
+            &self,
+            _actor: &ActorId,
+            _command: LocalSubmission,
+            _now: Timestamp,
+        ) -> Result<LocalSubmitOutcome> {
+            bail!("simulated SQLite I/O authority failure")
+        }
+
+        async fn cancel_for_actor(
+            &self,
+            _actor: &ActorId,
+            _command: LocalCancel,
+            _now: Timestamp,
+        ) -> Result<CancelOutcome> {
+            bail!("simulated SQLite I/O authority failure")
+        }
+
+        async fn resolve_local_request(
+            &self,
+            _actor: &ActorId,
+            _id: &RequestId,
+        ) -> Result<Option<LocalRequestRecord>> {
+            bail!("simulated SQLite I/O authority failure")
+        }
+
+        async fn load_actor(&self, _id: &ActorId) -> Result<Option<RuntimeActor>> {
+            bail!("simulated SQLite I/O authority failure")
+        }
     }
 
     #[async_trait]
@@ -1101,6 +1274,7 @@ mod tests {
 
         async fn resolve_local_request(
             &self,
+            _actor: &ActorId,
             _id: &RequestId,
         ) -> Result<Option<LocalRequestRecord>> {
             Ok(self.record.lock().unwrap().clone())
@@ -1166,6 +1340,7 @@ mod tests {
 
         async fn resolve_local_request(
             &self,
+            _actor: &ActorId,
             _id: &RequestId,
         ) -> Result<Option<LocalRequestRecord>> {
             self.resolve_calls.fetch_add(1, Ordering::SeqCst);
@@ -1226,6 +1401,7 @@ mod tests {
 
         async fn resolve_local_request(
             &self,
+            _actor: &ActorId,
             _id: &RequestId,
         ) -> Result<Option<LocalRequestRecord>> {
             Ok(self.record.lock().unwrap().clone())
@@ -1244,6 +1420,7 @@ mod tests {
     struct TestOutbox {
         acks: Mutex<Vec<BundleAck>>,
         ack_error: Mutex<Option<String>>,
+        ack_rejected: AtomicBool,
         replay: AtomicBool,
         replay_calls: AtomicUsize,
         replay_events: Mutex<Vec<ServerEvent>>,
@@ -1262,6 +1439,11 @@ mod tests {
     #[async_trait]
     impl IpcOutbox for TestOutbox {
         async fn acknowledge(&self, ack: BundleAck) -> Result<AckOutcome> {
+            if self.ack_rejected.load(Ordering::SeqCst) {
+                return Err(anyhow::Error::new(AckRejected(
+                    "invalid acknowledgement".into(),
+                )));
+            }
             if let Some(message) = self.ack_error.lock().unwrap().clone() {
                 bail!(message);
             }
@@ -1271,6 +1453,7 @@ mod tests {
 
         async fn replay(
             &self,
+            _actor: &ActorId,
             _request: &RequestId,
             sink: Arc<dyn BundleDeliverySink>,
         ) -> Result<bool> {
@@ -1322,6 +1505,7 @@ mod tests {
             active: Default::default(),
             decodes: Default::default(),
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
+            signals: ActorSignals::default(),
         }
     }
 
@@ -1352,6 +1536,7 @@ mod tests {
                 active: Default::default(),
                 decodes: Default::default(),
                 hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
+                signals: ActorSignals::default(),
             },
             ingress,
             outbox,
@@ -1393,6 +1578,7 @@ mod tests {
             active: Default::default(),
             decodes: Default::default(),
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
+            signals: ActorSignals::default(),
         }
     }
 
@@ -1423,6 +1609,7 @@ mod tests {
                 active: Default::default(),
                 decodes: Default::default(),
                 hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
+                signals: ActorSignals::default(),
             },
             ingress,
             outbox,
@@ -1887,6 +2074,7 @@ mod tests {
 
         async fn replay(
             &self,
+            _actor: &ActorId,
             _request: &RequestId,
             _sink: Arc<dyn BundleDeliverySink>,
         ) -> Result<bool> {
@@ -1967,7 +2155,7 @@ mod tests {
     async fn active_resume_emits_accepted_with_the_durable_work_item() -> Result<()> {
         let request = RequestId::new();
         let work = WorkItemId::new();
-        let (handler, _, _, _) = test_handler_with_record(Some(request_record(
+        let (handler, _, _, hub) = test_handler_with_record(Some(request_record(
             request.clone(),
             Some(work.clone()),
             LocalRequestState::Active,
@@ -1989,6 +2177,18 @@ mod tests {
             matches!(event.body, ServerEventBody::Accepted { request_id, work_item_id, .. }
             if request_id == request && work_item_id == work)
         );
+        use crate::runtime::stream_hub::RuntimeEventPublisher;
+        hub.publish_text(std::slice::from_ref(&request), "live");
+        let delta = timeout(
+            Duration::from_millis(100),
+            FrameReader::new(&mut client).read_server_event(),
+        )
+        .await??;
+        assert!(matches!(
+            delta.body,
+            ServerEventBody::TextDelta { request_id, delta }
+                if request_id == request && delta == "live"
+        ));
         drop(client);
         task.await??;
         Ok(())
@@ -2326,6 +2526,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_handler_cannot_resume_another_actors_request() -> Result<()> {
+        let store = crate::runtime::sqlite::SqliteRuntimeStore::open_in_memory().await?;
+        let owner = ActorId::from_string("actor:owner");
+        let other = ActorId::from_string("actor:other");
+        store
+            .import_legacy_authorization(
+                LegacyAuthorizationSnapshot {
+                    version: 1,
+                    actors: vec![
+                        LegacyActor {
+                            id: owner.to_string(),
+                            enabled: true,
+                            tools: vec![],
+                            identities: vec![],
+                        },
+                        LegacyActor {
+                            id: other.to_string(),
+                            enabled: true,
+                            tools: vec![],
+                            identities: vec![],
+                        },
+                    ],
+                },
+                Timestamp(0),
+            )
+            .await?;
+        let request = RequestId::new();
+        store
+            .submit_for_actor(
+                &owner,
+                LocalSubmission {
+                    request_id: request.clone(),
+                    text: "private".into(),
+                    prompt_sha256: "a".repeat(64),
+                },
+                Timestamp(1),
+            )
+            .await?;
+        let hub = Arc::new(StreamHub::default());
+        let handler = ConnectionHandler {
+            actor: other,
+            ingress: Arc::new(store),
+            outbox: Arc::new(TestOutbox::default()),
+            hub: hub.clone(),
+            credentials: Arc::new(SameUid),
+            submissions: SubmissionRegistry::default(),
+            active: ActiveConnections::default(),
+            decodes: DecodeRegistry::default(),
+            hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
+            signals: ActorSignals::default(),
+        };
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::Resume {
+                request_id: request.clone(),
+            }))
+            .await?;
+        let event = FrameReader::new(&mut client).read_server_event().await?;
+        assert!(matches!(
+            event.body,
+            ServerEventBody::RequestError { request_id, code, .. }
+                if request_id == request && code == "missing_request"
+        ));
+        assert!(hub.snapshot(&request).is_empty());
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancel_emits_exact_cancel_accepted_then_closes() -> Result<()> {
         let request = RequestId::new();
         let cancel = CancelId::new();
@@ -2381,6 +2651,7 @@ mod tests {
         assert_eq!(
             outbox.acks.lock().unwrap().as_slice(),
             &[BundleAck {
+                actor_id: ActorId::from_string("actor:local:test"),
                 request_id: request,
                 bundle_id: bundle,
                 delivery_ids: deliveries,
@@ -2392,7 +2663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_failure_emits_request_error_and_never_ack_accepted() -> Result<()> {
+    async fn ack_authority_failure_propagates_without_request_error() -> Result<()> {
         let request = RequestId::new();
         let bundle = BundleId::new();
         let mut handler = test_handler();
@@ -2408,6 +2679,28 @@ mod tests {
                 delivery_ids: vec![DeliveryId::new()],
             }))
             .await?;
+        assert!(task.await?.is_err());
+        let mut byte = [0_u8; 1];
+        assert_eq!(client.read(&mut byte).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_validation_rejection_stays_request_scoped() -> Result<()> {
+        let request = RequestId::new();
+        let mut handler = test_handler();
+        let outbox = Arc::new(TestOutbox::default());
+        outbox.ack_rejected.store(true, Ordering::SeqCst);
+        handler.outbox = outbox;
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::AckFinal {
+                request_id: request.clone(),
+                bundle_id: BundleId::new(),
+                delivery_ids: vec![DeliveryId::new()],
+            }))
+            .await?;
         let event = FrameReader::new(&mut client).read_server_event().await?;
         assert!(matches!(
             event.body,
@@ -2415,8 +2708,69 @@ mod tests {
                 if request_id == request && code == "ack_failed"
         ));
         task.await??;
-        let mut byte = [0_u8; 1];
-        assert_eq!(client.read(&mut byte).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_run_propagates_submit_authority_failure() -> Result<()> {
+        let root = short_temp().join(format!("authority-{}", uuid::Uuid::new_v4()));
+        create_secure_directory(&root)?;
+        let socket = root.join("c.sock");
+        let listener = bind_secure_listener(&socket)?;
+        let server = LocalIpcServer::with_credentials(
+            listener,
+            ActorId::from_string("actor:local:test"),
+            Arc::new(AuthorityIngress),
+            Arc::new(TestOutbox::default()),
+            Arc::new(StreamHub::default()),
+            Arc::new(SameUid),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut task = tokio::spawn(server.run(shutdown_rx));
+        let mut client = UnixStream::connect(&socket).await?;
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::Submit {
+                request_id: RequestId::new(),
+                text: "hello".into(),
+            }))
+            .await?;
+        let result = timeout(Duration::from_millis(200), &mut task).await;
+        if result.is_err() {
+            shutdown_tx.send_replace(true);
+            task.await??;
+        }
+        let error = result
+            .expect("server swallowed handler authority failure")?
+            .expect_err("server unexpectedly succeeded");
+        assert!(error.to_string().contains("authority failure"));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_run_propagates_connection_handler_panic() -> Result<()> {
+        let root = short_temp().join(format!("panic-{}", uuid::Uuid::new_v4()));
+        create_secure_directory(&root)?;
+        let socket = root.join("c.sock");
+        let listener = bind_secure_listener(&socket)?;
+        let handler = test_handler();
+        let server = LocalIpcServer::with_credentials(
+            listener,
+            handler.actor,
+            handler.ingress,
+            handler.outbox,
+            handler.hub,
+            Arc::new(PanicCredentials),
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(server.run(shutdown_rx));
+        let _client = UnixStream::connect(&socket).await?;
+        let error = timeout(Duration::from_millis(200), task)
+            .await
+            .expect("server swallowed handler panic")?
+            .expect_err("server unexpectedly succeeded");
+        assert!(error.to_string().contains("handler task failed"));
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 }

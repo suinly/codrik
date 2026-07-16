@@ -6,7 +6,7 @@ use futures_util::future::join_all;
 use tokio::sync::{Semaphore, watch};
 
 use crate::runtime::{
-    ipc::protocol::{ServerEvent, encode_bundle},
+    ipc::protocol::{ServerEvent, prepare_bundle},
     model::{BundleId, BundleState, Clock, RequestId},
     store::{
         AckOutcome, BundleAck, BundleStore, ClaimRenewal, ClaimTransition, ClaimedBundle,
@@ -35,6 +35,10 @@ pub trait BundleDeliverySink: Send + Sync {
 
     async fn send(&self, event: ServerEvent) -> Result<()>;
 
+    async fn send_shared(&self, event: &ServerEvent) -> Result<()> {
+        self.send(event.clone()).await
+    }
+
     async fn abort(&self, _error: &str) {}
 }
 
@@ -59,6 +63,7 @@ pub struct OutboxWorker<S, R, C> {
     registry: Arc<R>,
     clock: C,
     owner: String,
+    transmissions: Arc<Semaphore>,
 }
 
 impl<S, R, C> OutboxWorker<S, R, C>
@@ -78,6 +83,7 @@ where
             registry,
             clock,
             owner,
+            transmissions: Arc::new(Semaphore::new(TRANSMISSION_CONCURRENCY)),
         }
     }
 
@@ -117,11 +123,10 @@ where
             )
             .await?;
         let count = claimed.len();
-        let transmissions = Arc::new(Semaphore::new(TRANSMISSION_CONCURRENCY));
         let results = join_all(
             claimed
                 .into_iter()
-                .map(|claimed| self.await_transmission_slot(claimed, transmissions.clone())),
+                .map(|claimed| self.await_transmission_slot(claimed, self.transmissions.clone())),
         )
         .await;
         for result in results {
@@ -136,14 +141,21 @@ where
 
     pub async fn replay(
         &self,
+        actor: &crate::runtime::model::ActorId,
         request: &RequestId,
         sink: Arc<dyn BundleDeliverySink>,
     ) -> Result<bool> {
-        let Some(bundle) = self.store.replay_bundle(request).await? else {
+        let Some(bundle) = self.store.replay_bundle(actor, request).await? else {
             return Ok(false);
         };
-        for event in encode_bundle(&bundle, true).map_err(|error| anyhow!(error))? {
-            sink.send(event).await?;
+        let _permit = self
+            .transmissions
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("final transmission limiter closed"))?;
+        let prepared = prepare_bundle(&bundle, true).map_err(|error| anyhow!(error))?;
+        for event in prepared.events() {
+            sink.send_shared(&event).await?;
         }
         Ok(true)
     }
@@ -210,8 +222,8 @@ where
     }
 
     async fn transmit(&self, claimed: ClaimedBundle) -> Result<()> {
-        let frames = match encode_bundle(&claimed.bundle, false) {
-            Ok(frames) => frames,
+        let prepared = match prepare_bundle(&claimed.bundle, false) {
+            Ok(prepared) => Arc::new(prepared),
             Err(error) => {
                 self.store
                     .fail_bundle_terminal(&claimed.claim, &error.to_string(), self.clock.now())
@@ -228,16 +240,26 @@ where
             return Ok(());
         }
 
-        let sends = recipients.iter().cloned().map(|sink| {
-            let frames = frames.clone();
+        let sends = {
+            let recipients = recipients.clone();
             async move {
-                for frame in frames {
-                    sink.send(frame).await?;
+                let mut active = recipients;
+                for frame in prepared.events() {
+                    let results =
+                        join_all(active.iter().map(|sink| sink.send_shared(&frame))).await;
+                    active = active
+                        .into_iter()
+                        .zip(results)
+                        .filter_map(|(sink, result)| result.is_ok().then_some(sink))
+                        .collect();
+                    if active.is_empty() {
+                        break;
+                    }
                 }
-                Result::<()>::Ok(())
+                active
             }
-        });
-        let mut sends = Box::pin(join_all(sends));
+        };
+        tokio::pin!(sends);
         let mut claim = claimed.claim.clone();
         let mut renewal = tokio::time::interval(RENEW_INTERVAL);
         renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -265,7 +287,7 @@ where
                     continue;
                 }
             };
-            if results.iter().all(Result::is_err) {
+            if results.is_empty() {
                 self.retry(
                     ClaimedBundle { claim, ..claimed },
                     "every bundle subscriber failed",
@@ -391,7 +413,7 @@ mod tests {
 
     use anyhow::{Result, bail};
     use async_trait::async_trait;
-    use tokio::sync::watch;
+    use tokio::sync::{Notify, watch};
 
     use crate::runtime::{
         ipc::protocol::{ServerEvent, ServerEventBody},
@@ -472,7 +494,7 @@ mod tests {
             &self,
             owner: &str,
             request_ids: &[RequestId],
-            now: Timestamp,
+            _now: Timestamp,
             until: Timestamp,
             limit: usize,
         ) -> Result<Vec<ClaimedBundle>> {
@@ -644,7 +666,11 @@ mod tests {
             Ok(())
         }
 
-        async fn replay_bundle(&self, request: &RequestId) -> Result<Option<ResultBundle>> {
+        async fn replay_bundle(
+            &self,
+            _actor: &crate::runtime::model::ActorId,
+            request: &RequestId,
+        ) -> Result<Option<ResultBundle>> {
             self.replay_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self
                 .bundles
@@ -765,6 +791,23 @@ mod tests {
         store: Arc<FakeStore>,
         bundle_id: BundleId,
         sent: AtomicBool,
+    }
+
+    struct BlockingReplaySink {
+        started: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+        blocked: AtomicBool,
+    }
+
+    #[async_trait]
+    impl BundleDeliverySink for BlockingReplaySink {
+        async fn send(&self, _event: ServerEvent) -> Result<()> {
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -989,7 +1032,11 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         assert!(
             worker(store.clone(), registry, ManualClock::new(0))
-                .replay(&request, sink.clone())
+                .replay(
+                    &crate::runtime::model::ActorId::from_string("actor"),
+                    &request,
+                    sink.clone(),
+                )
                 .await?
         );
         assert_eq!(store.claim_calls.load(Ordering::SeqCst), 0);
@@ -1002,10 +1049,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivered_replay_shares_the_four_transmission_budget() -> Result<()> {
+        let store = FakeStore::with_bundles(5);
+        for bundle in store.bundles.lock().unwrap().iter_mut() {
+            bundle.state = BundleState::Delivered;
+        }
+        let worker = Arc::new(worker(
+            store.clone(),
+            Arc::new(FakeRegistry::default()),
+            ManualClock::new(0),
+        ));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let requests = store
+            .bundles
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|bundle| bundle.request_id.clone())
+            .collect::<Vec<_>>();
+        let tasks = requests
+            .into_iter()
+            .map(|request| {
+                let worker = worker.clone();
+                let sink = Arc::new(BlockingReplaySink {
+                    started: started.clone(),
+                    release: release.clone(),
+                    blocked: AtomicBool::new(false),
+                });
+                tokio::spawn(async move {
+                    worker
+                        .replay(
+                            &crate::runtime::model::ActorId::from_string("actor"),
+                            &request,
+                            sink,
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        tokio::task::yield_now().await;
+        assert_eq!(started.load(Ordering::SeqCst), 4);
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        release.notify_waiters();
+        for task in tasks {
+            task.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn acknowledge_routes_the_exact_bundle_ack_to_persistence() -> Result<()> {
         let store = FakeStore::with_bundles(1);
         let bundle = store.bundles.lock().unwrap()[0].clone();
         let ack = BundleAck {
+            actor_id: crate::runtime::model::ActorId::from_string("actor"),
             request_id: bundle.request_id,
             bundle_id: bundle.id,
             delivery_ids: bundle.deliveries.into_iter().map(|(id, _)| id).collect(),
@@ -1041,7 +1151,15 @@ mod tests {
         assert!(late.events.lock().unwrap().is_empty());
 
         store.set_delivered(&bundle.id);
-        assert!(worker.replay(&bundle.request_id, late.clone()).await?);
+        assert!(
+            worker
+                .replay(
+                    &crate::runtime::model::ActorId::from_string("actor"),
+                    &bundle.request_id,
+                    late.clone(),
+                )
+                .await?
+        );
         let events = late.events.lock().unwrap();
         assert_eq!(events.len(), 3);
         assert!(matches!(

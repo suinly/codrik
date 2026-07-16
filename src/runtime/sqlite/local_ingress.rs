@@ -287,7 +287,12 @@ impl LocalIngressStore for SqliteRuntimeStore {
             .map_err(map_call_error)
     }
 
-    async fn resolve_local_request(&self, id: &RequestId) -> Result<Option<LocalRequestRecord>> {
+    async fn resolve_local_request(
+        &self,
+        actor: &ActorId,
+        id: &RequestId,
+    ) -> Result<Option<LocalRequestRecord>> {
+        let actor = actor.clone();
         let id = id.clone();
         self.connection
             .call(move |connection| -> Result<Option<LocalRequestRecord>> {
@@ -300,8 +305,9 @@ impl LocalIngressStore for SqliteRuntimeStore {
                          FROM local_requests
                          JOIN events ON events.id = local_requests.event_id
                          LEFT JOIN result_bundles ON result_bundles.id = local_requests.result_bundle_id
-                         WHERE local_requests.request_id = ?1",
-                        [id.as_str()],
+                         WHERE local_requests.request_id = ?1
+                           AND local_requests.actor_id = ?2",
+                        params![id.as_str(), actor.as_str()],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -688,12 +694,56 @@ mod tests {
             .await?;
         assert_eq!(outcome.affected_request_ids, vec![request.clone()]);
         let rebound = store
-            .resolve_local_request(&request)
+            .resolve_local_request(&actor, &request)
             .await?
             .unwrap()
             .work_item_id
             .unwrap();
         assert_ne!(rebound.to_string(), old_work);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_resolution_is_scoped_to_the_configured_actor() -> Result<()> {
+        let (store, actor) = store_with_actor(true).await?;
+        let other = ActorId::from_string("actor:local:other");
+        store
+            .connection
+            .call({
+                let other = other.clone();
+                move |connection| -> Result<()> {
+                    connection.execute(
+                        "INSERT INTO actors(
+                            id, enabled, tools_json, next_mailbox_sequence, created_at
+                         ) VALUES (?1, 1, '[]', 0, 0)",
+                        [other.as_str()],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(super::map_call_error)?;
+        let request = RequestId::new();
+        store
+            .submit_for_actor(
+                &actor,
+                submission(request.clone(), "private", 'a'),
+                Timestamp(1),
+            )
+            .await?;
+
+        assert!(
+            store
+                .resolve_local_request(&other, &request)
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .resolve_local_request(&actor, &request)
+                .await?
+                .is_some()
+        );
         Ok(())
     }
 
@@ -841,7 +891,11 @@ mod tests {
         assert_eq!(store.actor_event_sequence_counts(&actor).await?, before);
         assert_eq!(store.gateway_counts().await?, (1, 0));
         assert_eq!(
-            store.resolve_local_request(&request).await?.unwrap().state,
+            store
+                .resolve_local_request(&actor, &request)
+                .await?
+                .unwrap()
+                .state,
             LocalRequestState::Completed
         );
         Ok(())

@@ -1,5 +1,5 @@
 use crate::{
-    auth::{AuthorizationStore, AuthorizedActor},
+    auth::AuthorizationStore,
     config::{AppConfig, RuntimePaths, codrik_dir},
     llm::{client::LlmStreamClient, openai::OpenAiClient},
     runtime::{
@@ -20,7 +20,7 @@ use crate::{
         runner::{ActorRunner, RunnerLimits},
         signals::ActorSignals,
         sqlite::SqliteRuntimeStore,
-        store::{LocalIngressStore, RuntimeAuthorizationStore},
+        store::{LocalIngressStore, RuntimeAuthorizationStore, RuntimeStore},
         stream_hub::StreamHub,
         supervisor::{ServeRuntime, Supervisor},
     },
@@ -36,6 +36,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 const MAX_SKILL_INDEX_CHARS: usize = 8_000;
+const ARTIFACT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     let home = codrik_dir()?;
@@ -56,6 +57,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     .await
 }
 
+#[doc(hidden)]
 pub async fn serve_with_dependencies<C, L, F>(
     config: AppConfig,
     home: PathBuf,
@@ -80,6 +82,7 @@ where
     .await
 }
 
+#[doc(hidden)]
 pub async fn serve_with_dependencies_and_hooks<C, L, F>(
     config: AppConfig,
     home: PathBuf,
@@ -117,6 +120,7 @@ enum StartupPhase {
     StaleSocketRemoved,
     SocketBound,
     Recovered,
+    ArtifactsCollected,
     Ready,
 }
 
@@ -212,22 +216,25 @@ where
         outbox.clone(),
         hub.clone(),
         hooks.clone(),
-    )?;
+    )?
+    .with_actor_signals(signals.clone());
     trace.record(StartupPhase::SocketBound);
     let recovery = store.recover_startup(clock.now()).await?;
     trace.record(StartupPhase::Recovered);
+    let artifacts = ArtifactManager::new(paths.artifacts.clone(), store.clone(), clock.clone());
+    artifacts.collect_garbage(clock.now()).await?;
+    trace.record(StartupPhase::ArtifactsCollected);
     let tool_config =
         tool_config_for_actor_workspace(actor_workspace_path_in(&home, actor.id.as_str())?)?;
     let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
-    let artifacts = ArtifactManager::new(paths.artifacts.clone(), store.clone(), clock.clone());
     let runner = ActorRunner::new(
         llm,
         tools,
         signals.clone(),
         hub.clone(),
         RunnerLimits::default(),
-        artifacts,
+        artifacts.clone(),
     )
     .with_system_instructions(instructions)
     .with_logger(logger.clone())
@@ -275,6 +282,12 @@ where
         let shutdown = shutdown_rx.clone();
         async move { outbox.run(shutdown).await }
     });
+    service.component("artifact-gc", {
+        let artifacts = artifacts.clone();
+        let clock = clock.clone();
+        let shutdown = shutdown_rx.clone();
+        async move { run_artifact_gc(artifacts, clock, shutdown).await }
+    });
     service.component("dispatcher", async move {
         dispatcher.run_with_shutdown(shutdown_rx).await
     });
@@ -312,6 +325,42 @@ where
         .await;
     let cleanup = lock.remove_stale_socket();
     result.and(recovery).and(cleanup)
+}
+
+async fn run_artifact_gc<S, C>(
+    manager: ArtifactManager<S, C>,
+    clock: C,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()>
+where
+    S: RuntimeStore + Clone + 'static,
+    C: Clock,
+{
+    run_artifact_gc_at_interval(manager, clock, shutdown, ARTIFACT_GC_INTERVAL).await
+}
+
+async fn run_artifact_gc_at_interval<S, C>(
+    manager: ArtifactManager<S, C>,
+    clock: C,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    interval: std::time::Duration,
+) -> Result<()>
+where
+    S: RuntimeStore + Clone + 'static,
+    C: Clock,
+{
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(interval) => {
+                manager.collect_garbage(clock.now()).await?;
+            }
+        }
+    }
 }
 
 async fn import_legacy_authorization_once(
@@ -375,17 +424,13 @@ async fn shutdown_signal() {
     }
 }
 
+#[cfg(test)]
 fn default_tool_config() -> Result<ToolRegistryConfig> {
     Ok(ToolRegistryConfig {
         actor_workspace: None,
         skill_roots: default_skill_roots()?,
         file_roots: Vec::new(),
     })
-}
-
-fn actor_tool_config(actor: &AuthorizedActor) -> Result<ToolRegistryConfig> {
-    let workspace = actor_workspace_path(&actor.id)?;
-    tool_config_for_actor_workspace(workspace)
 }
 
 fn tool_config_for_actor_workspace(workspace: PathBuf) -> Result<ToolRegistryConfig> {
@@ -404,13 +449,6 @@ fn default_skill_roots() -> Result<Vec<SkillRoot>> {
         SkillRoot::writable(codrik_dir()?.join("skills"), "user"),
         builtin_skill_root(),
     ])
-}
-
-fn actor_workspace_path(actor_id: &str) -> Result<std::path::PathBuf> {
-    actor_workspace_path_in(
-        &codrik_dir().context("failed to resolve codrik directory for actor workspace")?,
-        actor_id,
-    )
 }
 
 fn actor_workspace_path_in(home: &Path, actor_id: &str) -> Result<std::path::PathBuf> {
@@ -734,9 +772,38 @@ mod tests {
                 StartupPhase::StaleSocketRemoved,
                 StartupPhase::SocketBound,
                 StartupPhase::Recovered,
+                StartupPhase::ArtifactsCollected,
                 StartupPhase::Ready,
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn periodic_artifact_gc_propagates_authority_failure() -> Result<()> {
+        let root = short_runtime_root("gc-authority")?;
+        let database = root.join("runtime.sqlite");
+        let store = SqliteRuntimeStore::open(&database).await?;
+        let manager = ArtifactManager::new(
+            root.join("artifacts"),
+            store,
+            crate::runtime::model::ManualClock::new(1),
+        );
+        let connection = tokio_rusqlite::Connection::open(&database).await?;
+        connection
+            .call(|database| database.execute_batch("DROP TABLE artifacts;"))
+            .await?;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let error = run_artifact_gc_at_interval(
+            manager,
+            crate::runtime::model::ManualClock::new(2),
+            shutdown_rx,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("artifacts"));
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

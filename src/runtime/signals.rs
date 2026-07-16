@@ -16,13 +16,8 @@ impl ActorSignals {
 
     pub async fn notify(&self, actor: &ActorId, sequence: i64) {
         let sender = self.sender(actor).await;
-        sender.send_if_modified(|current| {
-            if sequence > *current {
-                *current = sequence;
-                true
-            } else {
-                false
-            }
+        sender.send_modify(|current| {
+            *current = (*current).max(sequence);
         });
     }
 

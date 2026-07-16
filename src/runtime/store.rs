@@ -164,7 +164,7 @@ pub enum ImportOutcome {
 }
 
 #[async_trait]
-pub trait RuntimeAuthorizationStore: Send + Sync {
+pub(crate) trait RuntimeAuthorizationStore: Send + Sync {
     async fn legacy_authorization_imported(&self) -> Result<bool>;
 
     async fn import_legacy_authorization(
@@ -312,7 +312,11 @@ pub trait LocalIngressStore: Send + Sync {
         now: Timestamp,
     ) -> Result<CancelOutcome>;
 
-    async fn resolve_local_request(&self, id: &RequestId) -> Result<Option<LocalRequestRecord>>;
+    async fn resolve_local_request(
+        &self,
+        actor: &ActorId,
+        id: &RequestId,
+    ) -> Result<Option<LocalRequestRecord>>;
 
     async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>>;
 }
@@ -503,6 +507,7 @@ pub enum ClaimTransition {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BundleAck {
+    pub actor_id: ActorId,
     pub request_id: RequestId,
     pub bundle_id: BundleId,
     pub delivery_ids: Vec<DeliveryId>,
@@ -513,6 +518,17 @@ pub enum AckOutcome {
     Delivered,
     AlreadyDelivered,
 }
+
+#[derive(Debug)]
+pub struct AckRejected(pub String);
+
+impl std::fmt::Display for AckRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AckRejected {}
 
 #[async_trait]
 pub trait BundleStore: Send + Sync {
@@ -558,7 +574,11 @@ pub trait BundleStore: Send + Sync {
         error: &str,
         now: Timestamp,
     ) -> Result<()>;
-    async fn replay_bundle(&self, request: &RequestId) -> Result<Option<ResultBundle>>;
+    async fn replay_bundle(
+        &self,
+        actor: &ActorId,
+        request: &RequestId,
+    ) -> Result<Option<ResultBundle>>;
 }
 
 #[derive(Clone, Debug)]

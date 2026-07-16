@@ -1387,7 +1387,7 @@ mod tests {
         let mut bundle_ids = Vec::new();
         for request in requests {
             let stored = store
-                .resolve_local_request(&request)
+                .resolve_local_request(&run.lease.actor_id, &request)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(store.outbox_intents().await.unwrap().len(), 1);
         for request in requests {
             let stored = store
-                .resolve_local_request(&request)
+                .resolve_local_request(&run.lease.actor_id, &request)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1506,7 +1506,7 @@ mod tests {
         );
         assert!(store.outbox_intents().await.unwrap().is_empty());
         let request = store
-            .resolve_local_request(&requests[0])
+            .resolve_local_request(&run.lease.actor_id, &requests[0])
             .await
             .unwrap()
             .unwrap();
@@ -1562,7 +1562,7 @@ mod tests {
 
         for request in requests {
             let stored = store
-                .resolve_local_request(&request)
+                .resolve_local_request(&run.lease.actor_id, &request)
                 .await
                 .unwrap()
                 .unwrap();

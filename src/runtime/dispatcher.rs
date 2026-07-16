@@ -14,7 +14,7 @@ pub struct ActorDispatcher<R, C> {
     owner: String,
     signals: ActorSignals,
     runner: R,
-    clock: C,
+    _clock: C,
 }
 
 impl<R, C> ActorDispatcher<R, C>
@@ -34,7 +34,7 @@ where
             owner: owner.into(),
             signals,
             runner,
-            clock,
+            _clock: clock,
         }
     }
 
@@ -109,12 +109,10 @@ mod tests {
 
     use crate::runtime::{
         dispatcher::ActorDispatcher,
-        model::{ActorId, ManualClock, Timestamp, WorkItemId},
+        model::{ActorId, ManualClock, WorkItemId},
         runner::RunOnceOutcome,
         signals::ActorSignals,
-        store::{
-            FailureDisposition, QuantumFailure, QuantumProgress, QuantumReport, QuantumRunner,
-        },
+        store::{QuantumFailure, QuantumProgress, QuantumReport, QuantumRunner},
     };
 
     #[derive(Clone)]
