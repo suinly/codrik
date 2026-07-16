@@ -177,6 +177,48 @@ pub trait ActorStore: Send + Sync {
     -> Result<Option<RuntimeActor>>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkIdentity {
+    pub provider: String,
+    pub subject: String,
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreLinkCodeReplacement {
+    Stored,
+    HashCollision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreLinkRedemption {
+    Linked { actor_id: ActorId },
+    AlreadyLinked { actor_id: ActorId },
+    InvalidOrExpired,
+    RateLimited { retry_at: Timestamp },
+    IdentityConflict { actor_id: ActorId },
+}
+
+#[async_trait]
+pub trait IdentityLinkStore: Send + Sync {
+    async fn replace_link_code(
+        &self,
+        actor: &ActorId,
+        code_hash: [u8; 32],
+        created_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<StoreLinkCodeReplacement>;
+
+    async fn redeem_link_code(
+        &self,
+        identity: LinkIdentity,
+        code_hash: Option<[u8; 32]>,
+        now: Timestamp,
+    ) -> Result<StoreLinkRedemption>;
+
+    async fn collect_expired_link_state(&self, now: Timestamp, limit: usize) -> Result<usize>;
+}
+
 #[derive(Clone, Debug)]
 pub struct NewInboundEvent {
     pub gateway: String,

@@ -12,6 +12,7 @@ mod bundles;
 mod checkpoint;
 mod dispatch;
 mod failures;
+mod identity_link;
 mod ingress;
 mod local_ingress;
 mod outbox;
