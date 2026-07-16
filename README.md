@@ -124,6 +124,17 @@ Submit a request through the running daemon:
 codrik "question"
 ```
 
+Create a one-time code for linking another supported channel to the configured
+actor:
+
+```sh
+codrik link
+```
+
+The daemon prints an eight-character code and the exact `/link CODE` message to
+send in the new channel. Codes expire after 10 minutes, can be used once, and a
+new code invalidates the actor's previous unused code.
+
 Resume a disconnected request:
 
 ```sh

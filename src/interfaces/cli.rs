@@ -20,6 +20,7 @@ pub async fn run() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
         CliCommand::Update => updater::update().await,
         CliCommand::Serve => crate::app::serve(AppConfig::load_default()?).await,
+        CliCommand::Link => link().await,
         CliCommand::Submit(prompt) => submit(prompt).await,
         CliCommand::Resume(request) => resume(request).await,
         CliCommand::Cancel(request) => cancel(request).await,
@@ -85,6 +86,24 @@ async fn cancel(request: RequestId) -> Result<()> {
             _ => {}
         }
     }
+}
+
+async fn link() -> Result<()> {
+    let issued = local_client()?.issue_link_code(RequestId::new()).await?;
+    write_link_instructions(&mut std::io::stdout(), &issued.code)
+}
+
+fn write_link_instructions(output: &mut impl Write, code: &str) -> Result<()> {
+    writeln!(output, "Link code: {code}")?;
+    writeln!(output, "Expires in 10 minutes.")?;
+    writeln!(output, "In the new channel, send: /link {code}")?;
+    Ok(())
+}
+
+fn local_client() -> Result<LocalIpcClient> {
+    let config = AppConfig::load_default()?;
+    let paths = config.required_runtime()?.resolve_paths(&codrik_dir()?)?;
+    Ok(LocalIpcClient::new(paths.socket))
 }
 
 fn local_context() -> Result<(LocalIpcClient, RequestMetadataStore)> {
@@ -218,6 +237,7 @@ where
 enum CliCommand {
     Update,
     Serve,
+    Link,
     Resume(RequestId),
     Cancel(RequestId),
     Submit(String),
@@ -232,6 +252,7 @@ impl CliCommand {
         let parsed = match command.as_str() {
             "update" => Self::Update,
             "serve" => Self::Serve,
+            "link" => Self::Link,
             "resume" => {
                 let request_id = args.next().context("missing request id")?;
                 Self::Resume(RequestId::parse(&request_id)?)
@@ -267,7 +288,7 @@ mod tests {
     use anyhow::Result;
     use tokio::{io::AsyncReadExt, net::UnixListener, sync::Notify};
 
-    use super::{CliCommand, drive_operation};
+    use super::{CliCommand, drive_operation, write_link_instructions};
     use crate::{
         interfaces::{
             local_renderer::LocalRenderer,
@@ -290,6 +311,7 @@ mod tests {
         let parse = |args: &[&str]| CliCommand::parse(args.iter().copied().map(String::from));
 
         assert_eq!(parse(&["serve"])?, CliCommand::Serve);
+        assert_eq!(parse(&["link"])?, CliCommand::Link);
         assert_eq!(parse(&["update"])?, CliCommand::Update);
         assert_eq!(
             parse(&["resume", UUID])?,
@@ -314,10 +336,22 @@ mod tests {
         assert!(parse(&["--stream", "hello"]).is_err());
         assert!(parse(&["update", "extra"]).is_err());
         assert!(parse(&["serve", "extra"]).is_err());
+        assert!(parse(&["link", "extra"]).is_err());
         assert!(parse(&["resume", UUID, "extra"]).is_err());
         assert!(parse(&["cancel", UUID, "extra"]).is_err());
         assert!(parse(&["hello", "extra"]).is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn link_instructions_are_concise_and_channel_ready() -> Result<()> {
+        let mut output = Vec::new();
+        write_link_instructions(&mut output, "ABCD-EFGH")?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            "Link code: ABCD-EFGH\nExpires in 10 minutes.\nIn the new channel, send: /link ABCD-EFGH\n"
+        );
         Ok(())
     }
 
