@@ -350,6 +350,7 @@ fn is_stale_provider_file_error(message: &str) -> bool {
 #[derive(Default)]
 struct StreamAccumulator {
     completed: Option<Response>,
+    text: std::collections::BTreeMap<(u32, u32), String>,
 }
 
 impl StreamAccumulator {
@@ -360,8 +361,16 @@ impl StreamAccumulator {
     ) -> Result<()> {
         match event {
             ResponseStreamEvent::ResponseOutputTextDelta(event) if !event.delta.is_empty() => {
+                self.text
+                    .entry((event.output_index, event.content_index))
+                    .or_default()
+                    .push_str(&event.delta);
                 sink.on_event(LlmStreamEvent::TextDelta(event.delta))
                     .await?;
+            }
+            ResponseStreamEvent::ResponseOutputTextDone(event) => {
+                self.text
+                    .insert((event.output_index, event.content_index), event.text);
             }
             ResponseStreamEvent::ResponseOutputItemAdded(event) => {
                 if let OutputItem::FunctionCall(function_call) = event.item {
@@ -407,10 +416,15 @@ impl StreamAccumulator {
     }
 
     fn into_response(self) -> Result<LlmResponse> {
-        OpenAiClient::to_llm_response(
+        let mut response = OpenAiClient::to_llm_response(
             self.completed
                 .context("OpenAI Responses stream ended before response.completed")?,
-        )
+        )?;
+        let fallback = self.text.into_values().collect::<String>();
+        if response.content.is_empty() && !fallback.is_empty() {
+            response.content = fallback;
+        }
+        Ok(response)
     }
 }
 
@@ -613,6 +627,96 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_done_text_fills_empty_completed_response() -> Result<()> {
+        let mut accumulator = StreamAccumulator::default();
+        let mut sink = RecordingSink::default();
+        accumulator
+            .push(
+                stream_event(json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Пр"
+                }))?,
+                &mut sink,
+            )
+            .await?;
+        accumulator
+            .push(
+                stream_event(json!({
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "Привет! Полный ответ.",
+                    "logprobs": null
+                }))?,
+                &mut sink,
+            )
+            .await?;
+        accumulator
+            .push(empty_completed_event(3)?, &mut sink)
+            .await?;
+
+        assert_eq!(
+            accumulator.into_response()?.content,
+            "Привет! Полный ответ."
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accumulated_deltas_fill_empty_completed_response_without_done_event() -> Result<()> {
+        let mut accumulator = StreamAccumulator::default();
+        let mut sink = RecordingSink::default();
+        for (sequence, delta) in [(1, "hello "), (2, "world")] {
+            accumulator
+                .push(
+                    stream_event(json!({
+                        "type": "response.output_text.delta",
+                        "sequence_number": sequence,
+                        "item_id": "msg_1",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": delta
+                    }))?,
+                    &mut sink,
+                )
+                .await?;
+        }
+        accumulator
+            .push(empty_completed_event(3)?, &mut sink)
+            .await?;
+
+        assert_eq!(accumulator.into_response()?.content, "hello world");
+        Ok(())
+    }
+
+    fn empty_completed_event(sequence_number: u64) -> Result<ResponseStreamEvent> {
+        stream_event(json!({
+            "type": "response.completed",
+            "sequence_number": sequence_number,
+            "response": {
+                "id": "resp_empty",
+                "object": "response",
+                "created_at": 1,
+                "model": "test",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": []
+                }]
+            }
+        }))
     }
 
     fn response_with_output(output: serde_json::Value) -> Result<Response> {
