@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod dispatcher;
 pub mod hooks;
+pub mod identity_link;
 pub mod instance_lock;
 pub mod ipc;
 pub mod model;

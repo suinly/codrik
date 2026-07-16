@@ -12,6 +12,7 @@ base64 = "0.22"
 bytes = "1.11"
 futures-util = "0.3.31"
 fs2 = "0.4"
+getrandom = "0.3.4"
 infer = "0.19"
 libc = "0.2.186"
 obscura = { git = "https://github.com/h4ckf0r0day/obscura", rev = "ca71ce3c2da9a244c6d05a5d68fafcc5a14eecd8", features = ["api"] }
