@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokio_rusqlite::params;
+use tokio_rusqlite::rusqlite::OptionalExtension;
 
 use crate::runtime::{
     gateway::{
@@ -9,7 +10,7 @@ use crate::runtime::{
     },
     model::{GatewayDeliveryId, OutboxId, Timestamp, WorkItemId},
     sqlite::{SqliteRuntimeStore, map_call_error},
-    store::{GatewayDeliveryStore, OutboxPayload},
+    store::{GatewayDeliveryStore, GatewayStreamStore, OutboxPayload},
 };
 
 #[async_trait]
@@ -167,7 +168,7 @@ impl GatewayDeliveryStore for SqliteRuntimeStore {
     ) -> Result<Option<GatewayDeliveryClaim>> {
         let claim = claim.clone();
         self.connection
-            .call(move |connection| {
+            .call(move |connection| -> Result<Option<GatewayDeliveryClaim>> {
                 let changed = connection.execute(
                     "UPDATE gateway_deliveries SET claim_expires_at = ?4, updated_at = ?3
                  WHERE id = ?1 AND state = 'delivering' AND claim_owner = ?2
@@ -244,6 +245,90 @@ impl GatewayDeliveryStore for SqliteRuntimeStore {
             now,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl GatewayStreamStore for SqliteRuntimeStore {
+    async fn upsert_gateway_stream(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+        remote_message_id: &str,
+        now: Timestamp,
+    ) -> Result<()> {
+        if remote_message_id.trim().is_empty() {
+            bail!("gateway stream remote message ID must not be blank");
+        }
+        let work_item = work_item.clone();
+        let route = route.clone();
+        let remote_message_id = remote_message_id.to_owned();
+        self.connection
+            .call(move |connection| -> Result<()> {
+                connection.execute(
+                    "INSERT INTO gateway_streams(
+                        work_item_id, gateway, address, remote_message_id, state, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'active', ?5)
+                     ON CONFLICT(work_item_id, gateway, address) DO UPDATE SET
+                        remote_message_id = excluded.remote_message_id,
+                        updated_at = excluded.updated_at
+                     WHERE gateway_streams.state = 'active'",
+                    params![
+                        work_item.as_str(),
+                        route.gateway,
+                        route.address,
+                        remote_message_id,
+                        now.0
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn resolve_gateway_stream(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+    ) -> Result<Option<String>> {
+        let work_item = work_item.clone();
+        let route = route.clone();
+        self.connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT remote_message_id FROM gateway_streams
+                         WHERE work_item_id = ?1 AND gateway = ?2 AND address = ?3",
+                        params![work_item.as_str(), route.gateway, route.address],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn close_gateway_stream(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+        now: Timestamp,
+    ) -> Result<()> {
+        let work_item = work_item.clone();
+        let route = route.clone();
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE gateway_streams SET state = 'closed', updated_at = ?4
+                     WHERE work_item_id = ?1 AND gateway = ?2 AND address = ?3",
+                    params![work_item.as_str(), route.gateway, route.address, now.0],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
     }
 }
 
@@ -331,7 +416,7 @@ mod tests {
         gateway::{DeliveryRoute, NewGatewayDelivery},
         model::Timestamp,
         sqlite::SqliteRuntimeStore,
-        store::{GatewayDeliveryStore, OutboxPayload},
+        store::{GatewayDeliveryStore, GatewayStreamStore, OutboxPayload},
     };
 
     fn delivery(key: &str, address: &str, text: &str) -> Result<NewGatewayDelivery> {
@@ -411,6 +496,54 @@ mod tests {
             !store
                 .complete_gateway_delivery(&claimed[0].claim, Some("77".into()), Timestamp(34))
                 .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_stream_state_round_trips_and_closes() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let work_item = crate::runtime::model::WorkItemId::new();
+        let work_item_id = work_item.as_str().to_owned();
+        store
+            .connection
+            .call(move |connection| -> Result<()> {
+                connection.execute(
+                    "INSERT INTO actors(id, enabled, tools_json, created_at)
+                     VALUES ('actor', 1, '[]', 1)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO work_items(
+                        id, actor_id, kind, audience_kind, state, created_at, updated_at
+                     ) VALUES (?1, 'actor', 'interactive', 'actor_private', 'ready', 1, 1)",
+                    [work_item_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(super::map_call_error)?;
+        let route = DeliveryRoute::new("telegram:900", "100", None, 4096, 1024)?;
+
+        assert!(
+            store
+                .resolve_gateway_stream(&work_item, &route)
+                .await?
+                .is_none()
+        );
+        store
+            .upsert_gateway_stream(&work_item, &route, "77", Timestamp(1))
+            .await?;
+        assert_eq!(
+            store.resolve_gateway_stream(&work_item, &route).await?,
+            Some("77".into())
+        );
+        store
+            .close_gateway_stream(&work_item, &route, Timestamp(2))
+            .await?;
+        assert_eq!(
+            store.resolve_gateway_stream(&work_item, &route).await?,
+            Some("77".into())
         );
         Ok(())
     }

@@ -2265,7 +2265,6 @@ mod tests {
             matches!(event.body, ServerEventBody::Accepted { request_id, work_item_id, .. }
             if request_id == request && work_item_id == work)
         );
-        use crate::runtime::stream_hub::RuntimeEventPublisher;
         hub.publish_text(std::slice::from_ref(&request), "live");
         let delta = timeout(
             Duration::from_millis(100),

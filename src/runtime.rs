@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod dispatcher;
 pub mod gateway;
+pub mod gateway_activity;
 pub mod hooks;
 pub mod identity_link;
 pub mod instance_lock;

@@ -8,13 +8,13 @@ use tokio::sync::watch;
 
 use crate::{
     interfaces::telegram::api::{
-        ReplyParameters, SendFile, SendMessage, TelegramApi, TelegramApiError,
+        EditMessageText, ReplyParameters, SendFile, SendMessage, TelegramApi, TelegramApiError,
         TelegramApiErrorClass, TelegramMessageRef,
     },
     runtime::{
         gateway::{ClaimedGatewayDelivery, GatewayDeliveryState},
         model::Clock,
-        store::{GatewayDeliveryStore, OutboxPayload},
+        store::{GatewayDeliveryStore, GatewayStreamStore, OutboxPayload},
     },
 };
 
@@ -26,9 +26,15 @@ const MAX_CONCURRENCY: usize = 4;
 const MAX_PHOTO_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
 
+#[derive(Debug)]
 enum DeliveryError {
     Api(TelegramApiError),
     Terminal(&'static str),
+}
+
+struct DeliverySuccess {
+    message: TelegramMessageRef,
+    edited_stream: bool,
 }
 
 pub struct TelegramDeliveryWorker<S, A, C> {
@@ -42,7 +48,7 @@ pub struct TelegramDeliveryWorker<S, A, C> {
 
 impl<S, A, C> TelegramDeliveryWorker<S, A, C>
 where
-    S: GatewayDeliveryStore,
+    S: GatewayDeliveryStore + GatewayStreamStore,
     A: TelegramApi,
     C: Clock,
 {
@@ -122,20 +128,41 @@ where
             return Ok(());
         };
 
-        let (claim, result) = self.send_with_renewals(claim, &delivery).await?;
+        let stream_message_id = if delivery.ordinal == 0 {
+            match &delivery.work_item_id {
+                Some(work_item) => self
+                    .store
+                    .resolve_gateway_stream(work_item, &delivery.route)
+                    .await?
+                    .and_then(|value| value.parse::<i64>().ok()),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (claim, result) = self
+            .send_with_renewals(claim, &delivery, stream_message_id)
+            .await?;
         let transition_time = self.clock.now();
         match result {
-            Ok(message) => {
+            Ok(success) => {
                 if !self
                     .store
                     .complete_gateway_delivery(
                         &claim,
-                        Some(message.message_id.to_string()),
+                        Some(success.message.message_id.to_string()),
                         transition_time,
                     )
                     .await?
                 {
                     bail!("Telegram delivery claim was lost after transport completed");
+                }
+                if success.edited_stream
+                    && let Some(work_item) = &delivery.work_item_id
+                {
+                    self.store
+                        .close_gateway_stream(work_item, &delivery.route, transition_time)
+                        .await?;
                 }
             }
             Err(DeliveryError::Terminal(summary)) => {
@@ -213,11 +240,12 @@ where
         &self,
         mut claim: crate::runtime::gateway::GatewayDeliveryClaim,
         delivery: &ClaimedGatewayDelivery,
+        stream_message_id: Option<i64>,
     ) -> Result<(
         crate::runtime::gateway::GatewayDeliveryClaim,
-        std::result::Result<TelegramMessageRef, DeliveryError>,
+        std::result::Result<DeliverySuccess, DeliveryError>,
     )> {
-        let transport = self.send_payload(delivery);
+        let transport = self.send_payload(delivery, stream_message_id);
         tokio::pin!(transport);
         let mut renewal =
             tokio::time::interval_at(tokio::time::Instant::now() + RENEW_INTERVAL, RENEW_INTERVAL);
@@ -243,9 +271,25 @@ where
     async fn send_payload(
         &self,
         delivery: &ClaimedGatewayDelivery,
-    ) -> std::result::Result<TelegramMessageRef, DeliveryError> {
+        stream_message_id: Option<i64>,
+    ) -> std::result::Result<DeliverySuccess, DeliveryError> {
         match &delivery.payload {
             OutboxPayload::Text { text } => {
+                if let Some(message_id) = stream_message_id {
+                    return self
+                        .api
+                        .edit_message_text(EditMessageText {
+                            chat_id: delivery.route.address.clone(),
+                            message_id,
+                            text: text.clone(),
+                        })
+                        .await
+                        .map(|()| DeliverySuccess {
+                            message: TelegramMessageRef { message_id },
+                            edited_stream: true,
+                        })
+                        .map_err(DeliveryError::Api);
+                }
                 let reply_parameters = delivery
                     .route
                     .reply_to_external_id
@@ -259,6 +303,10 @@ where
                         reply_parameters,
                     })
                     .await
+                    .map(|message| DeliverySuccess {
+                        message,
+                        edited_stream: false,
+                    })
                     .map_err(DeliveryError::Api)
             }
             OutboxPayload::File {
@@ -295,6 +343,10 @@ where
                 } else {
                     self.api.send_document(command).await
                 }
+                .map(|message| DeliverySuccess {
+                    message,
+                    edited_stream: false,
+                })
                 .map_err(DeliveryError::Api)
             }
             OutboxPayload::TerminalError { .. } => Err(DeliveryError::Terminal(
@@ -396,6 +448,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingApi {
         messages: Arc<Mutex<Vec<(String, String)>>>,
+        edits: Arc<Mutex<Vec<(i64, String)>>>,
         files: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
         responses: Arc<Mutex<VecDeque<TelegramApiErrorClass>>>,
         delay: Duration,
@@ -463,9 +516,13 @@ mod tests {
 
         async fn edit_message_text(
             &self,
-            _command: EditMessageText,
+            command: EditMessageText,
         ) -> Result<(), TelegramApiError> {
-            unreachable!()
+            self.edits
+                .lock()
+                .unwrap()
+                .push((command.message_id, command.text));
+            Ok(())
         }
 
         async fn send_photo(
@@ -779,6 +836,60 @@ mod tests {
 
         worker.run(receiver).await?;
         assert!(api.messages.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_final_text_edits_known_stream_and_later_text_sends() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let api = RecordingApi::default();
+        let worker = TelegramDeliveryWorker::new(
+            store,
+            api.clone(),
+            ManualClock::new(10),
+            "telegram:900",
+            "worker-1",
+            std::env::temp_dir(),
+        );
+        let mut delivery = crate::runtime::gateway::ClaimedGatewayDelivery {
+            claim: crate::runtime::gateway::GatewayDeliveryClaim {
+                id: crate::runtime::model::GatewayDeliveryId::new(),
+                owner: "worker-1".into(),
+                expires_at: Timestamp(1_000),
+            },
+            intent_key: "final:0".into(),
+            source_outbox_id: None,
+            work_item_id: Some(crate::runtime::model::WorkItemId::new()),
+            ordinal: 0,
+            route: route("100")?,
+            payload: OutboxPayload::Text {
+                text: "final".into(),
+            },
+            attempt_count: 1,
+            remote_message_id: None,
+        };
+
+        let edited = worker
+            .send_payload(&delivery, Some(77))
+            .await
+            .expect("stream edit succeeds");
+        assert!(edited.edited_stream);
+        assert_eq!(*api.edits.lock().unwrap(), vec![(77, "final".into())]);
+        assert!(api.messages.lock().unwrap().is_empty());
+
+        delivery.ordinal = 1;
+        delivery.payload = OutboxPayload::Text {
+            text: "continued".into(),
+        };
+        let sent = worker
+            .send_payload(&delivery, None)
+            .await
+            .expect("later chunk send succeeds");
+        assert!(!sent.edited_stream);
+        assert_eq!(
+            *api.messages.lock().unwrap(),
+            vec![("100".into(), "continued".into())]
+        );
         Ok(())
     }
 }

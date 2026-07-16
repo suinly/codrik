@@ -10,9 +10,11 @@ use std::{
 use crate::{
     llm::client::AgentActivityEvent,
     runtime::{
+        gateway_activity::{GatewayActivityEvent, GatewayActivityHub},
         ipc::protocol::{ActivityEvent, ServerEvent, ServerEventBody},
         model::RequestId,
         outbox_worker::{BundleDeliverySink, DeliveryRegistry},
+        store::AttachedRun,
     },
 };
 use tokio::sync::watch;
@@ -22,16 +24,51 @@ const DEFAULT_BYTES_PER_SUBSCRIPTION: usize = 512 * 1024;
 const DEFAULT_GLOBAL_BYTES: usize = 32 * 1024 * 1024;
 
 pub trait RuntimeEventPublisher: Send + Sync {
-    fn publish_text(&self, requests: &[RequestId], delta: &str);
-    fn publish_activity(&self, requests: &[RequestId], event: AgentActivityEvent);
+    fn publish_text(&self, run: &AttachedRun, delta: &str);
+    fn publish_activity(&self, run: &AttachedRun, event: AgentActivityEvent);
 }
 
 pub struct NoopRuntimeEventPublisher;
 
 impl RuntimeEventPublisher for NoopRuntimeEventPublisher {
-    fn publish_text(&self, _requests: &[RequestId], _delta: &str) {}
+    fn publish_text(&self, _run: &AttachedRun, _delta: &str) {}
 
-    fn publish_activity(&self, _requests: &[RequestId], _event: AgentActivityEvent) {}
+    fn publish_activity(&self, _run: &AttachedRun, _event: AgentActivityEvent) {}
+}
+
+pub struct CompositeRuntimeEventPublisher {
+    local: Arc<dyn RuntimeEventPublisher>,
+    gateway: GatewayActivityHub,
+}
+
+impl CompositeRuntimeEventPublisher {
+    pub fn new(local: Arc<dyn RuntimeEventPublisher>, gateway: GatewayActivityHub) -> Self {
+        Self { local, gateway }
+    }
+}
+
+impl RuntimeEventPublisher for CompositeRuntimeEventPublisher {
+    fn publish_text(&self, run: &AttachedRun, delta: &str) {
+        self.local.publish_text(run, delta);
+        if let Some(route) = &run.delivery_route {
+            self.gateway.publish(
+                run.work_item_id.clone(),
+                route.clone(),
+                GatewayActivityEvent::TextDelta(delta.to_owned()),
+            );
+        }
+    }
+
+    fn publish_activity(&self, run: &AttachedRun, event: AgentActivityEvent) {
+        self.local.publish_activity(run, event.clone());
+        if let Some(route) = &run.delivery_route {
+            self.gateway.publish(
+                run.work_item_id.clone(),
+                route.clone(),
+                GatewayActivityEvent::Activity(event),
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -262,6 +299,16 @@ impl StreamHub {
             }
         }
     }
+
+    pub fn publish_text(&self, requests: &[RequestId], delta: &str) {
+        if !delta.is_empty() {
+            self.publish(requests, PublishedBody::Text(delta));
+        }
+    }
+
+    pub fn publish_activity(&self, requests: &[RequestId], event: AgentActivityEvent) {
+        self.publish(requests, PublishedBody::Activity(&event));
+    }
 }
 
 impl DeliveryRegistry for StreamHub {
@@ -341,14 +388,12 @@ impl DeliveryRegistry for StreamHub {
 }
 
 impl RuntimeEventPublisher for StreamHub {
-    fn publish_text(&self, requests: &[RequestId], delta: &str) {
-        if !delta.is_empty() {
-            self.publish(requests, PublishedBody::Text(delta));
-        }
+    fn publish_text(&self, run: &AttachedRun, delta: &str) {
+        self.publish_text(&run.request_ids, delta);
     }
 
-    fn publish_activity(&self, requests: &[RequestId], event: AgentActivityEvent) {
-        self.publish(requests, PublishedBody::Activity(&event));
+    fn publish_activity(&self, run: &AttachedRun, event: AgentActivityEvent) {
+        self.publish_activity(&run.request_ids, event);
     }
 }
 
@@ -545,7 +590,7 @@ mod tests {
             ipc::protocol::{ServerEvent, ServerEventBody},
             model::{BundleId, RequestId},
             outbox_worker::{BundleDeliverySink, DeliveryRegistry},
-            stream_hub::{RuntimeEventPublisher, StreamHub},
+            stream_hub::StreamHub,
         },
     };
     use anyhow::Result;

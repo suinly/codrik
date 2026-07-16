@@ -22,9 +22,9 @@ use crate::{
         },
         signals::ActorSignals,
         store::{
-            AttemptOutcome, AttemptRecovery, CheckpointRun, FailureFence, FinalizeOutcome,
-            FinalizeRun, NewOutboxIntent, NewToolAttempt, OutboxPayload, QuantumFailure,
-            QuantumProgress, QuantumReport, QuantumRunner, RuntimeStore,
+            AttachedRun, AttemptOutcome, AttemptRecovery, CheckpointRun, FailureFence,
+            FinalizeOutcome, FinalizeRun, NewOutboxIntent, NewToolAttempt, OutboxPayload,
+            QuantumFailure, QuantumProgress, QuantumReport, QuantumRunner, RuntimeStore,
         },
         stream_hub::RuntimeEventPublisher,
     },
@@ -206,7 +206,7 @@ where
                         .mark_attempt_running(&run, &attempt.id, self.clock.now())
                         .await?;
                     self.events.publish_activity(
-                        &run.request_ids,
+                        &run,
                         AgentActivityEvent::ToolStarted {
                             name: attempt.tool_name.clone(),
                         },
@@ -241,7 +241,7 @@ where
                             .await?;
                     }
                     self.events.publish_activity(
-                        &run.request_ids,
+                        &run,
                         AgentActivityEvent::ToolFinished {
                             name: attempt.tool_name.clone(),
                             succeeded: matches!(outcome, AttemptOutcome::Succeeded { .. }),
@@ -307,7 +307,7 @@ where
                             .await?;
                         advance_progress(progress, QuantumProgress::Finalized);
                         self.events
-                            .publish_activity(&run.request_ids, AgentActivityEvent::Cancelled);
+                            .publish_activity(&run, AgentActivityEvent::Cancelled);
                         Ok(RunOnceOutcome::Cancelled)
                     }
                     EventKind::UserMessage => Ok(RunOnceOutcome::Yielded),
@@ -323,10 +323,11 @@ where
                 tools: self.tools.definitions(),
             };
             self.events
-                .publish_activity(&run.request_ids, AgentActivityEvent::ModelStepStarted);
+                .publish_activity(&run, AgentActivityEvent::ModelStepStarted);
             let response = {
+                let event_run = run.clone();
                 let mut sink = RuntimeLlmSink {
-                    requests: &run.request_ids,
+                    run: &event_run,
                     publisher: self.events.as_ref(),
                 };
                 let generation = self.llm.stream(request, &mut sink, &context);
@@ -361,7 +362,7 @@ where
                                         self.store.cancel_run(&run, &control, self.clock.now()).await?;
                                         advance_progress(progress, QuantumProgress::Finalized);
                                         self.events.publish_activity(
-                                            &run.request_ids,
+                                            &run,
                                             AgentActivityEvent::Cancelled,
                                         );
                                         Ok(RunOnceOutcome::Cancelled)
@@ -400,7 +401,7 @@ where
                     FinalizeOutcome::Completed => {
                         advance_progress(progress, QuantumProgress::Finalized);
                         self.events
-                            .publish_activity(&run.request_ids, AgentActivityEvent::Completed);
+                            .publish_activity(&run, AgentActivityEvent::Completed);
                         return Ok(RunOnceOutcome::Completed);
                     }
                     FinalizeOutcome::Preempted { .. } => {
@@ -441,7 +442,7 @@ where
 
             if !response.content.is_empty() {
                 self.events.publish_activity(
-                    &run.request_ids,
+                    &run,
                     AgentActivityEvent::Description(response.content.clone()),
                 );
             }
@@ -497,7 +498,7 @@ where
                     .mark_attempt_running(&run, &attempt.id, self.clock.now())
                     .await?;
                 self.events.publish_activity(
-                    &run.request_ids,
+                    &run,
                     AgentActivityEvent::ToolStarted {
                         name: tool_call.name.clone(),
                     },
@@ -543,7 +544,7 @@ where
                 };
                 let succeeded = matches!(outcome, AttemptOutcome::Succeeded { .. });
                 self.events.publish_activity(
-                    &run.request_ids,
+                    &run,
                     AgentActivityEvent::ToolFinished {
                         name: tool_call.name.clone(),
                         succeeded,
@@ -691,7 +692,7 @@ fn advance_progress(current: &mut QuantumProgress, committed: QuantumProgress) {
 }
 
 struct RuntimeLlmSink<'a> {
-    requests: &'a [crate::runtime::model::RequestId],
+    run: &'a AttachedRun,
     publisher: &'a dyn RuntimeEventPublisher,
 }
 
@@ -699,7 +700,7 @@ struct RuntimeLlmSink<'a> {
 impl LlmStreamSink for RuntimeLlmSink<'_> {
     async fn on_event(&mut self, event: LlmStreamEvent) -> Result<()> {
         if let LlmStreamEvent::TextDelta(delta) = event {
-            self.publisher.publish_text(self.requests, &delta);
+            self.publisher.publish_text(self.run, &delta);
         }
         Ok(())
     }

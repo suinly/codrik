@@ -286,6 +286,30 @@ pub trait GatewayDeliveryStore: Send + Sync {
     ) -> Result<bool>;
 }
 
+#[async_trait]
+pub trait GatewayStreamStore: Send + Sync {
+    async fn upsert_gateway_stream(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+        remote_message_id: &str,
+        now: Timestamp,
+    ) -> Result<()>;
+
+    async fn resolve_gateway_stream(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+    ) -> Result<Option<String>>;
+
+    async fn close_gateway_stream(
+        &self,
+        work_item: &WorkItemId,
+        route: &DeliveryRoute,
+        now: Timestamp,
+    ) -> Result<()>;
+}
+
 #[derive(Clone, Debug)]
 pub struct NewInboundEvent {
     pub gateway: String,
