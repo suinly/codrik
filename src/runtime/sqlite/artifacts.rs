@@ -533,6 +533,7 @@ mod tests {
             source_event_ids: Vec::new(),
             request_ids: Vec::new(),
             audience: Audience::ActorPrivate,
+            delivery_route: None,
             messages: Vec::new(),
         };
         Ok((root, store, run))

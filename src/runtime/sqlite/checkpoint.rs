@@ -7,9 +7,10 @@ use tokio_rusqlite::params;
 use crate::{
     agent::message::Message,
     runtime::{
+        gateway::{DeliveryRoute, split_unicode},
         model::{
-            AttemptId, AttemptState, Audience, BundleId, DeliveryId, EventId, LocalRequestState,
-            OutboxId, RequestId, Timestamp,
+            AttemptId, AttemptState, Audience, BundleId, DeliveryId, EventId, GatewayDeliveryId,
+            LocalRequestState, OutboxId, RequestId, Timestamp,
         },
         sqlite::{
             SqliteRuntimeStore,
@@ -822,13 +823,6 @@ pub(super) fn create_terminal_bundles(
             (replacement, LocalRequestState::FailedTerminal)
         }
     };
-    if request_ids.is_empty() {
-        for intent in &intents {
-            insert_outbox(transaction, context, intent, now)?;
-        }
-        return Ok(effective_state);
-    }
-
     let build_plans = |intents: &[NewOutboxIntent]| -> Result<Vec<BundlePlan>> {
         request_ids
             .iter()
@@ -861,6 +855,14 @@ pub(super) fn create_terminal_bundles(
         .iter()
         .map(|intent| insert_outbox(transaction, context, intent, now))
         .collect::<Result<Vec<_>>>()?;
+    if let Some(route) = &context.delivery_route {
+        for (intent, outbox_id) in intents.iter().zip(&outbox_ids) {
+            insert_gateway_deliveries(transaction, intent, outbox_id, route, now)?;
+        }
+    }
+    if request_ids.is_empty() {
+        return Ok(effective_state);
+    }
     for plan in plans {
         transaction.execute(
             "INSERT INTO result_bundles(
@@ -922,6 +924,7 @@ pub(super) struct TerminalBundleContext {
     pub(super) work_item_id: crate::runtime::model::WorkItemId,
     pub(super) run_id: crate::runtime::model::RunId,
     pub(super) audience: Audience,
+    pub(super) delivery_route: Option<DeliveryRoute>,
 }
 
 impl From<&AttachedRun> for TerminalBundleContext {
@@ -931,8 +934,74 @@ impl From<&AttachedRun> for TerminalBundleContext {
             work_item_id: run.work_item_id.clone(),
             run_id: run.run_id.clone(),
             audience: run.audience.clone(),
+            delivery_route: run.delivery_route.clone(),
         }
     }
+}
+
+fn insert_gateway_deliveries(
+    transaction: &tokio_rusqlite::rusqlite::Transaction<'_>,
+    intent: &NewOutboxIntent,
+    outbox_id: &OutboxId,
+    route: &DeliveryRoute,
+    now: Timestamp,
+) -> Result<()> {
+    let payloads = match &intent.payload {
+        crate::runtime::store::OutboxPayload::Text { text } => {
+            split_unicode(text, route.max_text_chars)
+                .into_iter()
+                .map(|text| crate::runtime::store::OutboxPayload::Text { text })
+                .collect()
+        }
+        crate::runtime::store::OutboxPayload::TerminalError { message, .. } => {
+            split_unicode(message, route.max_text_chars)
+                .into_iter()
+                .map(|text| crate::runtime::store::OutboxPayload::Text { text })
+                .collect()
+        }
+        crate::runtime::store::OutboxPayload::File { caption, .. }
+            if caption
+                .as_ref()
+                .is_some_and(|caption| caption.chars().count() > route.max_caption_chars) =>
+        {
+            let mut payloads =
+                split_unicode(caption.as_deref().unwrap_or_default(), route.max_text_chars)
+                    .into_iter()
+                    .map(|text| crate::runtime::store::OutboxPayload::Text { text })
+                    .collect::<Vec<_>>();
+            let mut file = intent.payload.clone();
+            if let crate::runtime::store::OutboxPayload::File { caption, .. } = &mut file {
+                *caption = None;
+            }
+            payloads.push(file);
+            payloads
+        }
+        crate::runtime::store::OutboxPayload::File { .. } => vec![intent.payload.clone()],
+    };
+    for (ordinal, payload) in payloads.into_iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO gateway_deliveries(
+                id, intent_key, source_outbox_id, gateway, address,
+                reply_to_external_id, max_text_chars, max_caption_chars,
+                ordinal, payload_json, state, attempt_count, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', 0, ?11, ?11)
+             ON CONFLICT(intent_key) DO NOTHING",
+            params![
+                GatewayDeliveryId::new().as_str(),
+                format!("gateway:{}:{ordinal}", intent.intent_key),
+                outbox_id.as_str(),
+                route.gateway,
+                route.address,
+                route.reply_to_external_id,
+                route.max_text_chars as i64,
+                route.max_caption_chars as i64,
+                ordinal as i64,
+                serde_json::to_string(&payload)?,
+                now.0,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn terminal_state_name(state: LocalRequestState) -> &'static str {
@@ -1124,6 +1193,7 @@ mod tests {
         agent::message::Message,
         llm::client::LlmToolCall,
         runtime::{
+            gateway::DeliveryRoute,
             model::{
                 ActorId, Audience, CancelId, LocalRequestState, OutboxId, RequestId, Timestamp,
             },
@@ -1185,6 +1255,106 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, run)
+    }
+
+    async fn routed_store_with_run() -> (SqliteRuntimeStore, crate::runtime::store::AttachedRun) {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
+                        id: "actor:telegram:123".into(),
+                        enabled: true,
+                        tools: vec![],
+                        identities: vec![IdentitySeed {
+                            provider: "telegram".into(),
+                            subject: "123".into(),
+                            username: None,
+                        }],
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .ingest(
+                NewInboundEvent::text_with_route(
+                    "telegram:900",
+                    "42",
+                    "telegram",
+                    "123",
+                    Audience::ActorPrivate,
+                    DeliveryRoute::new("telegram:900", "123", Some("7".into()), 4096, 1024)
+                        .unwrap(),
+                    "hello",
+                )
+                .unwrap(),
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(100), Timestamp(500))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(101))
+            .await
+            .unwrap()
+            .unwrap();
+        (store, run)
+    }
+
+    #[tokio::test]
+    async fn gateway_delivery_projection_chunks_final_text_durably() {
+        let (store, run) = routed_store_with_run().await;
+        store
+            .checkpoint_run(
+                CheckpointRun {
+                    run: run.clone(),
+                    incorporated_event_ids: run.source_event_ids.clone(),
+                    checkpointed_attempt_ids: Vec::new(),
+                    messages: Vec::new(),
+                },
+                Timestamp(150),
+            )
+            .await
+            .unwrap();
+        let text = "🦀".repeat(4097);
+        let mut command = finalize(&run, "routed-intent");
+        command.outbox[0].payload = OutboxPayload::Text { text: text.clone() };
+        assert_eq!(
+            store.finalize_run(command, Timestamp(200)).await.unwrap(),
+            FinalizeOutcome::Completed
+        );
+        let deliveries = store
+            .connection
+            .call(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT ordinal, payload_json FROM gateway_deliveries ORDER BY ordinal",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries[0].0, 0);
+        assert_eq!(deliveries[1].0, 1);
+        let joined = deliveries
+            .into_iter()
+            .map(|(_, json)| serde_json::from_str::<OutboxPayload>(&json).unwrap())
+            .map(|payload| match payload {
+                OutboxPayload::Text { text } => text,
+                other => panic!("unexpected projected payload: {other:?}"),
+            })
+            .collect::<String>();
+        assert_eq!(joined, text);
     }
 
     async fn local_store_with_run(

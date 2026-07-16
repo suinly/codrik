@@ -294,6 +294,7 @@ pub struct NewInboundEvent {
     pub identity_subject: String,
     pub kind: EventKind,
     pub audience: Audience,
+    pub delivery_route: Option<DeliveryRoute>,
     pub payload_json: String,
 }
 
@@ -304,6 +305,46 @@ impl NewInboundEvent {
         identity_provider: impl Into<String>,
         identity_subject: impl Into<String>,
         audience: Audience,
+        text: impl Into<String>,
+    ) -> Result<Self> {
+        Self::text_with_optional_route(
+            gateway,
+            external_id,
+            identity_provider,
+            identity_subject,
+            audience,
+            None,
+            text,
+        )
+    }
+
+    pub fn text_with_route(
+        gateway: impl Into<String>,
+        external_id: impl Into<String>,
+        identity_provider: impl Into<String>,
+        identity_subject: impl Into<String>,
+        audience: Audience,
+        delivery_route: DeliveryRoute,
+        text: impl Into<String>,
+    ) -> Result<Self> {
+        Self::text_with_optional_route(
+            gateway,
+            external_id,
+            identity_provider,
+            identity_subject,
+            audience,
+            Some(delivery_route),
+            text,
+        )
+    }
+
+    fn text_with_optional_route(
+        gateway: impl Into<String>,
+        external_id: impl Into<String>,
+        identity_provider: impl Into<String>,
+        identity_subject: impl Into<String>,
+        audience: Audience,
+        delivery_route: Option<DeliveryRoute>,
         text: impl Into<String>,
     ) -> Result<Self> {
         let payload_json = serde_json::to_string(&serde_json::json!({
@@ -317,6 +358,7 @@ impl NewInboundEvent {
             identity_subject: identity_subject.into(),
             kind: EventKind::UserMessage,
             audience,
+            delivery_route,
             payload_json,
         })
     }
@@ -490,6 +532,7 @@ pub struct AttachedRun {
     pub source_event_ids: Vec<EventId>,
     pub request_ids: Vec<RequestId>,
     pub audience: Audience,
+    pub delivery_route: Option<DeliveryRoute>,
     pub messages: Vec<Message>,
 }
 

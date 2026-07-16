@@ -2129,6 +2129,7 @@ mod tests {
                     identity_subject: "owner".into(),
                     kind: EventKind::CancelRequested,
                     audience: Audience::ActorPrivate,
+                    delivery_route: None,
                     payload_json: r#"{"type":"cancel"}"#.into(),
                 },
                 Timestamp(3),

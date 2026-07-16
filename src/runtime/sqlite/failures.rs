@@ -88,6 +88,7 @@ impl FailureStore for SqliteRuntimeStore {
                             work_item_id: fence.work_item_id.clone(),
                             run_id: RunId::from_string(run_id.clone()),
                             audience: audience.clone(),
+                            delivery_route: None,
                         };
                         create_terminal_bundles(
                             &transaction,

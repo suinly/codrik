@@ -12,6 +12,22 @@ use crate::runtime::{
 impl IngressStore for SqliteRuntimeStore {
     async fn ingest(&self, event: NewInboundEvent, now: Timestamp) -> Result<IngressOutcome> {
         let (audience_kind, audience_address) = encode_audience(&event.audience)?;
+        let (
+            delivery_gateway,
+            delivery_address,
+            reply_to_external_id,
+            delivery_max_text_chars,
+            delivery_max_caption_chars,
+        ) = match &event.delivery_route {
+            Some(route) => (
+                Some(route.gateway.clone()),
+                Some(route.address.clone()),
+                route.reply_to_external_id.clone(),
+                Some(route.max_text_chars as i64),
+                Some(route.max_caption_chars as i64),
+            ),
+            None => (None, None, None, None, None),
+        };
         let kind = encode_event_kind(event.kind);
         self.connection
             .call(move |connection| -> tokio_rusqlite::rusqlite::Result<IngressOutcome> {
@@ -84,8 +100,13 @@ impl IngressStore for SqliteRuntimeStore {
                 transaction.execute(
                     "INSERT INTO events(
                         id, actor_id, work_item_id, mailbox_sequence, gateway, external_id,
-                        kind, audience_kind, audience_address, payload_json, state, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?11)",
+                        kind, audience_kind, audience_address, delivery_gateway,
+                        delivery_address, reply_to_external_id, delivery_max_text_chars,
+                        delivery_max_caption_chars, payload_json, state, created_at, updated_at
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, 'pending', ?16, ?16
+                     )",
                     params![
                         event_id.as_str(),
                         actor_id,
@@ -96,6 +117,11 @@ impl IngressStore for SqliteRuntimeStore {
                         kind,
                         audience_kind,
                         audience_address,
+                        delivery_gateway,
+                        delivery_address,
+                        reply_to_external_id,
+                        delivery_max_text_chars,
+                        delivery_max_caption_chars,
                         event.payload_json,
                         now.0,
                     ],
@@ -176,6 +202,70 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn routed_ingress_persists_reply_route_separately_from_actor_private_audience() {
+        use crate::runtime::gateway::DeliveryRoute;
+
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .seed_actors_for_test(owner_snapshot(), Timestamp(1))
+            .await
+            .unwrap();
+        store
+            .ingest(
+                NewInboundEvent::text_with_route(
+                    "telegram:900",
+                    "42",
+                    "telegram",
+                    "123",
+                    Audience::ActorPrivate,
+                    DeliveryRoute::new("telegram:900", "123", Some("7".into()), 4096, 1024)
+                        .unwrap(),
+                    "hello",
+                )
+                .unwrap(),
+                Timestamp(10),
+            )
+            .await
+            .unwrap();
+        let route = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT audience_kind, audience_address, delivery_gateway,
+                            delivery_address, reply_to_external_id,
+                            delivery_max_text_chars, delivery_max_caption_chars
+                     FROM events WHERE external_id = '42'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            route,
+            (
+                "actor_private".into(),
+                None,
+                "telegram:900".into(),
+                "123".into(),
+                "7".into(),
+                4096,
+                1024,
+            )
+        );
     }
 
     #[tokio::test]

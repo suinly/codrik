@@ -5,6 +5,7 @@ use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 use crate::{
     agent::message::Message,
     runtime::{
+        gateway::DeliveryRoute,
         model::{ActorId, Audience, EventId, RequestId, RunId, Timestamp, WorkItemId},
         sqlite::{SqliteRuntimeStore, map_call_error, retry::call_connection_with_busy_retry},
         store::{ActorLease, AttachedRun, ControlEvent, ControlStore, DispatchStore, StaleLease},
@@ -507,6 +508,54 @@ impl DispatchStore for SqliteRuntimeStore {
                     transaction.commit()?;
                     return Ok(None);
                 }
+                let delivery_route = transaction
+                    .query_row(
+                        "SELECT events.delivery_gateway, events.delivery_address,
+                                events.reply_to_external_id, events.delivery_max_text_chars,
+                                events.delivery_max_caption_chars
+                         FROM events
+                         JOIN run_events ON run_events.event_id = events.id
+                         WHERE run_events.run_id = ?1
+                           AND events.kind = 'user_message'
+                           AND events.delivery_gateway IS NOT NULL
+                         ORDER BY events.mailbox_sequence DESC LIMIT 1",
+                        [&run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .map(|route| {
+                        DeliveryRoute::new(
+                            route.0,
+                            route.1,
+                            route.2,
+                            route.3 as usize,
+                            route.4 as usize,
+                        )
+                    })
+                    .transpose()?;
+                if let Some(route) = &delivery_route {
+                    transaction.execute(
+                        "UPDATE runs SET delivery_gateway = ?2, delivery_address = ?3,
+                            reply_to_external_id = ?4, delivery_max_text_chars = ?5,
+                            delivery_max_caption_chars = ?6 WHERE id = ?1",
+                        params![
+                            run_id,
+                            route.gateway,
+                            route.address,
+                            route.reply_to_external_id,
+                            route.max_text_chars as i64,
+                            route.max_caption_chars as i64,
+                        ],
+                    )?;
+                }
                 transaction.execute(
                     "UPDATE runs SET lease_generation = ?2, observed_sequence = ?3, updated_at = ?4 WHERE id = ?1",
                     params![run_id, lease.generation, observed_sequence, now.0],
@@ -524,6 +573,7 @@ impl DispatchStore for SqliteRuntimeStore {
                         .collect(),
                     request_ids,
                     audience: decode_audience(&audience_kind, audience_address)?,
+                    delivery_route,
                     messages,
                 }))
             },
@@ -803,6 +853,7 @@ impl SqliteRuntimeStore {
 mod tests {
     use crate::{
         runtime::{
+            gateway::DeliveryRoute,
             model::{ActorId, Audience, CancelId, ManualClock, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
@@ -872,6 +923,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<StaleLease>().is_some());
+    }
+
+    #[tokio::test]
+    async fn newest_routed_user_event_sets_persisted_run_route() {
+        let store = store_with_event().await;
+        let route =
+            DeliveryRoute::new("telegram:900", "123", Some("8".into()), 4096, 1024).unwrap();
+        store
+            .ingest(
+                NewInboundEvent::text_with_route(
+                    "telegram:900",
+                    "event-2",
+                    "telegram",
+                    "123",
+                    Audience::ActorPrivate,
+                    route.clone(),
+                    "follow-up",
+                )
+                .unwrap(),
+                Timestamp(3),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(20))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.delivery_route, Some(route.clone()));
+
+        let resumed_lease = store
+            .acquire_ready_actor("worker-2", Timestamp(21), Timestamp(31))
+            .await
+            .unwrap()
+            .unwrap();
+        let resumed = store
+            .attach_next_run(&resumed_lease, 8, Timestamp(22))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.delivery_route, Some(route));
     }
 
     #[tokio::test]
@@ -1057,6 +1154,7 @@ mod tests {
                     identity_subject: "123".into(),
                     kind: EventKind::CancelRequested,
                     audience: Audience::ActorPrivate,
+                    delivery_route: None,
                     payload_json: r#"{"type":"cancel"}"#.into(),
                 },
                 Timestamp(200),

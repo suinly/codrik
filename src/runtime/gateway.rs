@@ -131,11 +131,30 @@ impl NewGatewayDelivery {
     }
 }
 
+pub fn split_unicode(text: &str, max_chars: usize) -> Vec<String> {
+    assert!(max_chars > 0, "text chunk limit must be greater than zero");
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut count = 0;
+    for character in text.chars() {
+        if count == max_chars {
+            chunks.push(std::mem::take(&mut current));
+            count = 0;
+        }
+        current.push(character);
+        count += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
 
-    use super::{DeliveryRoute, GatewayDeliveryState, NewGatewayDelivery};
+    use super::{DeliveryRoute, GatewayDeliveryState, NewGatewayDelivery, split_unicode};
     use crate::runtime::store::OutboxPayload;
 
     #[test]
@@ -191,5 +210,14 @@ mod tests {
         ] {
             assert!(!state.is_failure_target());
         }
+    }
+
+    #[test]
+    fn unicode_splitting_preserves_text_and_limits_chunks() {
+        let text = "ab🦀cd";
+        let chunks = split_unicode(text, 2);
+        assert_eq!(chunks, vec!["ab", "🦀c", "d"]);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 2));
     }
 }

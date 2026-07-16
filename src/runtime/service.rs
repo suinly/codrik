@@ -83,6 +83,7 @@ where
             identity_subject: self.identity_subject.clone(),
             kind: EventKind::CancelRequested,
             audience: Audience::ActorPrivate,
+            delivery_route: None,
             payload_json: r#"{"type":"cancel"}"#.into(),
         })
         .await
