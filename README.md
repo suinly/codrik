@@ -55,6 +55,12 @@ runtime:
   socket_path: /absolute/path/to/codrik.sock
   lock_path: /absolute/path/to/runtime.lock
   artifact_path: /absolute/path/to/artifacts
+
+telegram:
+  token: "..."
+  public_url: "https://agent.example.com/webhooks/telegram"
+  listen: "127.0.0.1:8080"
+  webhook_secret: "..."
 ```
 
 | Field | Required | Default | Description |
@@ -69,6 +75,10 @@ runtime:
 | `runtime.socket_path` | No | `<CODRIK_HOME>/codrik.sock` | Private Unix socket. |
 | `runtime.lock_path` | No | `<CODRIK_HOME>/runtime.lock` | Exclusive server instance lock. |
 | `runtime.artifact_path` | No | `<CODRIK_HOME>/artifacts` | Managed tool-result files. |
+| `telegram.token` | When Telegram is enabled | None | Bot token obtained from BotFather. Keep it private. |
+| `telegram.public_url` | When Telegram is enabled | None | Public HTTPS webhook URL without a query or fragment. |
+| `telegram.listen` | No | `127.0.0.1:8080` | Local HTTP listener behind the HTTPS reverse proxy. |
+| `telegram.webhook_secret` | When Telegram is enabled | None | Secret-token value used to authenticate Telegram webhook requests. |
 
 ### Runtime paths
 
@@ -134,6 +144,119 @@ codrik link
 The daemon prints an eight-character code and the exact `/link CODE` message to
 send in the new channel. Codes expire after 10 minutes, can be used once, and a
 new code invalidates the actor's previous unused code.
+
+## Telegram webhook gateway
+
+Telegram support is optional. When the `telegram` section is present,
+`codrik serve` binds the configured local listener, calls `getMe`, registers
+the webhook with `setWebhook`, and verifies the resulting webhook information
+before the runtime becomes ready. Startup fails if registration or
+verification does not match the configured public URL.
+
+TLS termination belongs to a reverse proxy. Proxy only the exact webhook path
+to Codrik's local listener. For example, with Caddy:
+
+```caddyfile
+agent.example.com {
+    @telegram path /webhooks/telegram
+    reverse_proxy @telegram 127.0.0.1:8080
+}
+```
+
+Or with Nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name agent.example.com;
+
+    location = /webhooks/telegram {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+Keep `telegram.listen` on loopback unless the surrounding network provides an
+equivalent access boundary. The public URL must use HTTPS and must have the
+same path as the reverse-proxy rule. The bot token and webhook secret are
+redacted from debug output and are never included in runtime logs.
+
+### Linking Telegram
+
+Generate a one-time code in an already authorized local channel:
+
+```sh
+codrik link
+```
+
+Then send the printed command to the bot in a private chat:
+
+```text
+/link CODE
+```
+
+The link command is handled by the gateway itself. It does not create an agent
+event, work item, model call, or memory entry. Once linked, Telegram and local
+CLI requests resolve to the same actor and therefore share actor-private
+memory and durable knowledge.
+
+Link codes expire after 10 minutes and are single-use. Replaying the same
+Telegram update is idempotent. A Telegram identity already linked to another
+actor is not silently reassigned.
+
+### Supported Telegram scope
+
+Inbound support is intentionally narrow:
+
+- private chats only;
+- non-bot senders only;
+- text messages and `/link` commands only;
+- one Telegram bot per Codrik runtime.
+
+Groups, channels, callback queries, incoming photos, documents, and other
+attachments are ignored. Outbound replies support text and managed files.
+JPEG, PNG, and WebP files up to 10 MiB use Telegram photo delivery; other
+managed files up to 50 MiB use document delivery.
+
+Streaming updates such as `Thinking…` and partial text edits are transient and
+best effort. They may be dropped during overload, restart, or a Telegram API
+failure. Final text chunks and files are stored in SQLite before transport and
+are delivered by a separate durable worker. Final text is split at Unicode
+boundaries to Telegram's 4096-character limit; captions use a 1024-character
+limit.
+
+Telegram API retryable failures use bounded exponential backoff. A Telegram
+`429 retry_after` value takes precedence. Terminal API responses are recorded
+as `failed_terminal`. If Codrik cannot determine whether Telegram accepted a
+send, the delivery becomes `outcome_unknown` and is not automatically repeated
+because doing so could duplicate a message.
+
+### Telegram troubleshooting
+
+- `401 Unauthorized`: the
+  `X-Telegram-Bot-Api-Secret-Token` header is missing or does not exactly match
+  `telegram.webhook_secret`. Let Telegram set this header; do not replace it in
+  the proxy.
+- `413 Payload Too Large`: the webhook body exceeded 1 MiB. Standard private
+  text updates should remain well below this limit.
+- `503 Service Unavailable`: Codrik could not durably process the update,
+  usually because SQLite authority or storage was unavailable, or the
+  64-request webhook concurrency limit was saturated. Telegram may retry the
+  update using the same update ID.
+- Webhook reconciliation mismatch during startup: verify that
+  `telegram.public_url` exactly matches the externally reachable HTTPS URL and
+  that the configured bot token belongs to the intended bot.
+- Telegram `429`: Codrik schedules the delivery at Telegram's requested retry
+  time. Persistent rate limiting usually indicates excessive outbound traffic.
+- `failed_terminal`: Telegram definitively rejected the delivery, for example
+  because the chat is unavailable or a managed file violates a delivery
+  constraint. Correct the underlying configuration or channel state; Codrik
+  does not automatically retry terminal failures.
+- `outcome_unknown`: a transport interruption occurred after a send may have
+  reached Telegram. Inspect the chat before taking manual action to avoid a
+  duplicate message.
 
 Resume a disconnected request:
 

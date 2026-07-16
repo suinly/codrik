@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::runtime::model::{
-    ActorId, AttemptId, DeliveryId, OutboxId, RequestId, RunId, WorkItemId,
+    ActorId, AttemptId, DeliveryId, GatewayDeliveryId, OutboxId, RequestId, RunId, WorkItemId,
 };
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -14,6 +14,9 @@ pub enum RuntimeComponent {
     Ipc,
     Dispatcher,
     Outbox,
+    TelegramWebhook,
+    TelegramDelivery,
+    TelegramStreaming,
     Recovery,
     Supervisor,
 }
@@ -67,6 +70,10 @@ pub struct RuntimeLogEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_id: Option<DeliveryId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_delivery_id: Option<GatewayDeliveryId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_update_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_generation: Option<i64>,
     pub transition: RuntimeTransition,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +103,8 @@ impl RuntimeLogEvent {
             attempt_id: None,
             outbox_id: None,
             delivery_id: None,
+            gateway_delivery_id: None,
+            gateway_update_id: None,
             lease_generation: None,
             transition,
             latency_ms: None,
@@ -172,7 +181,7 @@ mod tests {
 
     use crate::runtime::{
         RequestId,
-        model::{ActorId, AttemptId, DeliveryId, OutboxId, RunId, WorkItemId},
+        model::{ActorId, AttemptId, DeliveryId, GatewayDeliveryId, OutboxId, RunId, WorkItemId},
         observability::{
             RuntimeComponent, RuntimeErrorClass, RuntimeLogEvent, RuntimeLogger,
             RuntimeRecoveryCounts, RuntimeTransition, StderrRuntimeLogger,
@@ -230,6 +239,9 @@ mod tests {
         event.attempt_id = Some(AttemptId::from_string("attempt-id"));
         event.outbox_id = Some(OutboxId::from_string("outbox-id"));
         event.delivery_id = Some(DeliveryId::new());
+        event.gateway_delivery_id = Some(GatewayDeliveryId::from_string("gateway-delivery-id"));
+        event.gateway_update_id = Some(4242);
+        event.telegram_bot_id = Some("900".into());
         event.lease_generation = Some(7);
         event.error_class = Some(RuntimeErrorClass::UnknownExternalOutcome);
         event.recovery = Some(RuntimeRecoveryCounts {
@@ -242,9 +254,18 @@ mod tests {
         let line = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         assert_eq!(line.lines().count(), 1);
         let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        for value in ["actor-id", "work-id", "run-id", "attempt-id", "outbox-id"] {
+        for value in [
+            "actor-id",
+            "work-id",
+            "run-id",
+            "attempt-id",
+            "outbox-id",
+            "gateway-delivery-id",
+        ] {
             assert!(line.contains(value));
         }
+        assert_eq!(json["gateway_update_id"], 4242);
+        assert_eq!(json["telegram_bot_id"], "900");
         assert_eq!(json["error_class"], "unknown_external_outcome");
         assert_eq!(json["recovery"]["orphaned_running_attempts"], 3);
         for forbidden in [
@@ -260,6 +281,11 @@ mod tests {
             "code_hash",
             "identity_subject",
             "/link ABCD-EFGH",
+            "123456789:AARealLookingBotToken",
+            "real_webhook_secret",
+            "private Telegram message",
+            "telegram-user-subject-4242",
+            "chat-address-4242",
         ] {
             assert!(!line.contains(forbidden));
         }

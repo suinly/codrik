@@ -1569,3 +1569,311 @@ async fn scenario_17_slow_or_malformed_clients_do_not_exhaust_daemon() -> Result
     drop(slow);
     Ok(())
 }
+
+mod telegram_acceptance {
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    use super::{ACTOR, InjectedLlm, InjectedReply};
+    use codrik::{
+        config::ValidatedTelegramConfig,
+        interfaces::telegram::{
+            api::{
+                EditMessageText, SendFile, SendMessage, SetWebhook, TelegramApi, TelegramApiError,
+                TelegramMessageRef, WebhookInfo,
+            },
+            delivery::TelegramDeliveryWorker,
+            prepare_with_api,
+            streaming::TelegramStreamingWorker,
+        },
+        runtime::{
+            artifacts::ArtifactManager,
+            gateway_activity::GatewayActivityHub,
+            identity_link::{IdentityLinkManager, IdentityLinkService, SystemLinkCodeGenerator},
+            model::{ActorId, Clock, ManualClock},
+            runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
+            signals::ActorSignals,
+            sqlite::SqliteRuntimeStore,
+            store::ActorStore,
+            stream_hub::{CompositeRuntimeEventPublisher, NoopRuntimeEventPublisher},
+        },
+        tools::ToolRegistry,
+    };
+
+    #[derive(Clone, Default)]
+    struct TelegramApiMock {
+        sent: Arc<Mutex<Vec<String>>>,
+        edited: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl TelegramApi for TelegramApiMock {
+        async fn get_me(
+            &self,
+        ) -> std::result::Result<codrik::interfaces::telegram::types::TelegramBot, TelegramApiError>
+        {
+            Ok(codrik::interfaces::telegram::types::TelegramBot {
+                id: 900,
+                is_bot: true,
+                username: Some("codrik_bot".into()),
+            })
+        }
+
+        async fn set_webhook(
+            &self,
+            _command: SetWebhook,
+        ) -> std::result::Result<(), TelegramApiError> {
+            Ok(())
+        }
+
+        async fn get_webhook_info(&self) -> std::result::Result<WebhookInfo, TelegramApiError> {
+            Ok(WebhookInfo {
+                url: "https://agent.example/webhooks/telegram".into(),
+                allowed_updates: vec!["message".into()],
+                pending_update_count: 0,
+            })
+        }
+
+        async fn send_message(
+            &self,
+            command: SendMessage,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            self.sent.lock().unwrap().push(command.text);
+            Ok(TelegramMessageRef { message_id: 77 })
+        }
+
+        async fn edit_message_text(
+            &self,
+            command: EditMessageText,
+        ) -> std::result::Result<(), TelegramApiError> {
+            self.edited.lock().unwrap().push(command.text);
+            Ok(())
+        }
+
+        async fn send_photo(
+            &self,
+            _command: SendFile,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn send_document(
+            &self,
+            _command: SendFile,
+        ) -> std::result::Result<TelegramMessageRef, TelegramApiError> {
+            unreachable!()
+        }
+    }
+
+    fn update(update_id: i64, message_id: i64, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "from": {
+                    "id": 4242,
+                    "is_bot": false,
+                    "username": "owner"
+                },
+                "chat": {
+                    "id": 4242,
+                    "type": "private"
+                },
+                "text": text
+            }
+        })
+    }
+
+    async fn counts(path: &std::path::Path) -> Result<(i64, i64, i64, i64, i64)> {
+        let connection = tokio_rusqlite::Connection::open(path).await?;
+        connection
+            .call(
+                |database| -> tokio_rusqlite::rusqlite::Result<(i64, i64, i64, i64, i64)> {
+                    Ok((
+                        database.query_row("SELECT COUNT(*) FROM gateway_commands", [], |row| {
+                            row.get(0)
+                        })?,
+                        database.query_row(
+                            "SELECT COUNT(*) FROM identities WHERE provider = 'telegram:900'",
+                            [],
+                            |row| row.get(0),
+                        )?,
+                        database.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?,
+                        database
+                            .query_row("SELECT COUNT(*) FROM work_items", [], |row| row.get(0))?,
+                        database.query_row(
+                            "SELECT COUNT(*) FROM gateway_deliveries",
+                            [],
+                            |row| row.get(0),
+                        )?,
+                    ))
+                },
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn telegram_webhook_links_runs_and_delivers_without_duplicates() -> Result<()> {
+        let root = std::env::current_dir()?
+            .join(".t")
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir_all(&root)?;
+        let database = root.join("runtime.sqlite");
+        let artifacts = root.join("artifacts");
+        let store = SqliteRuntimeStore::open(&database).await?;
+        let actor = ActorId::parse_workspace_safe(ACTOR)?;
+        let clock = ManualClock::new(1_000);
+        store
+            .ensure_initial_actor(&actor, &["*".into()], clock.now())
+            .await?;
+        let linking: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            clock.clone(),
+            SystemLinkCodeGenerator,
+        ));
+        let code = linking.issue_code(&actor).await?.code;
+        let signals = ActorSignals::default();
+        let api = TelegramApiMock::default();
+        let activity = GatewayActivityHub::default();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let webhook_address = probe.local_addr()?;
+        drop(probe);
+        let prepared = Arc::new(
+            prepare_with_api(
+                ValidatedTelegramConfig {
+                    token: "test-token".into(),
+                    public_url: url::Url::parse("https://agent.example/webhooks/telegram")?,
+                    listen: webhook_address,
+                    webhook_secret: "acceptance_secret".into(),
+                },
+                store.clone(),
+                linking,
+                signals.clone(),
+                activity.clone(),
+                clock.clone(),
+                artifacts.clone(),
+                api.clone(),
+            )
+            .await?,
+        );
+        let (webhook_shutdown_tx, webhook_shutdown_rx) = tokio::sync::watch::channel(false);
+        let webhook_task = {
+            let prepared = prepared.clone();
+            tokio::spawn(async move { prepared.webhook(webhook_shutdown_rx).await })
+        };
+        let client = reqwest::Client::new();
+        let delivery = TelegramDeliveryWorker::new(
+            store.clone(),
+            api.clone(),
+            clock.clone(),
+            "telegram:900",
+            "acceptance-delivery",
+            artifacts.clone(),
+        );
+
+        let link_update = update(10, 100, &format!("/link {code}"));
+        let link_response = client
+            .post(format!("http://{webhook_address}/webhooks/telegram"))
+            .header("content-type", "application/json")
+            .header("x-telegram-bot-api-secret-token", "acceptance_secret")
+            .json(&link_update)
+            .send()
+            .await?;
+        assert_eq!(link_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(counts(&database).await?, (1, 1, 0, 0, 1));
+        assert_eq!(delivery.run_once().await?, 1);
+        assert_eq!(
+            *api.sent.lock().unwrap(),
+            vec!["This channel is now linked."]
+        );
+
+        let text_update = update(11, 101, "remember this across channels");
+        let text_response = client
+            .post(format!("http://{webhook_address}/webhooks/telegram"))
+            .header("content-type", "application/json")
+            .header("x-telegram-bot-api-secret-token", "acceptance_secret")
+            .json(&text_update)
+            .send()
+            .await?;
+        assert_eq!(text_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(counts(&database).await?, (1, 1, 1, 1, 1));
+
+        let streaming = Arc::new(TelegramStreamingWorker::new(
+            store.clone(),
+            api.clone(),
+            clock.clone(),
+            "telegram:900",
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let streaming_task = {
+            let streaming = streaming.clone();
+            let receiver = activity.subscribe();
+            tokio::spawn(async move { streaming.run(receiver, shutdown_rx).await })
+        };
+        let events = Arc::new(CompositeRuntimeEventPublisher::new(
+            Arc::new(NoopRuntimeEventPublisher),
+            activity,
+        ));
+        let runner = ActorRunner::new(
+            InjectedLlm::new(vec![InjectedReply::Text("durable final".into())]),
+            ToolRegistry::new(),
+            signals,
+            events,
+            RunnerLimits::default(),
+            ArtifactManager::new(artifacts, store.clone(), clock.clone()),
+        );
+        assert_eq!(
+            runner.run_once("telegram-acceptance").await?,
+            RunOnceOutcome::Completed
+        );
+        let restarted_store = SqliteRuntimeStore::open(&database).await?;
+        let restarted_delivery = TelegramDeliveryWorker::new(
+            restarted_store,
+            api.clone(),
+            clock.clone(),
+            "telegram:900",
+            "acceptance-delivery-restarted",
+            root.join("artifacts"),
+        );
+        assert_eq!(restarted_delivery.run_once().await?, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if api
+                    .edited
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|text| text == "durable final")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        for replay in [&link_update, &text_update] {
+            let response = client
+                .post(format!("http://{webhook_address}/webhooks/telegram"))
+                .header("content-type", "application/json")
+                .header("x-telegram-bot-api-secret-token", "acceptance_secret")
+                .json(replay)
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+        assert_eq!(delivery.run_once().await?, 0);
+        assert_eq!(counts(&database).await?, (1, 1, 1, 1, 2));
+
+        shutdown_tx.send_replace(true);
+        streaming_task.await??;
+        webhook_shutdown_tx.send_replace(true);
+        webhook_task.await??;
+        drop(store);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
