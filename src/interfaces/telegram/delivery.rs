@@ -554,6 +554,13 @@ mod tests {
             self.response().await
         }
 
+        async fn send_chat_action(
+            &self,
+            _command: crate::interfaces::telegram::api::SendChatAction,
+        ) -> Result<(), TelegramApiError> {
+            unreachable!()
+        }
+
         async fn edit_message_text(
             &self,
             command: EditMessageText,

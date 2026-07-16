@@ -77,13 +77,7 @@ impl TelegramUpdate {
             subject: sender.id.to_string(),
             username: sender.username.clone(),
         };
-        let route = DeliveryRoute::new(
-            gateway,
-            message.chat.id.to_string(),
-            Some(message.message_id.to_string()),
-            4096,
-            1024,
-        )?;
+        let route = DeliveryRoute::new(gateway, message.chat.id.to_string(), None, 4096, 1024)?;
         let (command, argument) = split_command(text);
         if command == "/link" || command == format!("/link@{bot_username}") {
             return Ok(TelegramInbound::Link {
@@ -142,7 +136,7 @@ mod tests {
                     && identity.provider == "telegram:900"
                     && identity.subject == "100"
                     && route.address == "100"
-                    && route.reply_to_external_id.as_deref() == Some("7")
+                    && route.reply_to_external_id.is_none()
         ));
         Ok(())
     }
@@ -164,6 +158,7 @@ mod tests {
                 if text == "hello"
                     && route.max_text_chars == 4096
                     && route.max_caption_chars == 1024
+                    && route.reply_to_external_id.is_none()
         ));
         Ok(())
     }

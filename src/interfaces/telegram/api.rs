@@ -89,6 +89,18 @@ pub struct EditMessageText {
 }
 
 #[derive(Clone, Serialize)]
+pub struct SendChatAction {
+    pub chat_id: String,
+    pub action: TelegramChatAction,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramChatAction {
+    Typing,
+}
+
+#[derive(Clone, Serialize)]
 pub struct ReplyParameters {
     pub message_id: i64,
 }
@@ -116,6 +128,7 @@ pub trait TelegramApi: Send + Sync {
         &self,
         command: SendMessage,
     ) -> Result<TelegramMessageRef, TelegramApiError>;
+    async fn send_chat_action(&self, command: SendChatAction) -> Result<(), TelegramApiError>;
     async fn edit_message_text(&self, command: EditMessageText) -> Result<(), TelegramApiError>;
     async fn send_photo(&self, command: SendFile) -> Result<TelegramMessageRef, TelegramApiError>;
     async fn send_document(
@@ -279,6 +292,11 @@ impl TelegramApi for ReqwestTelegramApi {
         self.post_json("sendMessage", &command, false).await
     }
 
+    async fn send_chat_action(&self, command: SendChatAction) -> Result<(), TelegramApiError> {
+        let _: bool = self.post_json("sendChatAction", &command, true).await?;
+        Ok(())
+    }
+
     async fn edit_message_text(&self, command: EditMessageText) -> Result<(), TelegramApiError> {
         match self
             .post_json::<_, TelegramMessageRef>("editMessageText", &command, true)
@@ -395,7 +413,10 @@ mod tests {
         net::TcpListener,
     };
 
-    use super::{ReqwestTelegramApi, SendMessage, TelegramApi, TelegramApiErrorClass};
+    use super::{
+        ReqwestTelegramApi, SendChatAction, SendMessage, TelegramApi, TelegramApiErrorClass,
+        TelegramChatAction,
+    };
 
     #[tokio::test]
     async fn get_me_decodes_successful_envelope() -> Result<()> {
@@ -423,6 +444,41 @@ mod tests {
         let bot = api.get_me().await?;
         assert_eq!(bot.id, 900);
         assert_eq!(bot.username.as_deref(), Some("codrik_bot"));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_chat_action_posts_typed_typing_action() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /botsecret-token/sendChatAction "));
+            assert!(request.contains(r#""chat_id":"100""#));
+            assert!(request.contains(r#""action":"typing""#));
+            let body = r#"{"ok":true,"result":true}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            anyhow::Ok(())
+        });
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &base)?;
+
+        api.send_chat_action(SendChatAction {
+            chat_id: "100".into(),
+            action: TelegramChatAction::Typing,
+        })
+        .await?;
         server.await??;
         Ok(())
     }

@@ -386,6 +386,13 @@ mod tests {
             Ok(TelegramMessageRef { message_id: 77 })
         }
 
+        async fn send_chat_action(
+            &self,
+            _command: crate::interfaces::telegram::api::SendChatAction,
+        ) -> std::result::Result<(), TelegramApiError> {
+            Ok(())
+        }
+
         async fn edit_message_text(
             &self,
             command: EditMessageText,

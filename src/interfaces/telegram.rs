@@ -284,6 +284,13 @@ mod tests {
             unreachable!()
         }
 
+        async fn send_chat_action(
+            &self,
+            _command: crate::interfaces::telegram::api::SendChatAction,
+        ) -> std::result::Result<(), TelegramApiError> {
+            unreachable!()
+        }
+
         async fn edit_message_text(
             &self,
             _command: EditMessageText,
