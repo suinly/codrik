@@ -1152,6 +1152,7 @@ mod tests {
 
     use crate::{
         runtime::{
+            gateway::GatewayCommandKey,
             identity_link::{IdentityLinkManager, IssuedLinkCode, LinkRedemption},
             ipc::{
                 protocol::{
@@ -1196,6 +1197,15 @@ mod tests {
 
         async fn redeem_code(
             &self,
+            _identity: LinkIdentity,
+            _code: &str,
+        ) -> Result<LinkRedemption> {
+            unreachable!("IPC issuance never redeems a link code")
+        }
+
+        async fn redeem_code_once(
+            &self,
+            _key: GatewayCommandKey,
             _identity: LinkIdentity,
             _code: &str,
         ) -> Result<LinkRedemption> {

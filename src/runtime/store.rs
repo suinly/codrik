@@ -199,6 +199,15 @@ pub enum StoreLinkRedemption {
     IdentityConflict { actor_id: ActorId },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreLinkCommandRedemption {
+    Linked { actor_id: ActorId },
+    AlreadyLinked { actor_id: ActorId },
+    InvalidOrExpired,
+    RateLimited { retry_at: Timestamp },
+    IdentityConflict,
+}
+
 #[async_trait]
 pub trait IdentityLinkStore: Send + Sync {
     async fn replace_link_code(
@@ -215,6 +224,14 @@ pub trait IdentityLinkStore: Send + Sync {
         code_hash: Option<[u8; 32]>,
         now: Timestamp,
     ) -> Result<StoreLinkRedemption>;
+
+    async fn redeem_link_code_once(
+        &self,
+        key: GatewayCommandKey,
+        identity: LinkIdentity,
+        code_hash: Option<[u8; 32]>,
+        now: Timestamp,
+    ) -> Result<StoreLinkCommandRedemption>;
 
     async fn collect_expired_link_state(&self, now: Timestamp, limit: usize) -> Result<usize>;
 }

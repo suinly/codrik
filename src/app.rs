@@ -585,6 +585,15 @@ mod tests {
             unreachable!("GC test never redeems codes")
         }
 
+        async fn redeem_code_once(
+            &self,
+            _key: crate::runtime::gateway::GatewayCommandKey,
+            _identity: crate::runtime::store::LinkIdentity,
+            _code: &str,
+        ) -> Result<crate::runtime::identity_link::LinkRedemption> {
+            unreachable!("GC test never redeems codes")
+        }
+
         async fn collect_expired(&self, limit: usize) -> Result<usize> {
             assert_eq!(limit, IDENTITY_LINK_GC_BATCH);
             self.0.fetch_add(1, Ordering::SeqCst);

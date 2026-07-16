@@ -3,8 +3,12 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 use crate::runtime::{
+    gateway::GatewayCommandKey,
     model::{ActorId, Clock, Timestamp},
-    store::{IdentityLinkStore, LinkIdentity, StoreLinkCodeReplacement, StoreLinkRedemption},
+    store::{
+        IdentityLinkStore, LinkIdentity, StoreLinkCodeReplacement, StoreLinkCommandRedemption,
+        StoreLinkRedemption,
+    },
 };
 
 pub const LINK_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -83,6 +87,12 @@ impl LinkCodeGenerator for SystemLinkCodeGenerator {
 pub trait IdentityLinkManager: Send + Sync {
     async fn issue_code(&self, actor: &ActorId) -> Result<IssuedLinkCode>;
     async fn redeem_code(&self, identity: LinkIdentity, code: &str) -> Result<LinkRedemption>;
+    async fn redeem_code_once(
+        &self,
+        key: GatewayCommandKey,
+        identity: LinkIdentity,
+        code: &str,
+    ) -> Result<LinkRedemption>;
     async fn collect_expired(&self, limit: usize) -> Result<usize>;
 }
 
@@ -156,6 +166,34 @@ where
         )
     }
 
+    async fn redeem_code_once(
+        &self,
+        key: GatewayCommandKey,
+        identity: LinkIdentity,
+        code: &str,
+    ) -> Result<LinkRedemption> {
+        let hash = normalize_link_code(code).map(|normalized| hash_link_code(&normalized));
+        Ok(
+            match self
+                .store
+                .redeem_link_code_once(key, identity, hash, self.clock.now())
+                .await?
+            {
+                StoreLinkCommandRedemption::Linked { actor_id } => {
+                    LinkRedemption::Linked { actor_id }
+                }
+                StoreLinkCommandRedemption::AlreadyLinked { actor_id } => {
+                    LinkRedemption::AlreadyLinked { actor_id }
+                }
+                StoreLinkCommandRedemption::InvalidOrExpired => LinkRedemption::InvalidOrExpired,
+                StoreLinkCommandRedemption::RateLimited { retry_at } => {
+                    LinkRedemption::RateLimited { retry_at }
+                }
+                StoreLinkCommandRedemption::IdentityConflict => LinkRedemption::IdentityConflict,
+            },
+        )
+    }
+
     async fn collect_expired(&self, limit: usize) -> Result<usize> {
         self.store
             .collect_expired_link_state(self.clock.now(), limit)
@@ -180,8 +218,12 @@ mod tests {
         hash_link_code, normalize_link_code,
     };
     use crate::runtime::{
+        gateway::GatewayCommandKey,
         model::{ActorId, ManualClock, Timestamp},
-        store::{IdentityLinkStore, LinkIdentity, StoreLinkCodeReplacement, StoreLinkRedemption},
+        store::{
+            IdentityLinkStore, LinkIdentity, StoreLinkCodeReplacement, StoreLinkCommandRedemption,
+            StoreLinkRedemption,
+        },
     };
 
     #[derive(Clone)]
@@ -227,6 +269,17 @@ mod tests {
         ) -> Result<StoreLinkRedemption> {
             *self.last_hash.lock().unwrap() = Some(code_hash);
             Ok(StoreLinkRedemption::InvalidOrExpired)
+        }
+
+        async fn redeem_link_code_once(
+            &self,
+            _key: GatewayCommandKey,
+            _identity: LinkIdentity,
+            code_hash: Option<[u8; 32]>,
+            _now: Timestamp,
+        ) -> Result<StoreLinkCommandRedemption> {
+            *self.last_hash.lock().unwrap() = Some(code_hash);
+            Ok(StoreLinkCommandRedemption::InvalidOrExpired)
         }
 
         async fn collect_expired_link_state(
@@ -316,6 +369,39 @@ mod tests {
             LinkRedemption::InvalidOrExpired
         );
         assert_eq!(*observed.lock().unwrap(), Some(None));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_redemption_normalizes_before_idempotent_store_call() -> Result<()> {
+        let store = ScriptedStore {
+            replacements: Arc::new(Mutex::new(VecDeque::new())),
+            last_hash: Arc::new(Mutex::new(None)),
+        };
+        let observed = store.last_hash.clone();
+        let service =
+            IdentityLinkService::new(store, ManualClock::new(100), SequenceGenerator::new([]));
+        assert_eq!(
+            service
+                .redeem_code_once(
+                    GatewayCommandKey {
+                        gateway: "telegram:bot-1".into(),
+                        external_id: "42".into(),
+                    },
+                    LinkIdentity {
+                        provider: "telegram:bot-1".into(),
+                        subject: "123".into(),
+                        username: None,
+                    },
+                    "abcd-efgh",
+                )
+                .await?,
+            LinkRedemption::InvalidOrExpired
+        );
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(Some(hash_link_code("ABCDEFGH")))
+        );
         Ok(())
     }
 }
