@@ -1,9 +1,11 @@
 use crate::{
     config::{AppConfig, RuntimePaths, codrik_dir},
+    interfaces::telegram,
     llm::{client::LlmStreamClient, openai::OpenAiClient},
     runtime::{
         artifacts::ArtifactManager,
         dispatcher::ActorDispatcher,
+        gateway_activity::GatewayActivityHub,
         hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
         identity_link::{IdentityLinkManager, IdentityLinkService, SystemLinkCodeGenerator},
         instance_lock::InstanceLock,
@@ -21,7 +23,7 @@ use crate::{
         signals::ActorSignals,
         sqlite::{RUNTIME_SCHEMA_VERSION, SqliteRuntimeStore},
         store::{ActorStore, RuntimeStore},
-        stream_hub::StreamHub,
+        stream_hub::{CompositeRuntimeEventPublisher, RuntimeEventPublisher, StreamHub},
         supervisor::{ServeRuntime, Supervisor},
     },
     skills::{Skill, SkillRegistry, SkillRoot, builtin_skill_root},
@@ -178,6 +180,11 @@ where
     L: LlmStreamClient + Send + Sync + 'static,
     F: std::future::Future<Output = ()>,
 {
+    let telegram_config = config
+        .telegram
+        .as_ref()
+        .map(crate::config::TelegramConfig::validate)
+        .transpose()?;
     let runtime = config.required_runtime()?.clone();
     let paths = runtime.resolve_paths(&home)?;
     prepare_paths(&home, &paths)?;
@@ -206,6 +213,7 @@ where
 
     let signals = ActorSignals::default();
     let hub = Arc::new(StreamHub::default());
+    let gateway_activity = GatewayActivityHub::default();
     let outbox_owner = format!("outbox-{}", std::process::id());
     let dispatcher_owner = format!("dispatcher-{}", std::process::id());
     let outbox = Arc::new(OutboxWorker::new(
@@ -238,15 +246,37 @@ where
         .collect_expired(IDENTITY_LINK_GC_BATCH)
         .await?;
     trace.record(StartupPhase::ArtifactsCollected);
+    let telegram = match telegram_config {
+        Some(config) => Some(Arc::new(
+            telegram::prepare(
+                config,
+                store.clone(),
+                identity_linking.clone(),
+                signals.clone(),
+                gateway_activity.clone(),
+                clock.clone(),
+                paths.artifacts.clone(),
+            )
+            .await?,
+        )),
+        None => None,
+    };
     let tool_config =
         tool_config_for_actor_workspace(actor_workspace_path_in(&home, actor.id.as_str())?)?;
     let instructions = agent_instructions_for_tool_config(&tool_config);
     let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
+    let events: Arc<dyn RuntimeEventPublisher> = match &telegram {
+        Some(_) => Arc::new(CompositeRuntimeEventPublisher::new(
+            hub.clone(),
+            gateway_activity,
+        )),
+        None => hub.clone(),
+    };
     let runner = ActorRunner::new(
         llm,
         tools,
         signals.clone(),
-        hub.clone(),
+        events,
         RunnerLimits::default(),
         artifacts.clone(),
     )
@@ -267,6 +297,7 @@ where
     startup.database_path = Some(paths.database.clone());
     startup.socket_path = Some(paths.socket.clone());
     startup.schema_version = Some(RUNTIME_SCHEMA_VERSION);
+    startup.telegram_bot_id = telegram.as_ref().map(|gateway| gateway.bot_id().to_owned());
     startup.recovery = Some(RuntimeRecoveryCounts {
         expired_actor_leases: recovery.expired_actor_leases,
         expired_bundle_claims: recovery.expired_bundle_claims,
@@ -307,6 +338,22 @@ where
         let shutdown = shutdown_rx.clone();
         async move { run_identity_link_gc(identity_linking, shutdown).await }
     });
+    if let Some(telegram) = telegram {
+        service.component("telegram-webhook", {
+            let telegram = telegram.clone();
+            let shutdown = shutdown_rx.clone();
+            async move { telegram.webhook(shutdown).await }
+        });
+        service.component("telegram-delivery", {
+            let telegram = telegram.clone();
+            let shutdown = shutdown_rx.clone();
+            async move { telegram.delivery(shutdown).await }
+        });
+        service.component("telegram-streaming", {
+            let shutdown = shutdown_rx.clone();
+            async move { telegram.streaming(shutdown).await }
+        });
+    }
     service.component("dispatcher", async move {
         dispatcher.run_with_shutdown(shutdown_rx).await
     });

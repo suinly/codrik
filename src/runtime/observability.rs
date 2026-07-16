@@ -80,6 +80,8 @@ pub struct RuntimeLogEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_bot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RuntimeRecoveryCounts>,
 }
 
@@ -101,6 +103,7 @@ impl RuntimeLogEvent {
             database_path: None,
             socket_path: None,
             schema_version: None,
+            telegram_bot_id: None,
             recovery: None,
         }
     }
