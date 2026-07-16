@@ -18,6 +18,18 @@ impl ActorStore for SqliteRuntimeStore {
     ) -> Result<ActorBootstrapOutcome> {
         let id = ActorId::parse_workspace_safe(id.as_str())?;
         let tools_json = serde_json::to_string(tools)?;
+        let initialized = self
+            .connection
+            .call(|connection| {
+                connection.query_row("SELECT EXISTS(SELECT 1 FROM actors)", [], |row| {
+                    row.get::<_, bool>(0)
+                })
+            })
+            .await
+            .map_err(|error| anyhow!("failed to inspect runtime actors: {error}"))?;
+        if initialized {
+            return Ok(ActorBootstrapOutcome::AlreadyInitialized);
+        }
         self.connection
             .call(move |connection| -> Result<ActorBootstrapOutcome> {
                 let transaction = connection.transaction_with_behavior(

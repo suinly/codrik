@@ -114,7 +114,7 @@ enum StartupPhase {
     PathsValidated,
     LockAcquired,
     Migrated,
-    AuthImported,
+    ActorBootstrapped,
     ActorVerified,
     ParentsValidated,
     StaleSocketRemoved,
@@ -184,12 +184,15 @@ where
     trace.record(StartupPhase::LockAcquired);
     let store = SqliteRuntimeStore::open(&paths.database).await?;
     trace.record(StartupPhase::Migrated);
-    import_legacy_authorization_once(&store, &home.join("users.json"), clock.now()).await?;
-    trace.record(StartupPhase::AuthImported);
-    let actor_id = ActorId::from_string(runtime.actor_id);
-    let actor = store.load_actor(&actor_id).await?.with_context(|| {
-        format!("configured runtime actor {actor_id} does not exist; authorize an actor and set runtime.actor_id")
-    })?;
+    let actor_id = ActorId::parse_workspace_safe(&runtime.actor_id)?;
+    store
+        .ensure_initial_actor(&actor_id, &["*".to_string()], clock.now())
+        .await?;
+    trace.record(StartupPhase::ActorBootstrapped);
+    let actor = store
+        .load_actor(&actor_id)
+        .await?
+        .with_context(|| format!("configured runtime actor {actor_id} does not exist"))?;
     if !actor.enabled {
         bail!("configured runtime actor {actor_id} is disabled");
     }
@@ -452,16 +455,8 @@ fn default_skill_roots() -> Result<Vec<SkillRoot>> {
 }
 
 fn actor_workspace_path_in(home: &Path, actor_id: &str) -> Result<std::path::PathBuf> {
-    if actor_id.is_empty()
-        || actor_id == "."
-        || actor_id == ".."
-        || actor_id.contains('/')
-        || actor_id.contains('\\')
-    {
-        bail!("unsafe actor id for workspace path: {actor_id}");
-    }
-
-    Ok(home.join("workspaces").join(actor_id))
+    let actor_id = ActorId::parse_workspace_safe(actor_id)?;
+    Ok(home.join("workspaces").join(actor_id.as_str()))
 }
 
 fn default_agent_instructions() -> String {
@@ -668,48 +663,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_auth_marker_is_checked_before_reading_corrupt_file() -> Result<()> {
-        let root = temp_root("auth-marker")?;
-        let users = root.join("users.json");
-        fs::write(&users, r#"{"version":1,"actors":{}}"#)?;
-        let store = SqliteRuntimeStore::open_in_memory().await?;
-        assert_eq!(
-            import_legacy_authorization_once(&store, &users, crate::runtime::model::Timestamp(1))
-                .await?,
-            crate::runtime::store::ImportOutcome::Imported
-        );
-        fs::write(&users, "not json and must not be read")?;
-        assert_eq!(
-            import_legacy_authorization_once(&store, &users, crate::runtime::model::Timestamp(2))
-                .await?,
-            crate::runtime::store::ImportOutcome::AlreadyImported
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_legacy_auth_parse_does_not_set_marker() -> Result<()> {
-        let root = temp_root("auth-failure")?;
-        let users = root.join("users.json");
-        fs::write(&users, "not json")?;
-        let store = SqliteRuntimeStore::open_in_memory().await?;
-        assert!(
-            import_legacy_authorization_once(&store, &users, crate::runtime::model::Timestamp(1))
-                .await
-                .is_err()
-        );
-        assert!(!store.legacy_authorization_imported().await?);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn serve_dependency_seam_uses_injected_clock_for_runtime_state() -> Result<()> {
         let home = short_runtime_root("injected-clock")?;
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
-        fs::write(
-            home.join("users.json"),
-            r#"{"version":1,"actors":{"actor:local:owner":{"enabled":true,"display_name":null,"identities":[],"tools":["*"]}}}"#,
-        )?;
         let config: AppConfig = yaml_serde::from_str(
             "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: actor:local:owner\n",
         )?;
@@ -740,10 +696,6 @@ mod tests {
     async fn production_startup_is_ordered_and_ready_only_after_recovery() -> Result<()> {
         let home = short_runtime_root("order")?;
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
-        fs::write(
-            home.join("users.json"),
-            r#"{"version":1,"actors":{"actor:local:owner":{"enabled":true,"display_name":null,"identities":[],"tools":["*"]}}}"#,
-        )?;
         let stale = std::os::unix::net::UnixListener::bind(home.join("codrik.sock"))?;
         drop(stale);
         let config: AppConfig = yaml_serde::from_str(
@@ -766,7 +718,7 @@ mod tests {
                 StartupPhase::PathsValidated,
                 StartupPhase::LockAcquired,
                 StartupPhase::Migrated,
-                StartupPhase::AuthImported,
+                StartupPhase::ActorBootstrapped,
                 StartupPhase::ActorVerified,
                 StartupPhase::ParentsValidated,
                 StartupPhase::StaleSocketRemoved,
@@ -812,12 +764,24 @@ mod tests {
         for (configured, enabled) in [("actor:missing", true), ("actor:local:owner", false)] {
             let home = short_runtime_root("actor")?;
             fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
-            fs::write(
-                home.join("users.json"),
-                format!(
-                    r#"{{"version":1,"actors":{{"actor:local:owner":{{"enabled":{enabled},"display_name":null,"identities":[],"tools":[]}}}}}}"#
-                ),
-            )?;
+            let database_path = home.join("runtime.sqlite");
+            let store = SqliteRuntimeStore::open(&database_path).await?;
+            let owner = ActorId::parse_workspace_safe("actor:local:owner")?;
+            store
+                .ensure_initial_actor(&owner, &[], crate::runtime::model::Timestamp(1))
+                .await?;
+            drop(store);
+            if !enabled {
+                tokio_rusqlite::Connection::open(&database_path)
+                    .await?
+                    .call(|database| {
+                        database.execute(
+                            "UPDATE actors SET enabled = 0 WHERE id = 'actor:local:owner'",
+                            [],
+                        )
+                    })
+                    .await?;
+            }
             let stale_path = home.join("codrik.sock");
             let stale = std::os::unix::net::UnixListener::bind(&stale_path)?;
             drop(stale);
@@ -825,19 +789,23 @@ mod tests {
                 "api_key: key\nbase_url: https://example.test/v1\nmodel: test\nruntime:\n  actor_id: {configured}\n"
             ))?;
             let trace = RecordingStartupTrace::default();
-            assert!(
-                serve_at_until(
-                    config,
-                    Arc::new(crate::runtime::observability::NoopRuntimeLogger),
-                    &trace,
-                    home,
-                    SystemClock,
-                    OpenAiClient::new("test", "key", "https://example.test/v1"),
-                    async {},
-                )
-                .await
-                .is_err()
-            );
+            let error = serve_at_until(
+                config,
+                Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+                &trace,
+                home,
+                SystemClock,
+                OpenAiClient::new("test", "key", "https://example.test/v1"),
+                async {},
+            )
+            .await
+            .unwrap_err();
+            let expected = if configured == "actor:missing" {
+                "configured runtime actor actor:missing does not exist"
+            } else {
+                "configured runtime actor actor:local:owner is disabled"
+            };
+            assert!(error.to_string().contains(expected), "{error:#}");
             assert!(stale_path.exists());
             assert!(
                 !trace

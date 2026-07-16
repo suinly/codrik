@@ -29,8 +29,11 @@ use uuid::Uuid;
 use codrik::{
     interfaces::local_renderer::{FinalBundleVerifier, VerifiedFinalBundle},
     runtime::{
-        hooks::RuntimeBoundaryHooks, ipc::protocol::ServerEvent, model::RequestId,
-        store::FinalPayload,
+        hooks::RuntimeBoundaryHooks,
+        ipc::protocol::ServerEvent,
+        model::{ActorId, RequestId, Timestamp},
+        sqlite::SqliteRuntimeStore,
+        store::{ActorStore, FinalPayload},
     },
 };
 
@@ -227,9 +230,26 @@ impl RuntimeHarness {
         let socket = root.join("s");
         let database = root.join("d");
         let log = root.join("l");
-        fs::write(root.join("users.json"), format!(r#"{{"version":1,"actors":{{"{ACTOR}":{{"enabled":{enabled},"display_name":null,"identities":[],"tools":["*"]}}}}}}"#)).context("write users")?;
-        fs::set_permissions(root.join("users.json"), fs::Permissions::from_mode(0o600))
-            .context("secure users")?;
+        if !enabled {
+            let store = SqliteRuntimeStore::open(&database).await?;
+            store
+                .ensure_initial_actor(
+                    &ActorId::parse_workspace_safe(ACTOR)?,
+                    &["*".into()],
+                    Timestamp(1),
+                )
+                .await?;
+            drop(store);
+            tokio_rusqlite::Connection::open(&database)
+                .await?
+                .call(|connection| {
+                    connection.execute(
+                        "UPDATE actors SET enabled = 0 WHERE id = 'actor:local:owner'",
+                        [],
+                    )
+                })
+                .await?;
+        }
         fs::write(&config, format!("api_key: test\nbase_url: {}\nmodel: scripted\nruntime:\n  actor_id: {ACTOR}\n  database_path: {}\n  socket_path: {}\n  lock_path: {}\n  artifact_path: {}\n", provider.endpoint, database.display(), socket.display(), root.join("k").display(), root.join("a").display())).context("write config")?;
         let mut harness = Self {
             test_roots,
@@ -591,13 +611,6 @@ impl InjectedHarness {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         let socket = root.join("s");
         let database = root.join("d");
-        fs::write(
-            root.join("users.json"),
-            format!(
-                r#"{{"version":1,"actors":{{"{ACTOR}":{{"enabled":true,"display_name":null,"identities":[],"tools":["*"]}}}}}}"#
-            ),
-        )?;
-        fs::set_permissions(root.join("users.json"), fs::Permissions::from_mode(0o600))?;
         let config = yaml_serde::from_str(&format!(
             "api_key: injected\nbase_url: https://unused.invalid/v1\nmodel: injected\nruntime:\n  actor_id: {ACTOR}\n  database_path: {}\n  socket_path: {}\n  lock_path: {}\n  artifact_path: {}\n",
             database.display(),
@@ -720,6 +733,30 @@ impl Drop for InjectedHarness {
         let _ = fs::remove_dir_all(&self.root);
         let _ = fs::remove_dir(&self.test_roots);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_runtime_bootstraps_configured_actor_without_users_file() -> Result<()> {
+    let harness = InjectedHarness::start(vec![]).await?;
+    assert!(!harness.root.join("users.json").exists());
+    assert_eq!(
+        harness
+            .scalar(format!(
+                "SELECT CAST(enabled AS TEXT) FROM actors WHERE id = '{ACTOR}'"
+            ))
+            .await?,
+        "1"
+    );
+    assert_eq!(
+        harness
+            .scalar(format!(
+                "SELECT tools_json FROM actors WHERE id = '{ACTOR}'"
+            ))
+            .await?,
+        r#"["*"]"#
+    );
+    drop(harness);
+    Ok(())
 }
 
 fn request_id() -> String {
