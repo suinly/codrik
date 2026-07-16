@@ -433,6 +433,7 @@ mod tests {
         assert!(foreign_keys);
         assert_eq!(probe.user_version, 2);
         assert_eq!(probe.foreign_key_errors, 0);
+        assert!(!tables.contains(&"runtime_metadata".to_string()));
         for table in [
             "local_requests",
             "result_bundles",

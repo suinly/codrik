@@ -802,29 +802,28 @@ impl SqliteRuntimeStore {
 #[cfg(test)]
 mod tests {
     use crate::{
-        auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         runtime::{
             model::{ActorId, Audience, CancelId, ManualClock, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
                 ControlStore, DispatchStore, FailureFence, FailureStore, IngressStore, LocalCancel,
                 LocalIngressStore, LocalSubmission, LocalSubmitOutcome, NewInboundEvent,
-                RuntimeAuthorizationStore, StaleLease,
+                StaleLease,
             },
         },
+        test_fixtures::{ActorSeed, ActorSeedSet, IdentitySeed},
     };
 
     async fn store_with_event() -> SqliteRuntimeStore {
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: "actor:telegram:123".into(),
                         enabled: true,
                         tools: vec!["*".into()],
-                        identities: vec![LegacyIdentity {
+                        identities: vec![IdentitySeed {
                             provider: "telegram".into(),
                             subject: "123".into(),
                             username: None,
@@ -1088,10 +1087,9 @@ mod tests {
 
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: "actor:local:owner".into(),
                         enabled: true,
                         tools: vec!["*".into()],
@@ -1158,10 +1156,9 @@ mod tests {
 
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: "actor:local:owner".into(),
                         enabled: true,
                         tools: vec!["*".into()],
@@ -1231,10 +1228,9 @@ mod tests {
     async fn control_for_old_private_work_does_not_wake_new_private_run() {
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: "actor:local:owner".into(),
                         enabled: true,
                         tools: vec!["*".into()],

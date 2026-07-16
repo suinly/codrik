@@ -1122,7 +1122,6 @@ impl SqliteRuntimeStore {
 mod tests {
     use crate::{
         agent::message::Message,
-        auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::LlmToolCall,
         runtime::{
             model::{
@@ -1133,23 +1132,23 @@ mod tests {
                 AttemptOutcome, AttemptRecovery, BundleStore, CheckpointRun, CheckpointStore,
                 ContextStore, ControlStore, DispatchStore, FinalPayload, FinalizeOutcome,
                 FinalizeRun, IngressStore, LocalCancel, LocalIngressStore, LocalSubmission,
-                NewInboundEvent, NewOutboxIntent, NewToolAttempt, OutboxPayload,
-                RuntimeAuthorizationStore, StaleLease, ToolAttemptStore,
+                NewInboundEvent, NewOutboxIntent, NewToolAttempt, OutboxPayload, StaleLease,
+                ToolAttemptStore,
             },
         },
+        test_fixtures::{ActorSeed, ActorSeedSet, IdentitySeed},
     };
 
     async fn store_with_run() -> (SqliteRuntimeStore, crate::runtime::store::AttachedRun) {
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: "actor:telegram:123".into(),
                         enabled: true,
                         tools: vec!["*".into()],
-                        identities: vec![LegacyIdentity {
+                        identities: vec![IdentitySeed {
                             provider: "telegram".into(),
                             subject: "123".into(),
                             username: None,
@@ -1198,10 +1197,9 @@ mod tests {
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
         let actor = ActorId::from_string("actor:local:bundle-tests");
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: actor.to_string(),
                         enabled: true,
                         tools: vec!["*".into()],

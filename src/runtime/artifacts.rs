@@ -593,16 +593,15 @@ mod tests {
 
     use crate::{
         agent::tool::{FileArtifact, ToolArtifact, ToolCapabilities, ToolExecution},
-        auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         runtime::{
             model::{AttemptId, Audience, Clock, ManualClock, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
                 ArtifactStore, AttemptOutcome, AttemptRecovery, CheckpointRun, CheckpointStore,
-                DispatchStore, IngressStore, NewInboundEvent, NewToolAttempt,
-                RuntimeAuthorizationStore, ToolAttemptStore,
+                DispatchStore, IngressStore, NewInboundEvent, NewToolAttempt, ToolAttemptStore,
             },
         },
+        test_fixtures::{ActorSeed, ActorSeedSet, IdentitySeed},
     };
 
     use super::{ArtifactManager, MAX_ARTIFACT_BYTES, TestPause, validate_source};
@@ -1341,14 +1340,13 @@ mod tests {
             let managed = tokio::fs::canonicalize(managed).await?;
             let store = SqliteRuntimeStore::open(root.join("runtime.sqlite3")).await?;
             store
-                .import_legacy_authorization(
-                    LegacyAuthorizationSnapshot {
-                        version: 1,
-                        actors: vec![LegacyActor {
+                .seed_actors_for_test(
+                    ActorSeedSet {
+                        actors: vec![ActorSeed {
                             id: "actor:artifact:1".into(),
                             enabled: true,
                             tools: vec!["files".into()],
-                            identities: vec![LegacyIdentity {
+                            identities: vec![IdentitySeed {
                                 provider: "local".into(),
                                 subject: "owner".into(),
                                 username: None,

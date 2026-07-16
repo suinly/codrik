@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use crate::{
     agent::{message::Message, tool::ToolCapabilities},
-    auth::LegacyAuthorizationSnapshot,
     runtime::model::*,
 };
 
@@ -176,23 +175,6 @@ pub trait ActorStore: Send + Sync {
 
     async fn resolve_identity(&self, provider: &str, subject: &str)
     -> Result<Option<RuntimeActor>>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImportOutcome {
-    Imported,
-    AlreadyImported,
-}
-
-#[async_trait]
-pub(crate) trait RuntimeAuthorizationStore: Send + Sync {
-    async fn legacy_authorization_imported(&self) -> Result<bool>;
-
-    async fn import_legacy_authorization(
-        &self,
-        snapshot: LegacyAuthorizationSnapshot,
-        now: Timestamp,
-    ) -> Result<ImportOutcome>;
 }
 
 #[derive(Clone, Debug)]

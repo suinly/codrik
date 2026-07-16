@@ -1109,7 +1109,6 @@ mod tests {
     };
 
     use crate::{
-        auth::{LegacyActor, LegacyAuthorizationSnapshot},
         runtime::{
             ipc::{
                 protocol::{
@@ -1127,10 +1126,11 @@ mod tests {
             store::{
                 AckOutcome, AckRejected, BundleAck, BundleManifest, CancelOutcome, FinalPayload,
                 LocalCancel, LocalIngressStore, LocalRequestRecord, LocalSubmission,
-                LocalSubmitOutcome, ResultBundle, RuntimeAuthorizationStore,
+                LocalSubmitOutcome, ResultBundle,
             },
             stream_hub::StreamHub,
         },
+        test_fixtures::{ActorSeed, ActorSeedSet},
     };
 
     use super::{
@@ -2503,17 +2503,16 @@ mod tests {
         let owner = ActorId::from_string("actor:owner");
         let other = ActorId::from_string("actor:other");
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
+            .seed_actors_for_test(
+                ActorSeedSet {
                     actors: vec![
-                        LegacyActor {
+                        ActorSeed {
                             id: owner.to_string(),
                             enabled: true,
                             tools: vec![],
                             identities: vec![],
                         },
-                        LegacyActor {
+                        ActorSeed {
                             id: other.to_string(),
                             enabled: true,
                             tools: vec![],

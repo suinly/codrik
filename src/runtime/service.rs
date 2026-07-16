@@ -110,7 +110,6 @@ mod tests {
 
     use crate::{
         agent::tool::{Tool, ToolCallContext, ToolCapabilities, ToolExecution, ToolExecutor},
-        auth::{LegacyActor, LegacyAuthorizationSnapshot, LegacyIdentity},
         llm::client::{
             LlmClient, LlmRequest, LlmResponse, LlmStreamClient, LlmStreamSink, RunContext,
         },
@@ -123,10 +122,11 @@ mod tests {
             sqlite::SqliteRuntimeStore,
             store::{
                 DispatchStore, IngressOutcome, IngressStore, NewInboundEvent, NewToolAttempt,
-                OutboxPayload, RuntimeAuthorizationStore, ToolAttemptStore,
+                OutboxPayload, ToolAttemptStore,
             },
             stream_hub::NoopRuntimeEventPublisher,
         },
+        test_fixtures::{ActorSeed, ActorSeedSet, IdentitySeed},
     };
 
     fn test_artifacts(
@@ -201,14 +201,13 @@ mod tests {
         ));
         let store = SqliteRuntimeStore::open(&path).await.unwrap();
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: "actor:local:1".into(),
                         enabled: true,
                         tools: Vec::new(),
-                        identities: vec![LegacyIdentity {
+                        identities: vec![IdentitySeed {
                             provider: "local".into(),
                             subject: "owner".into(),
                             username: None,
@@ -415,14 +414,13 @@ mod tests {
     async fn authorized_store(path: &std::path::Path) -> SqliteRuntimeStore {
         let store = SqliteRuntimeStore::open(path).await.unwrap();
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: "actor:local:1".into(),
                         enabled: true,
                         tools: Vec::new(),
-                        identities: vec![LegacyIdentity {
+                        identities: vec![IdentitySeed {
                             provider: "local".into(),
                             subject: "owner".into(),
                             username: None,

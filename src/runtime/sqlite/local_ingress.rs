@@ -520,25 +520,23 @@ mod tests {
     use anyhow::Result;
 
     use crate::{
-        auth::{LegacyActor, LegacyAuthorizationSnapshot},
         runtime::{
             model::{ActorId, BundleId, CancelId, LocalRequestState, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
                 ActorStore, LocalCancel, LocalIngressStore, LocalSubmission, LocalSubmitOutcome,
-                RuntimeAuthorizationStore,
             },
         },
+        test_fixtures::{ActorSeed, ActorSeedSet},
     };
 
     async fn store_with_actor(enabled: bool) -> Result<(SqliteRuntimeStore, ActorId)> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         let actor = ActorId::from_string("actor:local:owner");
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
-                    actors: vec![LegacyActor {
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
                         id: actor.to_string(),
                         enabled,
                         tools: vec!["*".into()],
@@ -882,12 +880,11 @@ mod tests {
         let first_actor = ActorId::from_string("actor:local:first");
         let second_actor = ActorId::from_string("actor:local:second");
         store
-            .import_legacy_authorization(
-                LegacyAuthorizationSnapshot {
-                    version: 1,
+            .seed_actors_for_test(
+                ActorSeedSet {
                     actors: [&first_actor, &second_actor]
                         .into_iter()
-                        .map(|actor| LegacyActor {
+                        .map(|actor| ActorSeed {
                             id: actor.to_string(),
                             enabled: true,
                             tools: vec!["*".into()],

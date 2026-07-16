@@ -1,5 +1,4 @@
 use crate::{
-    auth::AuthorizationStore,
     config::{AppConfig, RuntimePaths, codrik_dir},
     llm::{client::LlmStreamClient, openai::OpenAiClient},
     runtime::{
@@ -20,7 +19,7 @@ use crate::{
         runner::{ActorRunner, RunnerLimits},
         signals::ActorSignals,
         sqlite::SqliteRuntimeStore,
-        store::{ActorStore, RuntimeAuthorizationStore, RuntimeStore},
+        store::{ActorStore, RuntimeStore},
         stream_hub::StreamHub,
         supervisor::{ServeRuntime, Supervisor},
     },
@@ -364,18 +363,6 @@ where
             }
         }
     }
-}
-
-async fn import_legacy_authorization_once(
-    store: &SqliteRuntimeStore,
-    users_path: &Path,
-    now: crate::runtime::model::Timestamp,
-) -> Result<crate::runtime::store::ImportOutcome> {
-    if store.legacy_authorization_imported().await? {
-        return Ok(crate::runtime::store::ImportOutcome::AlreadyImported);
-    }
-    let snapshot = AuthorizationStore::new(users_path).snapshot().await?;
-    store.import_legacy_authorization(snapshot, now).await
 }
 
 fn prepare_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {

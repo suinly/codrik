@@ -119,6 +119,54 @@ impl ActorStore for SqliteRuntimeStore {
 }
 
 #[cfg(test)]
+impl SqliteRuntimeStore {
+    pub(crate) async fn seed_actors_for_test(
+        &self,
+        seed: crate::test_fixtures::ActorSeedSet,
+        now: Timestamp,
+    ) -> Result<()> {
+        let actors = seed
+            .actors
+            .into_iter()
+            .map(|actor| {
+                let tools_json = serde_json::to_string(&actor.tools)?;
+                Ok((actor.id, actor.enabled, tools_json, actor.identities))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.connection
+            .call(move |connection| -> Result<()> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                for (actor_id, enabled, tools_json, identities) in actors {
+                    transaction.execute(
+                        "INSERT INTO actors(id, enabled, tools_json, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![actor_id, enabled, tools_json, now.0],
+                    )?;
+                    for identity in identities {
+                        transaction.execute(
+                            "INSERT INTO identities(provider, subject, actor_id, username)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![
+                                identity.provider,
+                                identity.subject,
+                                actor_id,
+                                identity.username
+                            ],
+                        )?;
+                    }
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+            .map_err(|error| anyhow!("failed to seed runtime actors for test: {error}"))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use anyhow::{Result, anyhow};
 
@@ -218,6 +266,38 @@ mod tests {
         );
         assert!(store.load_actor(&typo).await?.is_none());
         assert_eq!(store.actor_count_for_test().await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seeded_identity_resolves_to_its_actor() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        store
+            .seed_actors_for_test(
+                crate::test_fixtures::ActorSeedSet {
+                    actors: vec![crate::test_fixtures::ActorSeed {
+                        id: "actor:telegram:123".into(),
+                        enabled: true,
+                        tools: vec!["*".into(), "bash".into()],
+                        identities: vec![crate::test_fixtures::IdentitySeed {
+                            provider: "telegram".into(),
+                            subject: "123".into(),
+                            username: Some("owner".into()),
+                        }],
+                    }],
+                },
+                Timestamp(10),
+            )
+            .await?;
+
+        assert_eq!(
+            store.resolve_identity("telegram", "123").await?,
+            Some(RuntimeActor {
+                id: ActorId::from_string("actor:telegram:123"),
+                enabled: true,
+                tools: vec!["*".into(), "bash".into()],
+            })
+        );
         Ok(())
     }
 }

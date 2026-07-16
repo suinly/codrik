@@ -1,10 +1,5 @@
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS runtime_metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-) STRICT;
-
 CREATE TABLE actors (
     id TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
