@@ -118,7 +118,7 @@ impl OpenAiClient {
 
         match role {
             Role::System => {}
-            Role::User | Role::Assistant => {
+            Role::User => {
                 let mut content = Vec::new();
                 for part in message.content {
                     match part {
@@ -140,28 +140,32 @@ impl OpenAiClient {
                 }
                 if !content.is_empty() {
                     items.push(InputItem::EasyMessage(EasyInputMessage {
-                        role: match message.role {
-                            Role::User => ResponseRole::User,
-                            Role::Assistant => ResponseRole::Assistant,
-                            _ => unreachable!(),
-                        },
+                        role: ResponseRole::User,
                         content: EasyInputContent::ContentList(content),
                         ..Default::default()
                     }));
                 }
-
-                if message.role == Role::Assistant {
-                    items.extend(message.tool_calls.into_iter().map(|tool_call| {
-                        InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                            arguments: tool_call.arguments,
-                            call_id: tool_call.id,
-                            namespace: None,
-                            name: tool_call.name,
-                            id: None,
-                            status: None,
-                        }))
+            }
+            Role::Assistant => {
+                let content = message.text();
+                if !content.is_empty() {
+                    items.push(InputItem::EasyMessage(EasyInputMessage {
+                        role: ResponseRole::Assistant,
+                        content: EasyInputContent::Text(content),
+                        ..Default::default()
                     }));
                 }
+
+                items.extend(message.tool_calls.into_iter().map(|tool_call| {
+                    InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                        arguments: tool_call.arguments,
+                        call_id: tool_call.id,
+                        namespace: None,
+                        name: tool_call.name,
+                        id: None,
+                        status: None,
+                    }))
+                }));
             }
             Role::Tool => {
                 let content = message.text();
@@ -510,6 +514,51 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], InputItem::EasyMessage(_)));
         assert_eq!(request.store, Some(false));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assistant_history_uses_previous_response_text_shorthand() -> Result<()> {
+        let client = OpenAiClient::new("test", "key", "http://localhost");
+        let (request, _) = client
+            .to_openai_request(LlmRequest {
+                messages: vec![
+                    Message::user("hello"),
+                    Message::assistant_tool_calls(
+                        "previous answer",
+                        vec![LlmToolCall {
+                            id: "call_1".into(),
+                            name: "datetime".into(),
+                            arguments: "{}".into(),
+                        }],
+                    ),
+                    Message::user("follow-up"),
+                ],
+                tools: Vec::new(),
+            })
+            .await?;
+
+        let InputParam::Items(items) = request.input else {
+            panic!("request input should contain typed items");
+        };
+        assert_eq!(
+            serde_json::to_value(&items[1])?,
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": "previous answer"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&items[2])?,
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "datetime",
+                "arguments": "{}"
+            })
+        );
 
         Ok(())
     }

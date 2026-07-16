@@ -140,8 +140,17 @@ where
             return Ok(RunOnceOutcome::Idle);
         };
         let mut fence = None;
+        let mut activity_run = None;
         let mut progress = QuantumProgress::None;
-        let result = self.run_leased(&lease, &mut fence, &mut progress).await;
+        let result = self
+            .run_leased(&lease, &mut fence, &mut activity_run, &mut progress)
+            .await;
+        if result.is_err()
+            && let Some(run) = activity_run.as_ref()
+        {
+            self.events
+                .publish_activity(run, AgentActivityEvent::Failed);
+        }
         let release = self.store.release_lease(&lease).await;
         match (result, release) {
             (Err(error), _) => Err(error),
@@ -158,6 +167,7 @@ where
         &self,
         lease: &crate::runtime::store::ActorLease,
         failure_fence: &mut Option<FailureFence>,
+        activity_run: &mut Option<AttachedRun>,
         progress: &mut QuantumProgress,
     ) -> Result<RunOnceOutcome> {
         let mut current_lease = lease.clone();
@@ -174,6 +184,7 @@ where
             return Ok(RunOnceOutcome::Idle);
         };
         *failure_fence = Some(FailureFence::from(&run));
+        *activity_run = Some(run.clone());
         let mut messages = self
             .store
             .load_recent_context(&lease.actor_id, &run.audience, self.limits.recent_messages)
@@ -347,6 +358,7 @@ where
                                 .await?;
                             run.lease = current_lease.clone();
                             *failure_fence = Some(FailureFence::from(&run));
+                            *activity_run = Some(run.clone());
                         }
                         changed = signal_receiver.changed() => {
                             if changed.is_err() {
@@ -415,6 +427,7 @@ where
                             .await?
                             .ok_or_else(|| anyhow::anyhow!("preempted run was not resumable"))?;
                         *failure_fence = Some(FailureFence::from(&run));
+                        *activity_run = Some(run.clone());
                         messages = self
                             .store
                             .load_recent_context(
@@ -612,8 +625,17 @@ where
             });
         };
         let mut fence = None;
+        let mut activity_run = None;
         let mut progress = QuantumProgress::None;
-        let result = self.run_leased(&lease, &mut fence, &mut progress).await;
+        let result = self
+            .run_leased(&lease, &mut fence, &mut activity_run, &mut progress)
+            .await;
+        if result.is_err()
+            && let Some(run) = activity_run.as_ref()
+        {
+            self.events
+                .publish_activity(run, AgentActivityEvent::Failed);
+        }
         let classified = match result {
             Ok(outcome) => {
                 let bookkeeping = if progress != QuantumProgress::None {
@@ -1802,6 +1824,67 @@ mod tests {
         assert!(lines[0].contains("work_failure"));
         assert!(!lines[0].contains("later model failure"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_failure_publishes_failed_activity() {
+        let (store, request) = store_with_local_text().await;
+        let hub = StreamHub::default();
+        let mut subscription = hub.subscribe(request).unwrap();
+        let runner = ActorRunner::new(
+            ToolThenErrorLlm {
+                calls: Arc::new(AtomicUsize::new(1)),
+            },
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(hub),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(9_000)),
+        );
+
+        assert!(matches!(
+            runner
+                .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+                .await,
+            Err(crate::runtime::store::QuantumFailure::RecoverableWork { .. })
+        ));
+        assert_eq!(
+            std::iter::from_fn(|| subscription.try_recv())
+                .filter_map(|event| match event.body {
+                    ServerEventBody::Activity { event, .. } => Some(event),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![ActivityEvent::ModelStepStarted, ActivityEvent::Failed]
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_model_failure_publishes_single_failed_activity() {
+        let (store, request) = store_with_local_text().await;
+        let hub = StreamHub::default();
+        let mut subscription = hub.subscribe(request).unwrap();
+        let runner = ActorRunner::new(
+            ToolThenErrorLlm {
+                calls: Arc::new(AtomicUsize::new(1)),
+            },
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(hub),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(9_000)),
+        );
+
+        assert!(runner.run_once("worker").await.is_err());
+        assert_eq!(
+            std::iter::from_fn(|| subscription.try_recv())
+                .filter_map(|event| match event.body {
+                    ServerEventBody::Activity { event, .. } => Some(event),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![ActivityEvent::ModelStepStarted, ActivityEvent::Failed]
+        );
     }
 
     #[tokio::test]
