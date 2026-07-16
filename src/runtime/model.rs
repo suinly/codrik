@@ -79,6 +79,21 @@ uuid_id_type!(BundleId);
 uuid_id_type!(DeliveryId);
 uuid_id_type!(ArtifactId);
 
+impl ActorId {
+    pub fn parse_workspace_safe(value: &str) -> anyhow::Result<Self> {
+        let value = value.trim();
+        if value.is_empty()
+            || value == "."
+            || value == ".."
+            || value.contains('/')
+            || value.contains('\\')
+        {
+            anyhow::bail!("unsafe actor id for workspace path: {value}");
+        }
+        Ok(Self::from_string(value))
+    }
+}
+
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_SUBMIT_BYTES: usize = 256 * 1024;
 pub const MAX_FINAL_CHUNK_BYTES: usize = 192 * 1024;
@@ -147,10 +162,27 @@ impl Clock for ManualClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState,
+        ActorId, ArtifactId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState,
         MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES, MAX_FINAL_CHUNK_BYTES, MAX_FRAME_BYTES,
         MAX_MANIFEST_BYTES, MAX_SUBMIT_BYTES, RequestId, WorkItemState,
     };
+
+    #[test]
+    fn workspace_actor_ids_trim_valid_values() -> anyhow::Result<()> {
+        let actor = ActorId::parse_workspace_safe("  actor:local:owner  ")?;
+        assert_eq!(actor.as_str(), "actor:local:owner");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_actor_ids_reject_unsafe_values() {
+        for value in ["", "   ", ".", "..", "actor/owner", r"actor\owner"] {
+            assert!(
+                ActorId::parse_workspace_safe(value).is_err(),
+                "accepted unsafe actor id: {value:?}"
+            );
+        }
+    }
 
     #[test]
     fn request_ids_reject_non_uuid_strings() {

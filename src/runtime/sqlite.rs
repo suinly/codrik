@@ -6,6 +6,7 @@ use tokio_rusqlite::Connection;
 use tokio_rusqlite::rusqlite::OptionalExtension;
 use tokio_rusqlite::rusqlite::TransactionBehavior;
 
+mod actors;
 mod artifacts;
 mod bundles;
 mod checkpoint;

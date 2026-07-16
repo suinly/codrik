@@ -1127,7 +1127,7 @@ mod tests {
             store::{
                 AckOutcome, AckRejected, BundleAck, BundleManifest, CancelOutcome, FinalPayload,
                 LocalCancel, LocalIngressStore, LocalRequestRecord, LocalSubmission,
-                LocalSubmitOutcome, ResultBundle, RuntimeActor, RuntimeAuthorizationStore,
+                LocalSubmitOutcome, ResultBundle, RuntimeAuthorizationStore,
             },
             stream_hub::StreamHub,
         },
@@ -1234,10 +1234,6 @@ mod tests {
         ) -> Result<Option<LocalRequestRecord>> {
             bail!("simulated SQLite I/O authority failure")
         }
-
-        async fn load_actor(&self, _id: &ActorId) -> Result<Option<RuntimeActor>> {
-            bail!("simulated SQLite I/O authority failure")
-        }
     }
 
     #[async_trait]
@@ -1278,14 +1274,6 @@ mod tests {
             _id: &RequestId,
         ) -> Result<Option<LocalRequestRecord>> {
             Ok(self.record.lock().unwrap().clone())
-        }
-
-        async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>> {
-            Ok(Some(RuntimeActor {
-                id: id.clone(),
-                enabled: true,
-                tools: vec![],
-            }))
         }
     }
 
@@ -1346,14 +1334,6 @@ mod tests {
             self.resolve_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.record.lock().unwrap().clone())
         }
-
-        async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>> {
-            Ok(Some(RuntimeActor {
-                id: id.clone(),
-                enabled: true,
-                tools: vec![],
-            }))
-        }
     }
 
     #[async_trait]
@@ -1405,14 +1385,6 @@ mod tests {
             _id: &RequestId,
         ) -> Result<Option<LocalRequestRecord>> {
             Ok(self.record.lock().unwrap().clone())
-        }
-
-        async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>> {
-            Ok(Some(RuntimeActor {
-                id: id.clone(),
-                enabled: true,
-                tools: vec![],
-            }))
         }
     }
 

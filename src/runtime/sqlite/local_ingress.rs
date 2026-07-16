@@ -10,7 +10,7 @@ use crate::runtime::{
     sqlite::{SqliteRuntimeStore, map_call_error},
     store::{
         CancelOutcome, LocalCancel, LocalIngressStore, LocalRequestRecord, LocalSubmission,
-        LocalSubmitOutcome, RuntimeActor,
+        LocalSubmitOutcome,
     },
 };
 
@@ -343,31 +343,6 @@ impl LocalIngressStore for SqliteRuntimeStore {
             .await
             .map_err(map_call_error)
     }
-
-    async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>> {
-        let id = id.clone();
-        self.connection
-            .call(move |connection| -> Result<Option<RuntimeActor>> {
-                let actor = connection
-                    .query_row(
-                        "SELECT enabled, tools_json FROM actors WHERE id = ?1",
-                        [id.as_str()],
-                        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .optional()?;
-                actor
-                    .map(|(enabled, tools_json)| {
-                        Ok(RuntimeActor {
-                            id,
-                            enabled,
-                            tools: serde_json::from_str(&tools_json)?,
-                        })
-                    })
-                    .transpose()
-            })
-            .await
-            .map_err(map_call_error)
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -550,7 +525,7 @@ mod tests {
             model::{ActorId, BundleId, CancelId, LocalRequestState, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                LocalCancel, LocalIngressStore, LocalSubmission, LocalSubmitOutcome,
+                ActorStore, LocalCancel, LocalIngressStore, LocalSubmission, LocalSubmitOutcome,
                 RuntimeAuthorizationStore,
             },
         },

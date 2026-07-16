@@ -20,7 +20,7 @@ use crate::{
         runner::{ActorRunner, RunnerLimits},
         signals::ActorSignals,
         sqlite::SqliteRuntimeStore,
-        store::{LocalIngressStore, RuntimeAuthorizationStore, RuntimeStore},
+        store::{ActorStore, RuntimeAuthorizationStore, RuntimeStore},
         stream_hub::StreamHub,
         supervisor::{ServeRuntime, Supervisor},
     },

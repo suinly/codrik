@@ -158,6 +158,27 @@ pub struct RuntimeActor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorBootstrapOutcome {
+    Created,
+    AlreadyInitialized,
+}
+
+#[async_trait]
+pub trait ActorStore: Send + Sync {
+    async fn ensure_initial_actor(
+        &self,
+        id: &ActorId,
+        tools: &[String],
+        now: Timestamp,
+    ) -> Result<ActorBootstrapOutcome>;
+
+    async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>>;
+
+    async fn resolve_identity(&self, provider: &str, subject: &str)
+    -> Result<Option<RuntimeActor>>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportOutcome {
     Imported,
     AlreadyImported,
@@ -172,9 +193,6 @@ pub(crate) trait RuntimeAuthorizationStore: Send + Sync {
         snapshot: LegacyAuthorizationSnapshot,
         now: Timestamp,
     ) -> Result<ImportOutcome>;
-
-    async fn resolve_identity(&self, provider: &str, subject: &str)
-    -> Result<Option<RuntimeActor>>;
 }
 
 #[derive(Clone, Debug)]
@@ -317,8 +335,6 @@ pub trait LocalIngressStore: Send + Sync {
         actor: &ActorId,
         id: &RequestId,
     ) -> Result<Option<LocalRequestRecord>>;
-
-    async fn load_actor(&self, id: &ActorId) -> Result<Option<RuntimeActor>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

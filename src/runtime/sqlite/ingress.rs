@@ -7,11 +7,10 @@ use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 use crate::{
     auth::LegacyAuthorizationSnapshot,
     runtime::{
-        model::{ActorId, Timestamp},
+        model::Timestamp,
         sqlite::SqliteRuntimeStore,
         store::{
-            ImportOutcome, IngressOutcome, IngressStore, NewInboundEvent, RuntimeActor,
-            RuntimeAuthorizationStore,
+            ImportOutcome, IngressOutcome, IngressStore, NewInboundEvent, RuntimeAuthorizationStore,
         },
     },
 };
@@ -93,44 +92,6 @@ impl RuntimeAuthorizationStore for SqliteRuntimeStore {
             })
             .await
             .map_err(|error| anyhow!("failed to import legacy authorization: {error}"))
-    }
-
-    async fn resolve_identity(
-        &self,
-        provider: &str,
-        subject: &str,
-    ) -> Result<Option<RuntimeActor>> {
-        let provider = provider.to_string();
-        let subject = subject.to_string();
-        self.connection
-            .call(move |connection| -> Result<Option<RuntimeActor>> {
-                let row = connection
-                    .query_row(
-                        "SELECT actors.id, actors.enabled, actors.tools_json
-                         FROM identities
-                         JOIN actors ON actors.id = identities.actor_id
-                         WHERE identities.provider = ?1 AND identities.subject = ?2",
-                        params![provider, subject],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, bool>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
-                let Some((actor_id, enabled, tools_json)) = row else {
-                    return Ok(None);
-                };
-                Ok(Some(RuntimeActor {
-                    id: ActorId::from_string(actor_id),
-                    enabled,
-                    tools: serde_json::from_str(&tools_json)?,
-                }))
-            })
-            .await
-            .map_err(|error| anyhow!("failed to resolve runtime identity: {error}"))
     }
 }
 
@@ -311,7 +272,7 @@ mod tests {
             model::{Audience, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                ImportOutcome, IngressOutcome, IngressStore, NewInboundEvent,
+                ActorStore, ImportOutcome, IngressOutcome, IngressStore, NewInboundEvent,
                 RuntimeAuthorizationStore,
             },
         },
