@@ -18,6 +18,7 @@ use tokio::{
 
 use crate::runtime::{
     hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
+    identity_link::IdentityLinkManager,
     ipc::{
         protocol::{
             ClientRequestBody, FrameReader, FrameWriter, ProtocolFailure, ServerEvent,
@@ -222,6 +223,7 @@ pub struct LocalIpcServer {
     decodes: DecodeRegistry,
     hooks: Arc<dyn RuntimeBoundaryHooks>,
     signals: ActorSignals,
+    linking: Option<Arc<dyn IdentityLinkManager>>,
 }
 
 impl LocalIpcServer {
@@ -320,11 +322,17 @@ impl LocalIpcServer {
             decodes: DecodeRegistry::default(),
             hooks,
             signals: ActorSignals::default(),
+            linking: None,
         }
     }
 
     pub fn with_actor_signals(mut self, signals: ActorSignals) -> Self {
         self.signals = signals;
+        self
+    }
+
+    pub fn with_identity_linking(mut self, linking: Arc<dyn IdentityLinkManager>) -> Self {
+        self.linking = Some(linking);
         self
     }
 
@@ -385,6 +393,7 @@ impl LocalIpcServer {
                 decodes: self.decodes.clone(),
                 hooks: self.hooks.clone(),
                 signals: self.signals.clone(),
+                linking: self.linking.clone(),
             };
             let decode = self.decodes.register();
             handlers.spawn(async move {
@@ -434,6 +443,7 @@ struct ConnectionHandler {
     decodes: DecodeRegistry,
     hooks: Arc<dyn RuntimeBoundaryHooks>,
     signals: ActorSignals,
+    linking: Option<Arc<dyn IdentityLinkManager>>,
 }
 
 impl ConnectionHandler {
@@ -545,6 +555,37 @@ impl ConnectionHandler {
                         .await?;
                     }
                     Err(error) => return Err(error),
+                }
+                sink.close().await
+            }
+            ClientRequestBody::IssueLinkCode { request_id } => {
+                drop(decode);
+                let Some(linking) = self.linking.as_ref() else {
+                    sink.send_control(request_error(
+                        request_id,
+                        "linking_unavailable",
+                        "identity linking is not configured",
+                    ))
+                    .await?;
+                    return sink.close().await;
+                };
+                match linking.issue_code(&self.actor).await {
+                    Ok(issued) => {
+                        sink.send_control(ServerEvent::new(ServerEventBody::LinkCodeIssued {
+                            request_id,
+                            code: issued.code,
+                            expires_at: issued.expires_at.0,
+                        }))
+                        .await?;
+                    }
+                    Err(error) => {
+                        sink.send_control(request_error(
+                            request_id,
+                            "link_code_failed",
+                            &format!("failed to issue identity link code: {error}"),
+                        ))
+                        .await?;
+                    }
                 }
                 sink.close().await
             }
@@ -840,7 +881,8 @@ fn request_id(body: &ClientRequestBody) -> RequestId {
         ClientRequestBody::Submit { request_id, .. }
         | ClientRequestBody::Resume { request_id }
         | ClientRequestBody::AckFinal { request_id, .. }
-        | ClientRequestBody::Cancel { request_id, .. } => request_id.clone(),
+        | ClientRequestBody::Cancel { request_id, .. }
+        | ClientRequestBody::IssueLinkCode { request_id } => request_id.clone(),
     }
 }
 
@@ -1110,6 +1152,7 @@ mod tests {
 
     use crate::{
         runtime::{
+            identity_link::{IdentityLinkManager, IssuedLinkCode, LinkRedemption},
             ipc::{
                 protocol::{
                     ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode,
@@ -1125,7 +1168,7 @@ mod tests {
             signals::ActorSignals,
             store::{
                 AckOutcome, AckRejected, BundleAck, BundleManifest, CancelOutcome, FinalPayload,
-                LocalCancel, LocalIngressStore, LocalRequestRecord, LocalSubmission,
+                LinkIdentity, LocalCancel, LocalIngressStore, LocalRequestRecord, LocalSubmission,
                 LocalSubmitOutcome, ResultBundle,
             },
             stream_hub::StreamHub,
@@ -1139,6 +1182,30 @@ mod tests {
     };
 
     struct SameUid;
+
+    struct TestLinking;
+
+    #[async_trait]
+    impl IdentityLinkManager for TestLinking {
+        async fn issue_code(&self, _actor: &ActorId) -> Result<IssuedLinkCode> {
+            Ok(IssuedLinkCode {
+                code: "ABCD-EFGH".into(),
+                expires_at: Timestamp(1_721_234_567_890),
+            })
+        }
+
+        async fn redeem_code(
+            &self,
+            _identity: LinkIdentity,
+            _code: &str,
+        ) -> Result<LinkRedemption> {
+            unreachable!("IPC issuance never redeems a link code")
+        }
+
+        async fn collect_expired(&self, _limit: usize) -> Result<usize> {
+            Ok(0)
+        }
+    }
 
     impl PeerCredentials for SameUid {
         fn peer_uid(&self, _stream: &UnixStream) -> std::io::Result<u32> {
@@ -1478,6 +1545,7 @@ mod tests {
             decodes: Default::default(),
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             signals: ActorSignals::default(),
+            linking: None,
         }
     }
 
@@ -1509,6 +1577,7 @@ mod tests {
                 decodes: Default::default(),
                 hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
                 signals: ActorSignals::default(),
+                linking: None,
             },
             ingress,
             outbox,
@@ -1551,6 +1620,7 @@ mod tests {
             decodes: Default::default(),
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             signals: ActorSignals::default(),
+            linking: None,
         }
     }
 
@@ -1582,6 +1652,7 @@ mod tests {
                 decodes: Default::default(),
                 hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
                 signals: ActorSignals::default(),
+                linking: None,
             },
             ingress,
             outbox,
@@ -1986,6 +2057,41 @@ mod tests {
                 ..
             }
         ));
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_link_code_returns_terminal_response_without_submitting_work() -> Result<()> {
+        let mut handler = test_handler();
+        handler.linking = Some(Arc::new(TestLinking));
+        let ingress = handler.ingress.clone();
+        let request_id = RequestId::new();
+        let expected = request_id.clone();
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::IssueLinkCode {
+                request_id,
+            }))
+            .await?;
+        client.shutdown().await?;
+
+        let event = FrameReader::new(client).read_server_event().await?;
+        assert_eq!(
+            event.body,
+            ServerEventBody::LinkCodeIssued {
+                request_id: expected,
+                code: "ABCD-EFGH".into(),
+                expires_at: 1_721_234_567_890,
+            }
+        );
+        assert!(
+            ingress
+                .resolve_local_request(&ActorId::from_string("actor:local:test"), &RequestId::new())
+                .await?
+                .is_none()
+        );
         task.await??;
         Ok(())
     }
@@ -2547,6 +2653,7 @@ mod tests {
             decodes: DecodeRegistry::default(),
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             signals: ActorSignals::default(),
+            linking: None,
         };
         let (server, mut client) = UnixStream::pair()?;
         let task = tokio::spawn(async move { handler.handle(server).await });

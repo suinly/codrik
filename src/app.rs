@@ -5,6 +5,7 @@ use crate::{
         artifacts::ArtifactManager,
         dispatcher::ActorDispatcher,
         hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
+        identity_link::{IdentityLinkManager, IdentityLinkService, SystemLinkCodeGenerator},
         instance_lock::InstanceLock,
         ipc::{
             security::{create_secure_directory, validate_secure_directory},
@@ -211,6 +212,11 @@ where
         clock.clone(),
         outbox_owner.clone(),
     ));
+    let identity_linking: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+        store.clone(),
+        clock.clone(),
+        SystemLinkCodeGenerator,
+    ));
     let server = LocalIpcServer::bind_with_hooks(
         &paths.socket,
         actor_id.clone(),
@@ -219,7 +225,8 @@ where
         hub.clone(),
         hooks.clone(),
     )?
-    .with_actor_signals(signals.clone());
+    .with_actor_signals(signals.clone())
+    .with_identity_linking(identity_linking);
     trace.record(StartupPhase::SocketBound);
     let recovery = store.recover_startup(clock.now()).await?;
     trace.record(StartupPhase::Recovered);
@@ -254,7 +261,7 @@ where
     startup.actor_id = Some(actor_id);
     startup.database_path = Some(paths.database.clone());
     startup.socket_path = Some(paths.socket.clone());
-    startup.schema_version = Some(2);
+    startup.schema_version = Some(3);
     startup.recovery = Some(RuntimeRecoveryCounts {
         expired_actor_leases: recovery.expired_actor_leases,
         expired_bundle_claims: recovery.expired_bundle_claims,

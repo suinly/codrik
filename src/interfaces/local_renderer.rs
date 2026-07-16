@@ -848,6 +848,13 @@ impl<W: Write> LocalRenderer<W> {
                 }
                 Ok(RenderAction::Recover)
             }
+            ServerEventBody::LinkCodeIssued { request_id, .. } => {
+                self.require_request(&request_id)?;
+                Ok(RenderAction::DaemonError {
+                    message: "unexpected link code response on operation stream".into(),
+                    recover: false,
+                })
+            }
         }
     }
 

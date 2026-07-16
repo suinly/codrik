@@ -129,6 +129,41 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn issue_link_code_requires_matching_terminal_response() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let expected = request.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let received = FrameReader::new(&mut stream).read_client_request().await?;
+            assert_eq!(
+                received.body,
+                ClientRequestBody::IssueLinkCode {
+                    request_id: expected.clone(),
+                }
+            );
+            FrameWriter::new(&mut stream)
+                .write_server_event(&ServerEvent::new(ServerEventBody::LinkCodeIssued {
+                    request_id: expected,
+                    code: "ABCD-EFGH".into(),
+                    expires_at: 1_721_234_567_890,
+                }))
+                .await?;
+            anyhow::Ok(())
+        });
+
+        let issued = LocalIpcClient::new(socket.clone())
+            .issue_link_code(request)
+            .await?;
+        assert_eq!(issued.code, "ABCD-EFGH");
+        assert_eq!(issued.expires_at.0, 1_721_234_567_890);
+        server.await??;
+        std::fs::remove_file(socket)?;
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn client_operation_write_uses_protocol_deadline() {
         let (mut writer, _reader) = tokio::io::duplex(1);
@@ -231,10 +266,12 @@ use tokio::{
 
 use crate::runtime::{
     BundleId, CancelId, DeliveryId, RequestId,
+    identity_link::IssuedLinkCode,
     ipc::protocol::{
         ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode,
-        ProtocolFailure, ServerEvent,
+        ProtocolFailure, ServerEvent, ServerEventBody,
     },
+    model::Timestamp,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -319,6 +356,41 @@ impl LocalIpcClient {
             )),
             None => Err(anyhow!(
                 "daemon closed before confirming final acknowledgement for {expected_request}"
+            )),
+        }
+    }
+
+    pub async fn issue_link_code(&self, request_id: RequestId) -> Result<IssuedLinkCode> {
+        let expected_request = request_id.clone();
+        let mut stream = self
+            .open(ClientRequestBody::IssueLinkCode { request_id })
+            .await?;
+        stream.close_write().await?;
+        match stream.next_event().await? {
+            Some(ServerEvent {
+                body:
+                    ServerEventBody::LinkCodeIssued {
+                        request_id,
+                        code,
+                        expires_at,
+                    },
+                ..
+            }) if request_id == expected_request => Ok(IssuedLinkCode {
+                code,
+                expires_at: Timestamp(expires_at),
+            }),
+            Some(ServerEvent {
+                body: ServerEventBody::RequestError { code, message, .. },
+                ..
+            }) => Err(anyhow!(
+                "daemon rejected identity link code request ({code}): {message}"
+            )),
+            Some(event) => Err(anyhow!(
+                "daemon returned an unexpected identity link code response: {:?}",
+                event.body
+            )),
+            None => Err(anyhow!(
+                "daemon closed before issuing an identity link code for {expected_request}"
             )),
         }
     }

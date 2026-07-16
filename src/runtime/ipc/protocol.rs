@@ -86,6 +86,9 @@ pub enum ClientRequestBody {
         request_id: RequestId,
         cancel_id: CancelId,
     },
+    IssueLinkCode {
+        request_id: RequestId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +207,11 @@ pub enum ServerEventBody {
     ServerShuttingDown {
         request_id: Option<RequestId>,
         resume_command: Option<String>,
+    },
+    LinkCodeIssued {
+        request_id: RequestId,
+        code: String,
+        expires_at: i64,
     },
 }
 
@@ -874,12 +882,16 @@ mod tests {
                 request_id: request_id(),
                 cancel_id: cancel_id(),
             }),
+            ClientRequest::new(ClientRequestBody::IssueLinkCode {
+                request_id: request_id(),
+            }),
         ];
         let expected = [
             r#"{"version":1,"body":{"type":"submit","request_id":"0190f2ef-0000-7000-8000-000000000001","text":"hello"}}"#,
             r#"{"version":1,"body":{"type":"resume","request_id":"0190f2ef-0000-7000-8000-000000000001"}}"#,
             r#"{"version":1,"body":{"type":"ack_final","request_id":"0190f2ef-0000-7000-8000-000000000001","bundle_id":"0190f2ef-0000-7000-8000-000000000002","delivery_ids":["0190f2ef-0000-7000-8000-000000000003"]}}"#,
             r#"{"version":1,"body":{"type":"cancel","request_id":"0190f2ef-0000-7000-8000-000000000001","cancel_id":"0190f2ef-0000-7000-8000-000000000004"}}"#,
+            r#"{"version":1,"body":{"type":"issue_link_code","request_id":"0190f2ef-0000-7000-8000-000000000001"}}"#,
         ];
         for (value, expected) in values.into_iter().zip(expected) {
             let json = serde_json::to_vec(&value)?;
@@ -958,6 +970,11 @@ mod tests {
                 request_id: Some(request_id()),
                 resume_command: Some("codrik resume id".into()),
             }),
+            ServerEvent::new(ServerEventBody::LinkCodeIssued {
+                request_id: request_id(),
+                code: "ABCD-EFGH".into(),
+                expires_at: 1_721_234_567_890,
+            }),
         ];
         let hash_a = "a".repeat(64);
         let hash_b = "b".repeat(64);
@@ -974,6 +991,7 @@ mod tests {
             r#"{"version":1,"body":{"type":"request_error","request_id":"0190f2ef-0000-7000-8000-000000000001","code":"missing_request","message":"not found"}}"#.to_string(),
             r#"{"version":1,"body":{"type":"protocol_error","code":"invalid_json","message":"bad json"}}"#.to_string(),
             r#"{"version":1,"body":{"type":"server_shutting_down","request_id":"0190f2ef-0000-7000-8000-000000000001","resume_command":"codrik resume id"}}"#.to_string(),
+            r#"{"version":1,"body":{"type":"link_code_issued","request_id":"0190f2ef-0000-7000-8000-000000000001","code":"ABCD-EFGH","expires_at":1721234567890}}"#.to_string(),
         ];
         for (value, expected) in values.into_iter().zip(expected) {
             let json = serde_json::to_vec(&value)?;
