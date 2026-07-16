@@ -103,6 +103,16 @@ impl GatewayDeliveryStore for SqliteRuntimeStore {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
+                transaction.execute(
+                    "UPDATE gateway_deliveries
+                     SET state = 'outcome_unknown', claim_owner = NULL,
+                         claim_expires_at = NULL, error_class = 'expired_claim',
+                         last_error = 'delivery claim expired with unknown transport outcome',
+                         updated_at = ?1
+                     WHERE gateway = ?2 AND state = 'delivering'
+                       AND claim_expires_at <= ?1",
+                    params![now.0, gateway],
+                )?;
                 let ids = {
                     let mut statement = transaction.prepare(
                         "SELECT candidate.id
@@ -366,15 +376,42 @@ mod tests {
             .await?;
         assert_eq!(claims.len(), 2);
         assert_ne!(claims[0].route.address, claims[1].route.address);
+        let address_100 = claims
+            .iter()
+            .find(|claim| claim.route.address == "100")
+            .expect("address 100 was claimed");
         assert!(
             store
-                .complete_gateway_delivery(&claims[0].claim, Some("77".into()), Timestamp(3),)
+                .complete_gateway_delivery(&address_100.claim, Some("77".into()), Timestamp(3),)
                 .await?
         );
         let next = store
             .claim_gateway_deliveries("telegram:900", "worker", Timestamp(4), Timestamp(34), 10)
             .await?;
         assert_eq!(next.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_delivery_claim_becomes_outcome_unknown_instead_of_retrying() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        store
+            .enqueue_gateway_delivery(delivery("expired", "100", "hello")?, Timestamp(1))
+            .await?;
+        let claimed = store
+            .claim_gateway_deliveries("telegram:900", "worker", Timestamp(2), Timestamp(32), 10)
+            .await?;
+        assert_eq!(claimed.len(), 1);
+
+        let reclaimed = store
+            .claim_gateway_deliveries("telegram:900", "worker-2", Timestamp(33), Timestamp(63), 10)
+            .await?;
+        assert!(reclaimed.is_empty());
+        assert!(
+            !store
+                .complete_gateway_delivery(&claimed[0].claim, Some("77".into()), Timestamp(34))
+                .await?
+        );
         Ok(())
     }
 }

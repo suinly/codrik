@@ -29,6 +29,19 @@ impl TelegramApiError {
     pub fn class(&self) -> TelegramApiErrorClass {
         self.class.clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn classified(
+        class: TelegramApiErrorClass,
+        method: &'static str,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            class,
+            method,
+            description: description.into(),
+        }
+    }
 }
 
 impl fmt::Display for TelegramApiError {
