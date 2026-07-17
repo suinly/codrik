@@ -1,4 +1,5 @@
 const INSTALLER: &str = include_str!("../scripts/install.sh");
+const UPDATER: &str = include_str!("../src/updater.rs");
 
 use std::{fs, path::Path, process::Command};
 
@@ -113,13 +114,19 @@ fn polling_gateway_installation_is_removed() {
         "Telegram bot token",
         "install_gateway_service",
         "gateway telegram",
-        "codrik-telegram.service",
-        "com.suinly.codrik.telegram",
     ] {
         assert!(
             !INSTALLER.contains(removed),
             "legacy polling installer text remains: {removed}"
         );
+    }
+}
+
+#[test]
+fn legacy_service_names_are_absent_from_installer_and_updater() {
+    for source in [INSTALLER, UPDATER] {
+        assert!(!source.contains("codrik-telegram.service"));
+        assert!(!source.contains("com.suinly.codrik.telegram"));
     }
 }
 
