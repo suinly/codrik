@@ -334,8 +334,6 @@ install_serve_service() {
       need_command id
       service_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
       service_file="$service_dir/codrik.service"
-      systemctl --user disable --now codrik-telegram.service >/dev/null 2>&1 || true
-      rm -f "$service_dir/codrik-telegram.service"
       write_systemd_user_service "$service_file" "$bin_path" "$config_file" "$runtime_dir"
       systemctl --user daemon-reload
       systemctl --user enable --now codrik.service
@@ -347,11 +345,8 @@ install_serve_service() {
       need_command launchctl
       need_command id
       launch_dir="$HOME/Library/LaunchAgents"
-      old_plist="$launch_dir/com.suinly.codrik.telegram.plist"
       plist_file="$launch_dir/com.suinly.codrik.plist"
       label="com.suinly.codrik"
-      launchctl bootout "gui/$(id -u)" "$old_plist" >/dev/null 2>&1 || true
-      rm -f "$old_plist"
       write_launchd_service "$plist_file" "$bin_path" "$config_file" "$runtime_dir"
       launchctl bootout "gui/$(id -u)" "$plist_file" >/dev/null 2>&1 || true
       launchctl bootstrap "gui/$(id -u)" "$plist_file"
@@ -391,11 +386,9 @@ capture_install_state() {
   case "$(uname -s)" in
     Linux)
       [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/codrik.service" ] && service_present=1
-      [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/codrik-telegram.service" ] && service_present=1
       ;;
     Darwin)
       [ -f "$HOME/Library/LaunchAgents/com.suinly.codrik.plist" ] && service_present=1
-      [ -f "$HOME/Library/LaunchAgents/com.suinly.codrik.telegram.plist" ] && service_present=1
       ;;
   esac
   if [ ! -e "$config_dir" ] && [ ! -e "$runtime_dir" ] \

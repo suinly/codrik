@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 const REPO_API_URL: &str = "https://api.github.com/repos/suinly/codrik";
 const BIN_NAME: &str = "codrik";
-const TELEGRAM_SERVICE: &str = "codrik-telegram.service";
-const TELEGRAM_LAUNCHD_LABEL: &str = "com.suinly.codrik.telegram";
+const SERVICE: &str = "codrik.service";
+const LAUNCHD_LABEL: &str = "com.suinly.codrik";
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -59,7 +59,7 @@ pub async fn update() -> Result<()> {
         exe_path.display()
     );
 
-    restart_gateway_service_if_running()?;
+    restart_service_if_running()?;
 
     Ok(())
 }
@@ -141,7 +141,7 @@ fn temp_binary_path(exe_path: &Path) -> Result<PathBuf> {
     Ok(exe_path.with_file_name(tmp_name))
 }
 
-fn restart_gateway_service_if_running() -> Result<()> {
+fn restart_service_if_running() -> Result<()> {
     match env::consts::OS {
         "linux" => restart_systemd_user_service_if_running(),
         "macos" => restart_launchd_service_if_running(),
@@ -151,7 +151,7 @@ fn restart_gateway_service_if_running() -> Result<()> {
 
 fn restart_systemd_user_service_if_running() -> Result<()> {
     let active = Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", TELEGRAM_SERVICE])
+        .args(["--user", "is-active", "--quiet", SERVICE])
         .status();
 
     if !matches!(active, Ok(status) if status.success()) {
@@ -159,21 +159,21 @@ fn restart_systemd_user_service_if_running() -> Result<()> {
     }
 
     let status = Command::new("systemctl")
-        .args(["--user", "restart", TELEGRAM_SERVICE])
+        .args(["--user", "restart", SERVICE])
         .status()
-        .context("failed to restart telegram user service")?;
+        .context("failed to restart user service")?;
 
     if !status.success() {
-        bail!("failed to restart {TELEGRAM_SERVICE}");
+        bail!("failed to restart {SERVICE}");
     }
 
-    println!("Restarted {TELEGRAM_SERVICE}");
+    println!("Restarted {SERVICE}");
     Ok(())
 }
 
 fn restart_launchd_service_if_running() -> Result<()> {
     let uid = current_uid()?;
-    let service = format!("gui/{uid}/{TELEGRAM_LAUNCHD_LABEL}");
+    let service = format!("gui/{uid}/{LAUNCHD_LABEL}");
     let active = Command::new("launchctl").args(["print", &service]).status();
 
     if !matches!(active, Ok(status) if status.success()) {
@@ -183,13 +183,13 @@ fn restart_launchd_service_if_running() -> Result<()> {
     let status = Command::new("launchctl")
         .args(["kickstart", "-k", &service])
         .status()
-        .context("failed to restart telegram LaunchAgent")?;
+        .context("failed to restart LaunchAgent")?;
 
     if !status.success() {
-        bail!("failed to restart {TELEGRAM_LAUNCHD_LABEL}");
+        bail!("failed to restart {LAUNCHD_LABEL}");
     }
 
-    println!("Restarted {TELEGRAM_LAUNCHD_LABEL}");
+    println!("Restarted {LAUNCHD_LABEL}");
     Ok(())
 }
 
@@ -226,7 +226,13 @@ fn user_agent() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_target_for, verify_sha256};
+    use super::{LAUNCHD_LABEL, SERVICE, asset_target_for, verify_sha256};
+
+    #[test]
+    fn uses_current_foreground_service_names() {
+        assert_eq!(SERVICE, "codrik.service");
+        assert_eq!(LAUNCHD_LABEL, "com.suinly.codrik");
+    }
 
     #[test]
     fn maps_supported_platforms_to_release_assets() {

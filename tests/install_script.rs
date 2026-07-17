@@ -113,6 +113,8 @@ fn polling_gateway_installation_is_removed() {
         "Telegram bot token",
         "install_gateway_service",
         "gateway telegram",
+        "codrik-telegram.service",
+        "com.suinly.codrik.telegram",
     ] {
         assert!(
             !INSTALLER.contains(removed),
