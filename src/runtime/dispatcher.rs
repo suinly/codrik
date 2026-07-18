@@ -20,6 +20,17 @@ struct RunningDispatcher {
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
+#[derive(Default)]
+struct RunningDispatchers(HashMap<ActorId, RunningDispatcher>);
+
+impl Drop for RunningDispatchers {
+    fn drop(&mut self) {
+        for child in self.0.values() {
+            child.task.abort();
+        }
+    }
+}
+
 impl<S> ActorDispatcherManager<S>
 where
     S: ActorAdminStore + Clone + Send + Sync + 'static,
@@ -41,7 +52,7 @@ where
         let mut poll = tokio::time::interval(Duration::from_millis(500));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         poll.tick().await;
-        let mut running = HashMap::new();
+        let mut running = RunningDispatchers::default();
         loop {
             if *shutdown.borrow() {
                 stop_all_dispatchers(&mut running).await?;
@@ -71,7 +82,7 @@ where
 async fn reconcile_dispatchers<S, F, Fut>(
     store: &S,
     make_dispatcher: &F,
-    running: &mut HashMap<ActorId, RunningDispatcher>,
+    running: &mut RunningDispatchers,
 ) -> Result<()>
 where
     S: ActorAdminStore,
@@ -80,6 +91,7 @@ where
 {
     let mut desired = enabled_actors(store).await?;
     let stale = running
+        .0
         .iter()
         .filter_map(|(id, child)| {
             (desired.get(id) != Some(&child.actor) || child.task.is_finished()).then(|| id.clone())
@@ -88,7 +100,12 @@ where
     if !stale.is_empty() {
         let stopping = stale
             .into_iter()
-            .map(|id| running.remove(&id).expect("running dispatcher disappeared"))
+            .map(|id| {
+                running
+                    .0
+                    .remove(&id)
+                    .expect("running dispatcher disappeared")
+            })
             .collect::<Vec<_>>();
         for child in &stopping {
             child.shutdown.send_replace(true);
@@ -102,12 +119,12 @@ where
         desired = enabled_actors(store).await?;
     }
     for (id, actor) in desired {
-        if running.contains_key(&id) {
+        if running.0.contains_key(&id) {
             continue;
         }
         let (shutdown, receiver) = watch::channel(false);
         let task = tokio::spawn(make_dispatcher(actor.clone(), receiver));
-        running.insert(
+        running.0.insert(
             id,
             RunningDispatcher {
                 actor,
@@ -129,11 +146,11 @@ async fn enabled_actors<S: ActorAdminStore>(store: &S) -> Result<HashMap<ActorId
         .collect())
 }
 
-async fn stop_all_dispatchers(running: &mut HashMap<ActorId, RunningDispatcher>) -> Result<()> {
-    for child in running.values() {
+async fn stop_all_dispatchers(running: &mut RunningDispatchers) -> Result<()> {
+    for child in running.0.values() {
         child.shutdown.send_replace(true);
     }
-    for (_, child) in running.drain() {
+    for (_, child) in running.0.drain() {
         child
             .task
             .await
