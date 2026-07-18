@@ -1,13 +1,146 @@
-use std::time::Duration;
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use anyhow::Result;
 use tokio::sync::watch;
 
 use crate::runtime::{
     model::{ActorId, Clock},
-    signals::ActorSignals,
-    store::{FailureDisposition, QuantumFailure, QuantumRunner},
+    signals::{ActorDirectorySignals, ActorSignals},
+    store::{ActorAdminStore, FailureDisposition, QuantumFailure, QuantumRunner, RuntimeActor},
 };
+
+pub struct ActorDispatcherManager<S> {
+    store: S,
+    directory: ActorDirectorySignals,
+}
+
+struct RunningDispatcher {
+    actor: RuntimeActor,
+    shutdown: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl<S> ActorDispatcherManager<S>
+where
+    S: ActorAdminStore + Clone + Send + Sync + 'static,
+{
+    pub fn new(store: S, directory: ActorDirectorySignals) -> Self {
+        Self { store, directory }
+    }
+
+    pub async fn run_with<F, Fut>(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        make_dispatcher: F,
+    ) -> Result<()>
+    where
+        F: Fn(RuntimeActor, watch::Receiver<bool>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let mut directory = self.directory.subscribe();
+        let mut poll = tokio::time::interval(Duration::from_millis(500));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        poll.tick().await;
+        let mut running = HashMap::new();
+        loop {
+            if *shutdown.borrow() {
+                stop_all_dispatchers(&mut running).await?;
+                return Ok(());
+            }
+            reconcile_dispatchers(&self.store, &make_dispatcher, &mut running).await?;
+            if *shutdown.borrow() {
+                stop_all_dispatchers(&mut running).await?;
+                return Ok(());
+            }
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        stop_all_dispatchers(&mut running).await?;
+                        return Ok(());
+                    }
+                }
+                changed = directory.changed() => {
+                    changed.map_err(|_| anyhow::anyhow!("actor directory signal channel closed"))?;
+                }
+                _ = poll.tick() => {}
+            }
+        }
+    }
+}
+
+async fn reconcile_dispatchers<S, F, Fut>(
+    store: &S,
+    make_dispatcher: &F,
+    running: &mut HashMap<ActorId, RunningDispatcher>,
+) -> Result<()>
+where
+    S: ActorAdminStore,
+    F: Fn(RuntimeActor, watch::Receiver<bool>) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let mut desired = enabled_actors(store).await?;
+    let stale = running
+        .iter()
+        .filter_map(|(id, child)| {
+            (desired.get(id) != Some(&child.actor) || child.task.is_finished()).then(|| id.clone())
+        })
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        let stopping = stale
+            .into_iter()
+            .map(|id| running.remove(&id).expect("running dispatcher disappeared"))
+            .collect::<Vec<_>>();
+        for child in &stopping {
+            child.shutdown.send_replace(true);
+        }
+        for child in stopping {
+            child
+                .task
+                .await
+                .map_err(|error| anyhow::anyhow!("actor dispatcher task failed: {error}"))??;
+        }
+        desired = enabled_actors(store).await?;
+    }
+    for (id, actor) in desired {
+        if running.contains_key(&id) {
+            continue;
+        }
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(make_dispatcher(actor.clone(), receiver));
+        running.insert(
+            id,
+            RunningDispatcher {
+                actor,
+                shutdown,
+                task,
+            },
+        );
+    }
+    Ok(())
+}
+
+async fn enabled_actors<S: ActorAdminStore>(store: &S) -> Result<HashMap<ActorId, RuntimeActor>> {
+    Ok(store
+        .list_actors()
+        .await?
+        .into_iter()
+        .filter(|actor| actor.enabled)
+        .map(|actor| (actor.id.clone(), actor))
+        .collect())
+}
+
+async fn stop_all_dispatchers(running: &mut HashMap<ActorId, RunningDispatcher>) -> Result<()> {
+    for child in running.values() {
+        child.shutdown.send_replace(true);
+    }
+    for (_, child) in running.drain() {
+        child
+            .task
+            .await
+            .map_err(|error| anyhow::anyhow!("actor dispatcher task failed: {error}"))??;
+    }
+    Ok(())
+}
 
 pub struct ActorDispatcher<R, C> {
     actor_id: ActorId,
@@ -95,9 +228,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeSet, VecDeque},
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -105,14 +238,18 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify, watch};
 
     use crate::runtime::{
-        dispatcher::ActorDispatcher,
-        model::{ActorId, ManualClock, WorkItemId},
+        dispatcher::{ActorDispatcher, ActorDispatcherManager},
+        model::{ActorId, ManualClock, Timestamp, WorkItemId},
         runner::RunOnceOutcome,
-        signals::ActorSignals,
-        store::{QuantumFailure, QuantumProgress, QuantumReport, QuantumRunner},
+        signals::{ActorDirectorySignals, ActorSignals},
+        sqlite::SqliteRuntimeStore,
+        store::{
+            ActorAdminStore, QuantumFailure, QuantumProgress, QuantumReport, QuantumRunner,
+            RuntimeActor,
+        },
     };
 
     #[derive(Clone)]
@@ -235,5 +372,133 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.to_string(), "database corrupt");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manager_runs_enabled_actors_independently_and_stops_disabled_actor() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        for id in ["alice", "bob"] {
+            store
+                .create_actor(&ActorId::parse_workspace_safe(id)?, Timestamp(1))
+                .await?;
+        }
+        let directory = ActorDirectorySignals::default();
+        let running = Arc::new(StdMutex::new(BTreeSet::new()));
+        let changed = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let manager = ActorDispatcherManager::new(store.clone(), directory.clone());
+        let task = {
+            let running = running.clone();
+            let changed = changed.clone();
+            tokio::spawn(manager.run_with(shutdown_rx, move |actor, mut stop| {
+                let running = running.clone();
+                let changed = changed.clone();
+                async move {
+                    running.lock().unwrap().insert(actor.id.to_string());
+                    changed.notify_waiters();
+                    while !*stop.borrow() && stop.changed().await.is_ok() {}
+                    running.lock().unwrap().remove(actor.id.as_str());
+                    changed.notify_waiters();
+                    Ok(())
+                }
+            }))
+        };
+        wait_until(&changed, || running.lock().unwrap().len() == 2).await;
+        assert_eq!(
+            *running.lock().unwrap(),
+            BTreeSet::from(["alice".into(), "bob".into()])
+        );
+
+        store
+            .set_actor_enabled(&ActorId::parse_workspace_safe("bob")?, false)
+            .await?;
+        directory.notify();
+        wait_until(&changed, || !running.lock().unwrap().contains("bob")).await;
+        assert_eq!(*running.lock().unwrap(), BTreeSet::from(["alice".into()]));
+
+        shutdown_tx.send(true)?;
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_change_restarts_dispatcher_only_after_current_quantum() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let alice = ActorId::parse_workspace_safe("alice")?;
+        store.create_actor(&alice, Timestamp(1)).await?;
+        let directory = ActorDirectorySignals::default();
+        let starts = Arc::new(StdMutex::new(Vec::<RuntimeActor>::new()));
+        let changed = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let manager = ActorDispatcherManager::new(store.clone(), directory.clone());
+        let task = {
+            let starts = starts.clone();
+            let changed = changed.clone();
+            let release_first = release_first.clone();
+            tokio::spawn(manager.run_with(shutdown_rx, move |actor, mut stop| {
+                let starts = starts.clone();
+                let changed = changed.clone();
+                let release_first = release_first.clone();
+                async move {
+                    let first = actor.tools.is_empty();
+                    starts.lock().unwrap().push(actor);
+                    changed.notify_waiters();
+                    while !*stop.borrow() && stop.changed().await.is_ok() {}
+                    if first {
+                        release_first.notified().await;
+                    }
+                    Ok(())
+                }
+            }))
+        };
+        wait_until(&changed, || starts.lock().unwrap().len() == 1).await;
+
+        store.grant_actor_tool(&alice, "bash").await?;
+        directory.notify();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(starts.lock().unwrap().len(), 1);
+
+        release_first.notify_one();
+        wait_until(&changed, || starts.lock().unwrap().len() == 2).await;
+        assert_eq!(starts.lock().unwrap()[1].tools, vec!["bash"]);
+
+        shutdown_tx.send(true)?;
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manager_propagates_dispatcher_failure() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        store
+            .create_actor(&ActorId::parse_workspace_safe("alice")?, Timestamp(1))
+            .await?;
+        let manager = ActorDispatcherManager::new(store, ActorDirectorySignals::default());
+        let task = tokio::spawn(manager.run_with(watch::channel(false).1, |_, _| async {
+            anyhow::bail!("dispatcher failed")
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let error = task.await?.unwrap_err();
+        assert!(error.to_string().contains("dispatcher failed"));
+        Ok(())
+    }
+
+    async fn wait_until(changed: &Notify, ready: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if ready() {
+                return;
+            }
+            let notified = changed.notified();
+            if ready() {
+                return;
+            }
+            notified.await;
+        }
+        panic!("condition was not reached");
     }
 }
