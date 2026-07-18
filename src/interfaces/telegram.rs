@@ -18,9 +18,10 @@ use crate::{
     config::{ValidatedTelegramConfig, ValidatedTelegramIngressConfig},
     interfaces::telegram::{
         activity::TelegramActivityWorker,
-        api::{ReqwestTelegramApi, SetWebhook, TelegramApi, TelegramIngressApi},
+        api::{DeleteWebhook, ReqwestTelegramApi, SetWebhook, TelegramApi, TelegramIngressApi},
         delivery::TelegramDeliveryWorker,
         ingress::TelegramIngressService,
+        polling::TelegramPollingWorker,
         webhook::{SecretToken, TelegramWebhookServer},
     },
     runtime::{
@@ -32,10 +33,17 @@ use crate::{
     },
 };
 
+enum PreparedTelegramIngress {
+    Webhook {
+        listener: Mutex<Option<TcpListener>>,
+        public_url: url::Url,
+        webhook_secret: String,
+    },
+    Polling,
+}
+
 pub struct PreparedTelegramGateway<S, A, C> {
-    listener: Mutex<Option<TcpListener>>,
-    path: String,
-    webhook_secret: String,
+    transport: PreparedTelegramIngress,
     ingress: Arc<TelegramIngressService<S, C>>,
     store: S,
     api: A,
@@ -61,21 +69,33 @@ where
         &self.gateway
     }
 
-    pub async fn webhook(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
-        let listener = self
-            .listener
-            .lock()
-            .expect("Telegram listener poisoned")
-            .take()
-            .context("Telegram webhook listener was already started")?;
-        TelegramWebhookServer::new(
-            listener,
-            self.path.clone(),
-            SecretToken::new(&self.webhook_secret),
-            self.ingress.clone(),
-        )?
-        .run(shutdown)
-        .await
+    pub async fn ingress(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
+        match &self.transport {
+            PreparedTelegramIngress::Webhook {
+                listener,
+                public_url,
+                webhook_secret,
+            } => {
+                let listener = listener
+                    .lock()
+                    .expect("Telegram listener poisoned")
+                    .take()
+                    .context("Telegram webhook listener was already started")?;
+                TelegramWebhookServer::new(
+                    listener,
+                    public_url.path(),
+                    SecretToken::new(webhook_secret),
+                    self.ingress.clone(),
+                )?
+                .run(shutdown)
+                .await
+            }
+            PreparedTelegramIngress::Polling => {
+                TelegramPollingWorker::new(self.api.clone(), self.ingress.clone())
+                    .run(shutdown)
+                    .await
+            }
+        }
     }
 
     pub async fn delivery(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -142,17 +162,22 @@ where
     A: TelegramApi + TelegramIngressApi + Clone + Send + Sync + 'static,
     C: Clock,
 {
-    let ValidatedTelegramIngressConfig::Webhook {
-        public_url,
-        listen,
-        webhook_secret,
-    } = config.ingress
-    else {
-        bail!("Telegram polling ingress is not prepared yet");
+    let transport = match config.ingress {
+        ValidatedTelegramIngressConfig::Webhook {
+            public_url,
+            listen,
+            webhook_secret,
+        } => PreparedTelegramIngress::Webhook {
+            listener: Mutex::new(Some(
+                TcpListener::bind(listen)
+                    .await
+                    .context("failed to bind Telegram webhook listener")?,
+            )),
+            public_url,
+            webhook_secret,
+        },
+        ValidatedTelegramIngressConfig::Polling => PreparedTelegramIngress::Polling,
     };
-    let listener = TcpListener::bind(listen)
-        .await
-        .context("failed to bind Telegram webhook listener")?;
     let bot = api.get_me().await?;
     if !bot.is_bot {
         bail!("Telegram getMe returned a non-bot identity");
@@ -162,17 +187,34 @@ where
         .username
         .filter(|value| !value.trim().is_empty())
         .context("Telegram bot username is missing")?;
-    let public_url_text = public_url.as_str().to_owned();
-    api.set_webhook(SetWebhook {
-        url: public_url_text.clone(),
-        secret_token: webhook_secret.clone(),
-        allowed_updates: vec!["message".into()],
-        drop_pending_updates: false,
-    })
-    .await?;
-    let info = api.get_webhook_info().await?;
-    if info.url != public_url_text || info.allowed_updates != ["message"] {
-        bail!("Telegram webhook reconciliation mismatch");
+    match &transport {
+        PreparedTelegramIngress::Webhook {
+            public_url,
+            webhook_secret,
+            ..
+        } => {
+            let public_url = public_url.as_str().to_owned();
+            api.set_webhook(SetWebhook {
+                url: public_url.clone(),
+                secret_token: webhook_secret.clone(),
+                allowed_updates: vec!["message".into()],
+                drop_pending_updates: false,
+            })
+            .await?;
+            let info = api.get_webhook_info().await?;
+            if info.url != public_url || info.allowed_updates != ["message"] {
+                bail!("Telegram webhook reconciliation mismatch");
+            }
+        }
+        PreparedTelegramIngress::Polling => {
+            api.delete_webhook(DeleteWebhook {
+                drop_pending_updates: false,
+            })
+            .await?;
+            if !api.get_webhook_info().await?.url.is_empty() {
+                bail!("Telegram polling reconciliation mismatch");
+            }
+        }
     }
     let gateway = format!("telegram:{bot_id}");
     let ingress = Arc::new(TelegramIngressService::new(
@@ -184,9 +226,7 @@ where
         clock.clone(),
     )?);
     Ok(PreparedTelegramGateway {
-        listener: Mutex::new(Some(listener)),
-        path: public_url.path().to_owned(),
-        webhook_secret,
+        transport,
         ingress,
         store,
         api,
@@ -230,6 +270,7 @@ mod tests {
     struct StartupApi {
         calls: Arc<Mutex<Vec<String>>>,
         webhook: Arc<Mutex<Option<(String, String, Vec<String>, bool)>>>,
+        deleted: Arc<Mutex<Vec<bool>>>,
         info: WebhookInfo,
         expected_bound: Option<std::net::SocketAddr>,
     }
@@ -267,9 +308,14 @@ mod tests {
 
         async fn delete_webhook(
             &self,
-            _command: DeleteWebhook,
+            command: DeleteWebhook,
         ) -> std::result::Result<(), TelegramApiError> {
-            unreachable!("webhook preparation must not delete the webhook")
+            self.calls.lock().unwrap().push("deleteWebhook".into());
+            self.deleted
+                .lock()
+                .unwrap()
+                .push(command.drop_pending_updates);
+            Ok(())
         }
 
         async fn get_webhook_info(&self) -> std::result::Result<WebhookInfo, TelegramApiError> {
@@ -345,6 +391,7 @@ mod tests {
         let api = StartupApi {
             calls: Arc::new(Mutex::new(Vec::new())),
             webhook: Arc::new(Mutex::new(None)),
+            deleted: Arc::new(Mutex::new(Vec::new())),
             info: WebhookInfo {
                 url: "https://agent.example/webhooks/telegram".into(),
                 allowed_updates: vec!["message".into()],
@@ -403,6 +450,7 @@ mod tests {
         let api = StartupApi {
             calls: Arc::new(Mutex::new(Vec::new())),
             webhook: Arc::new(Mutex::new(None)),
+            deleted: Arc::new(Mutex::new(Vec::new())),
             info: WebhookInfo {
                 url: "https://wrong.example/hook".into(),
                 allowed_updates: vec!["message".into()],
@@ -433,6 +481,52 @@ mod tests {
         .err()
         .expect("mismatched webhook info must fail");
         assert!(error.to_string().contains("reconciliation mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_polling_removes_webhook_without_dropping_updates() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let clock = ManualClock::new(1);
+        let linking: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            clock.clone(),
+            SystemLinkCodeGenerator,
+        ));
+        let api = StartupApi {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            webhook: Arc::new(Mutex::new(None)),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+            info: WebhookInfo {
+                url: String::new(),
+                allowed_updates: vec!["message".into()],
+                pending_update_count: 3,
+            },
+            expected_bound: None,
+        };
+
+        let prepared = prepare_with_api(
+            ValidatedTelegramConfig {
+                token: "secret-token".into(),
+                ingress: ValidatedTelegramIngressConfig::Polling,
+            },
+            store,
+            linking,
+            ActorSignals::default(),
+            GatewayActivityHub::default(),
+            clock,
+            std::env::temp_dir(),
+            api.clone(),
+        )
+        .await?;
+
+        assert_eq!(prepared.bot_id(), "900");
+        assert_eq!(
+            *api.calls.lock().unwrap(),
+            vec!["getMe", "deleteWebhook", "getWebhookInfo"]
+        );
+        assert_eq!(*api.deleted.lock().unwrap(), vec![false]);
+        assert_eq!(*api.webhook.lock().unwrap(), None);
         Ok(())
     }
 }

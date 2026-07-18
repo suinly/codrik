@@ -1833,7 +1833,7 @@ mod telegram_acceptance {
         let (webhook_shutdown_tx, webhook_shutdown_rx) = tokio::sync::watch::channel(false);
         let webhook_task = {
             let prepared = prepared.clone();
-            tokio::spawn(async move { prepared.webhook(webhook_shutdown_rx).await })
+            tokio::spawn(async move { prepared.ingress(webhook_shutdown_rx).await })
         };
         let client = reqwest::Client::new();
         let delivery = TelegramDeliveryWorker::new(

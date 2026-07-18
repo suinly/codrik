@@ -339,10 +339,10 @@ where
         async move { run_identity_link_gc(identity_linking, shutdown).await }
     });
     if let Some(telegram) = telegram {
-        service.component("telegram-webhook", {
+        service.component("telegram-ingress", {
             let telegram = telegram.clone();
             let shutdown = shutdown_rx.clone();
-            async move { telegram.webhook(shutdown).await }
+            async move { telegram.ingress(shutdown).await }
         });
         service.component("telegram-delivery", {
             let telegram = telegram.clone();
