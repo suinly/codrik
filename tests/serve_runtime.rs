@@ -1591,9 +1591,9 @@ mod telegram_acceptance {
         interfaces::telegram::{
             activity::TelegramActivityWorker,
             api::{
-                EditMessageText, SendChatAction, SendFile, SendMessage, SendRichMessage,
-                SetWebhook, TelegramApi, TelegramApiError, TelegramIngressApi, TelegramMessageRef,
-                WebhookInfo,
+                DeleteWebhook, EditMessageText, GetUpdates, SendChatAction, SendFile, SendMessage,
+                SendRichMessage, SetWebhook, TelegramApi, TelegramApiError, TelegramIngressApi,
+                TelegramMessageRef, WebhookInfo,
             },
             delivery::TelegramDeliveryWorker,
             prepare_with_api,
@@ -1641,12 +1641,29 @@ mod telegram_acceptance {
             Ok(())
         }
 
+        async fn delete_webhook(
+            &self,
+            _command: DeleteWebhook,
+        ) -> std::result::Result<(), TelegramApiError> {
+            unreachable!("webhook acceptance must not delete the webhook")
+        }
+
         async fn get_webhook_info(&self) -> std::result::Result<WebhookInfo, TelegramApiError> {
             Ok(WebhookInfo {
                 url: "https://agent.example/webhooks/telegram".into(),
                 allowed_updates: vec!["message".into()],
                 pending_update_count: 0,
             })
+        }
+
+        async fn get_updates(
+            &self,
+            _command: GetUpdates,
+        ) -> std::result::Result<
+            Vec<codrik::interfaces::telegram::types::TelegramUpdate>,
+            TelegramApiError,
+        > {
+            unreachable!("webhook acceptance must not poll updates")
         }
     }
 

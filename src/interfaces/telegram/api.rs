@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::interfaces::telegram::types::TelegramBot;
+use crate::interfaces::telegram::types::{TelegramBot, TelegramUpdate};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,6 +62,20 @@ pub struct SetWebhook {
     pub secret_token: String,
     pub allowed_updates: Vec<String>,
     pub drop_pending_updates: bool,
+}
+
+#[derive(Clone, Serialize)]
+pub struct DeleteWebhook {
+    pub drop_pending_updates: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GetUpdates {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<i64>,
+    pub timeout: u64,
+    pub limit: u8,
+    pub allowed_updates: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -153,7 +167,12 @@ pub trait TelegramApi: Send + Sync {
 pub trait TelegramIngressApi: Send + Sync {
     async fn get_me(&self) -> Result<TelegramBot, TelegramApiError>;
     async fn set_webhook(&self, command: SetWebhook) -> Result<(), TelegramApiError>;
+    async fn delete_webhook(&self, command: DeleteWebhook) -> Result<(), TelegramApiError>;
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramApiError>;
+    async fn get_updates(
+        &self,
+        command: GetUpdates,
+    ) -> Result<Vec<TelegramUpdate>, TelegramApiError>;
 }
 
 #[derive(Clone)]
@@ -299,9 +318,21 @@ impl TelegramIngressApi for ReqwestTelegramApi {
         Ok(())
     }
 
+    async fn delete_webhook(&self, command: DeleteWebhook) -> Result<(), TelegramApiError> {
+        let _: bool = self.post_json("deleteWebhook", &command, true).await?;
+        Ok(())
+    }
+
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramApiError> {
         self.post_json("getWebhookInfo", &serde_json::json!({}), true)
             .await
+    }
+
+    async fn get_updates(
+        &self,
+        command: GetUpdates,
+    ) -> Result<Vec<TelegramUpdate>, TelegramApiError> {
+        self.post_json("getUpdates", &command, true).await
     }
 }
 
@@ -443,8 +474,9 @@ mod tests {
     };
 
     use super::{
-        InputRichMessage, ReqwestTelegramApi, SendChatAction, SendMessage, SendRichMessage,
-        TelegramApi, TelegramApiErrorClass, TelegramChatAction, TelegramIngressApi,
+        DeleteWebhook, GetUpdates, InputRichMessage, ReqwestTelegramApi, SendChatAction,
+        SendMessage, SendRichMessage, TelegramApi, TelegramApiErrorClass, TelegramChatAction,
+        TelegramIngressApi,
     };
 
     #[tokio::test]
@@ -473,6 +505,83 @@ mod tests {
         let bot = api.get_me().await?;
         assert_eq!(bot.id, 900);
         assert_eq!(bot.username.as_deref(), Some("codrik_bot"));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_webhook_preserves_pending_updates() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /botsecret-token/deleteWebhook "));
+            assert!(request.contains(r#""drop_pending_updates":false"#));
+            let body = r#"{"ok":true,"result":true}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            anyhow::Ok(())
+        });
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &base)?;
+
+        api.delete_webhook(DeleteWebhook {
+            drop_pending_updates: false,
+        })
+        .await?;
+
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_updates_posts_long_poll_parameters_and_decodes_updates() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /botsecret-token/getUpdates "));
+            assert!(request.contains(r#""offset":42"#));
+            assert!(request.contains(r#""timeout":25"#));
+            assert!(request.contains(r#""limit":100"#));
+            assert!(request.contains(r#""allowed_updates":["message"]"#));
+            let body = r#"{"ok":true,"result":[{"update_id":42,"message":null}]}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            anyhow::Ok(())
+        });
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &base)?;
+
+        let updates = api
+            .get_updates(GetUpdates {
+                offset: Some(42),
+                timeout: 25,
+                limit: 100,
+                allowed_updates: vec!["message".into()],
+            })
+            .await?;
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].update_id, 42);
         server.await??;
         Ok(())
     }

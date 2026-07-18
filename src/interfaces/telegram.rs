@@ -207,8 +207,9 @@ mod tests {
 
     use super::{
         api::{
-            EditMessageText, SendFile, SendMessage, SendRichMessage, SetWebhook, TelegramApi,
-            TelegramApiError, TelegramIngressApi, TelegramMessageRef, WebhookInfo,
+            DeleteWebhook, EditMessageText, GetUpdates, SendFile, SendMessage, SendRichMessage,
+            SetWebhook, TelegramApi, TelegramApiError, TelegramIngressApi, TelegramMessageRef,
+            WebhookInfo,
         },
         prepare_with_api,
         types::TelegramBot,
@@ -263,9 +264,23 @@ mod tests {
             Ok(())
         }
 
+        async fn delete_webhook(
+            &self,
+            _command: DeleteWebhook,
+        ) -> std::result::Result<(), TelegramApiError> {
+            unreachable!("webhook preparation must not delete the webhook")
+        }
+
         async fn get_webhook_info(&self) -> std::result::Result<WebhookInfo, TelegramApiError> {
             self.calls.lock().unwrap().push("getWebhookInfo".into());
             Ok(self.info.clone())
+        }
+
+        async fn get_updates(
+            &self,
+            _command: GetUpdates,
+        ) -> std::result::Result<Vec<super::types::TelegramUpdate>, TelegramApiError> {
+            unreachable!("webhook preparation must not poll updates")
         }
     }
 
