@@ -165,10 +165,16 @@ codrik actors delete alice --force
 
 New actors are enabled with no tool grants. Grant `'*'` for standard tools;
 privileged `bash` still requires its own explicit grant. The actor configured
-as `runtime.actor_id` cannot be disabled or deleted. Disabling an actor lets
-its active work finish but prevents new work from starting. A normal delete
-only removes an empty actor; `--force` permanently removes all durable state
-for an already disabled and idle actor, and cannot be undone.
+as `runtime.actor_id` is the local default and cannot be disabled or deleted.
+Codrik serves all enabled actors concurrently. Permission changes apply on the
+next run; a run already in progress keeps its original tool grants. Disabling
+an actor lets its active work finish but prevents new work from starting. A
+normal delete only removes an empty actor; `--force` permanently removes all
+durable state for an already disabled and idle actor, and cannot be undone.
+
+`codrik link` issues a code for `runtime.actor_id`; `codrik link alice` targets
+Alice instead. Every linked channel resolves to the selected actor's shared
+memory and durable knowledge.
 
 ## Telegram gateway
 

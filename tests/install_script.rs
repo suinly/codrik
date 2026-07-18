@@ -282,4 +282,8 @@ fn active_documentation_has_no_users_json_instructions() {
     assert!(readme.contains("removes any existing webhook"));
     assert!(readme.contains("mutually exclusive ingress modes"));
     assert!(readme.contains("restart `codrik serve`"));
+    assert!(readme.contains("codrik actors tools grant alice bash"));
+    assert!(readme.contains("codrik link alice"));
+    assert!(readme.contains("next run"));
+    assert!(readme.contains("--force"));
 }
