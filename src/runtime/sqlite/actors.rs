@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio_rusqlite::{params, rusqlite::OptionalExtension};
@@ -5,8 +7,19 @@ use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 use crate::runtime::{
     model::{ActorId, Timestamp},
     sqlite::{SqliteRuntimeStore, map_call_error},
-    store::{ActorBootstrapOutcome, ActorStore, RuntimeActor},
+    store::{
+        ActorAdminStore, ActorBootstrapOutcome, ActorCreateOutcome, ActorDetails,
+        ActorMutationOutcome, ActorStore, LinkIdentity, RuntimeActor,
+    },
 };
+
+fn runtime_actor(id: String, enabled: bool, tools_json: String) -> Result<RuntimeActor> {
+    Ok(RuntimeActor {
+        id: ActorId::from_string(id),
+        enabled,
+        tools: serde_json::from_str(&tools_json)?,
+    })
+}
 
 #[async_trait]
 impl ActorStore for SqliteRuntimeStore {
@@ -118,6 +131,215 @@ impl ActorStore for SqliteRuntimeStore {
     }
 }
 
+#[async_trait]
+impl ActorAdminStore for SqliteRuntimeStore {
+    async fn list_actors(&self) -> Result<Vec<RuntimeActor>> {
+        self.connection
+            .call(|connection| -> Result<Vec<RuntimeActor>> {
+                let mut statement =
+                    connection.prepare("SELECT id, enabled, tools_json FROM actors ORDER BY id")?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .map(|row| {
+                        let (id, enabled, tools_json) = row?;
+                        runtime_actor(id, enabled, tools_json)
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn actor_details(&self, actor: &ActorId) -> Result<Option<ActorDetails>> {
+        let actor = actor.clone();
+        self.connection
+            .call(move |connection| -> Result<Option<ActorDetails>> {
+                let row = connection
+                    .query_row(
+                        "SELECT enabled, tools_json FROM actors WHERE id = ?1",
+                        [actor.as_str()],
+                        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                let Some((enabled, tools_json)) = row else {
+                    return Ok(None);
+                };
+                let mut statement = connection.prepare(
+                    "SELECT provider, subject, username
+                     FROM identities WHERE actor_id = ?1
+                     ORDER BY provider, subject",
+                )?;
+                let identities = statement
+                    .query_map([actor.as_str()], |row| {
+                        Ok(LinkIdentity {
+                            provider: row.get(0)?,
+                            subject: row.get(1)?,
+                            username: row.get(2)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let has_active_work = connection.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM actor_leases WHERE actor_id = ?1
+                        UNION ALL
+                        SELECT 1 FROM runs WHERE actor_id = ?1 AND state = 'active'
+                        UNION ALL
+                        SELECT 1 FROM work_items
+                        WHERE actor_id = ?1
+                          AND state NOT IN (
+                            'completed', 'cancelled', 'failed_terminal',
+                            'blocked_unknown_outcome', 'blocked_malformed'
+                          )
+                     )",
+                    [actor.as_str()],
+                    |row| row.get(0),
+                )?;
+                Ok(Some(ActorDetails {
+                    actor: runtime_actor(actor.to_string(), enabled, tools_json)?,
+                    identities,
+                    has_active_work,
+                }))
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn create_actor(&self, actor: &ActorId, now: Timestamp) -> Result<ActorCreateOutcome> {
+        let actor = ActorId::parse_workspace_safe(actor.as_str())?;
+        self.connection
+            .call(move |connection| -> Result<ActorCreateOutcome> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let created = transaction.execute(
+                    "INSERT OR IGNORE INTO actors(id, enabled, tools_json, created_at)
+                     VALUES (?1, 1, '[]', ?2)",
+                    params![actor.as_str(), now.0],
+                )? == 1;
+                let (enabled, tools_json) = transaction.query_row(
+                    "SELECT enabled, tools_json FROM actors WHERE id = ?1",
+                    [actor.as_str()],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                let actor = runtime_actor(actor.to_string(), enabled, tools_json)?;
+                transaction.commit()?;
+                Ok(if created {
+                    ActorCreateOutcome::Created(actor)
+                } else {
+                    ActorCreateOutcome::Existing(actor)
+                })
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn set_actor_enabled(
+        &self,
+        actor: &ActorId,
+        enabled: bool,
+    ) -> Result<Option<ActorMutationOutcome>> {
+        let actor = actor.clone();
+        self.connection
+            .call(move |connection| -> Result<Option<ActorMutationOutcome>> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let row = transaction
+                    .query_row(
+                        "SELECT enabled, tools_json FROM actors WHERE id = ?1",
+                        [actor.as_str()],
+                        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                let Some((current, tools_json)) = row else {
+                    return Ok(None);
+                };
+                let changed = current != enabled;
+                if changed {
+                    transaction.execute(
+                        "UPDATE actors SET enabled = ?2 WHERE id = ?1",
+                        params![actor.as_str(), enabled],
+                    )?;
+                }
+                let outcome = ActorMutationOutcome {
+                    actor: runtime_actor(actor.to_string(), enabled, tools_json)?,
+                    changed,
+                };
+                transaction.commit()?;
+                Ok(Some(outcome))
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn grant_actor_tool(
+        &self,
+        actor: &ActorId,
+        tool: &str,
+    ) -> Result<Option<ActorMutationOutcome>> {
+        mutate_actor_tools(&self.connection, actor.clone(), tool.to_owned(), true).await
+    }
+
+    async fn revoke_actor_tool(
+        &self,
+        actor: &ActorId,
+        tool: &str,
+    ) -> Result<Option<ActorMutationOutcome>> {
+        mutate_actor_tools(&self.connection, actor.clone(), tool.to_owned(), false).await
+    }
+}
+
+async fn mutate_actor_tools(
+    connection: &tokio_rusqlite::Connection,
+    actor: ActorId,
+    tool: String,
+    grant: bool,
+) -> Result<Option<ActorMutationOutcome>> {
+    connection
+        .call(move |connection| -> Result<Option<ActorMutationOutcome>> {
+            let transaction = connection.transaction_with_behavior(
+                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let row = transaction
+                .query_row(
+                    "SELECT enabled, tools_json FROM actors WHERE id = ?1",
+                    [actor.as_str()],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((enabled, tools_json)) = row else {
+                return Ok(None);
+            };
+            let mut tools = serde_json::from_str::<BTreeSet<String>>(&tools_json)?;
+            let changed = if grant {
+                tools.insert(tool)
+            } else {
+                tools.remove(&tool)
+            };
+            let tools_json = serde_json::to_string(&tools)?;
+            if changed {
+                transaction.execute(
+                    "UPDATE actors SET tools_json = ?2 WHERE id = ?1",
+                    params![actor.as_str(), tools_json],
+                )?;
+            }
+            let outcome = ActorMutationOutcome {
+                actor: runtime_actor(actor.to_string(), enabled, tools_json)?,
+                changed,
+            };
+            transaction.commit()?;
+            Ok(Some(outcome))
+        })
+        .await
+        .map_err(map_call_error)
+}
+
 #[cfg(test)]
 impl SqliteRuntimeStore {
     pub(crate) async fn seed_actors_for_test(
@@ -173,7 +395,9 @@ mod tests {
     use crate::runtime::{
         model::{ActorId, Timestamp},
         sqlite::SqliteRuntimeStore,
-        store::{ActorBootstrapOutcome, ActorStore, RuntimeActor},
+        store::{
+            ActorAdminStore, ActorBootstrapOutcome, ActorCreateOutcome, ActorStore, RuntimeActor,
+        },
     };
 
     impl SqliteRuntimeStore {
@@ -266,6 +490,85 @@ mod tests {
         );
         assert!(store.load_actor(&typo).await?.is_none());
         assert_eq!(store.actor_count_for_test().await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_admin_create_list_and_show_are_stable() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let bob = ActorId::parse_workspace_safe("bob")?;
+        let alice = ActorId::parse_workspace_safe("alice")?;
+
+        assert!(matches!(
+            store.create_actor(&bob, Timestamp(10)).await?,
+            ActorCreateOutcome::Created(RuntimeActor {
+                enabled: true,
+                ref tools,
+                ..
+            }) if tools.is_empty()
+        ));
+        assert!(matches!(
+            store.create_actor(&bob, Timestamp(11)).await?,
+            ActorCreateOutcome::Existing(_)
+        ));
+        store.create_actor(&alice, Timestamp(12)).await?;
+
+        assert_eq!(
+            store
+                .list_actors()
+                .await?
+                .into_iter()
+                .map(|actor| actor.id)
+                .collect::<Vec<_>>(),
+            vec![alice, bob.clone()]
+        );
+        let details = store.actor_details(&bob).await?.unwrap();
+        assert_eq!(details.actor.id, bob);
+        assert!(details.identities.is_empty());
+        assert!(!details.has_active_work);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_admin_enable_and_tools_are_idempotent_and_sorted() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store.create_actor(&actor, Timestamp(10)).await?;
+
+        assert!(
+            store
+                .set_actor_enabled(&actor, false)
+                .await?
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !store
+                .set_actor_enabled(&actor, false)
+                .await?
+                .unwrap()
+                .changed
+        );
+        store.grant_actor_tool(&actor, "bash").await?;
+        store.grant_actor_tool(&actor, "*").await?;
+        assert_eq!(
+            store.load_actor(&actor).await?.unwrap().tools,
+            vec!["*", "bash"]
+        );
+        assert!(
+            store
+                .revoke_actor_tool(&actor, "bash")
+                .await?
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !store
+                .revoke_actor_tool(&actor, "bash")
+                .await?
+                .unwrap()
+                .changed
+        );
         Ok(())
     }
 

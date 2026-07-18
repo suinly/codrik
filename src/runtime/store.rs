@@ -162,6 +162,25 @@ pub enum ActorBootstrapOutcome {
     AlreadyInitialized,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActorDetails {
+    pub actor: RuntimeActor,
+    pub identities: Vec<LinkIdentity>,
+    pub has_active_work: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActorCreateOutcome {
+    Created(RuntimeActor),
+    Existing(RuntimeActor),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActorMutationOutcome {
+    pub actor: RuntimeActor,
+    pub changed: bool,
+}
+
 #[async_trait]
 pub trait ActorStore: Send + Sync {
     async fn ensure_initial_actor(
@@ -175,6 +194,28 @@ pub trait ActorStore: Send + Sync {
 
     async fn resolve_identity(&self, provider: &str, subject: &str)
     -> Result<Option<RuntimeActor>>;
+}
+
+#[async_trait]
+pub trait ActorAdminStore: Send + Sync {
+    async fn list_actors(&self) -> Result<Vec<RuntimeActor>>;
+    async fn actor_details(&self, actor: &ActorId) -> Result<Option<ActorDetails>>;
+    async fn create_actor(&self, actor: &ActorId, now: Timestamp) -> Result<ActorCreateOutcome>;
+    async fn set_actor_enabled(
+        &self,
+        actor: &ActorId,
+        enabled: bool,
+    ) -> Result<Option<ActorMutationOutcome>>;
+    async fn grant_actor_tool(
+        &self,
+        actor: &ActorId,
+        tool: &str,
+    ) -> Result<Option<ActorMutationOutcome>>;
+    async fn revoke_actor_tool(
+        &self,
+        actor: &ActorId,
+        tool: &str,
+    ) -> Result<Option<ActorMutationOutcome>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
