@@ -181,6 +181,21 @@ pub struct ActorMutationOutcome {
     pub changed: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorDeleteMode {
+    EmptyOnly,
+    Force,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActorDeleteOutcome {
+    Deleted { artifact_paths: Vec<PathBuf> },
+    NotFound,
+    Nonempty,
+    Busy,
+    UnresolvedDelivery,
+}
+
 #[async_trait]
 pub trait ActorStore: Send + Sync {
     async fn ensure_initial_actor(
@@ -216,6 +231,12 @@ pub trait ActorAdminStore: Send + Sync {
         actor: &ActorId,
         tool: &str,
     ) -> Result<Option<ActorMutationOutcome>>;
+    async fn delete_actor(
+        &self,
+        actor: &ActorId,
+        mode: ActorDeleteMode,
+        now: Timestamp,
+    ) -> Result<ActorDeleteOutcome>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

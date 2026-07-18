@@ -8,8 +8,9 @@ use crate::runtime::{
     model::{ActorId, Timestamp},
     sqlite::{SqliteRuntimeStore, map_call_error},
     store::{
-        ActorAdminStore, ActorBootstrapOutcome, ActorCreateOutcome, ActorDetails,
-        ActorMutationOutcome, ActorStore, LinkIdentity, RuntimeActor,
+        ActorAdminStore, ActorBootstrapOutcome, ActorCreateOutcome, ActorDeleteMode,
+        ActorDeleteOutcome, ActorDetails, ActorMutationOutcome, ActorStore, LinkIdentity,
+        RuntimeActor,
     },
 };
 
@@ -293,6 +294,166 @@ impl ActorAdminStore for SqliteRuntimeStore {
     ) -> Result<Option<ActorMutationOutcome>> {
         mutate_actor_tools(&self.connection, actor.clone(), tool.to_owned(), false).await
     }
+
+    async fn delete_actor(
+        &self,
+        actor: &ActorId,
+        mode: ActorDeleteMode,
+        now: Timestamp,
+    ) -> Result<ActorDeleteOutcome> {
+        let actor = actor.clone();
+        self.connection
+            .call(move |connection| -> Result<ActorDeleteOutcome> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let enabled = transaction
+                    .query_row(
+                        "SELECT enabled FROM actors WHERE id = ?1",
+                        [actor.as_str()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?;
+                let Some(enabled) = enabled else {
+                    return Ok(ActorDeleteOutcome::NotFound);
+                };
+
+                if mode == ActorDeleteMode::EmptyOnly {
+                    let nonempty = transaction.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM identities WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM actor_leases WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM work_items WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM events WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM runs WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM recent_messages WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM outbox WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM artifacts WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM local_requests WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM identity_link_codes WHERE actor_id = ?1
+                         )",
+                        [actor.as_str()],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                    if nonempty {
+                        return Ok(ActorDeleteOutcome::Nonempty);
+                    }
+                    transaction.execute("DELETE FROM actors WHERE id = ?1", [actor.as_str()])?;
+                    transaction.commit()?;
+                    return Ok(ActorDeleteOutcome::Deleted {
+                        artifact_paths: Vec::new(),
+                    });
+                }
+
+                let busy = enabled
+                    || transaction.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM actor_leases WHERE actor_id = ?1
+                            UNION ALL SELECT 1 FROM runs
+                                WHERE actor_id = ?1 AND state = 'active'
+                            UNION ALL SELECT 1 FROM work_items
+                                WHERE actor_id = ?1
+                                  AND state NOT IN (
+                                    'completed', 'cancelled', 'failed_terminal',
+                                    'blocked_unknown_outcome', 'blocked_malformed'
+                                  )
+                         )",
+                        [actor.as_str()],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                if busy {
+                    return Ok(ActorDeleteOutcome::Busy);
+                }
+
+                let unresolved = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM result_bundles
+                        JOIN local_requests ON local_requests.request_id = result_bundles.request_id
+                        WHERE local_requests.actor_id = ?1
+                          AND result_bundles.state IN ('pending', 'delivering', 'failed_retryable')
+                        UNION ALL
+                        SELECT 1 FROM gateway_deliveries
+                        JOIN outbox ON outbox.id = gateway_deliveries.source_outbox_id
+                        WHERE outbox.actor_id = ?1
+                          AND gateway_deliveries.state IN (
+                            'pending', 'delivering', 'failed_retryable', 'outcome_unknown'
+                          )
+                     )",
+                    [actor.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if unresolved {
+                    return Ok(ActorDeleteOutcome::UnresolvedDelivery);
+                }
+
+                let artifact_paths = {
+                    let mut statement = transaction.prepare(
+                        "SELECT managed_path FROM artifacts WHERE actor_id = ?1 ORDER BY managed_path",
+                    )?;
+                    statement
+                        .query_map([actor.as_str()], |row| row.get::<_, String>(0))?
+                        .map(|row| row.map(std::path::PathBuf::from))
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+                transaction.execute(
+                    "INSERT INTO actor_deletions(actor_id, requested_at) VALUES (?1, ?2)",
+                    params![actor.as_str(), now.0],
+                )?;
+                transaction.execute(
+                    "DELETE FROM gateway_deliveries
+                     WHERE source_outbox_id IN (SELECT id FROM outbox WHERE actor_id = ?1)",
+                    [actor.as_str()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM outbox_deliveries
+                     WHERE outbox_id IN (SELECT id FROM outbox WHERE actor_id = ?1)",
+                    [actor.as_str()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM cancel_targets
+                     WHERE request_id IN (
+                        SELECT request_id FROM local_requests WHERE actor_id = ?1
+                     )",
+                    [actor.as_str()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM legacy_runtime_quarantine
+                     WHERE (entity_type = 'work_item' AND entity_id IN (
+                            SELECT id FROM work_items WHERE actor_id = ?1
+                        )) OR (entity_type = 'run' AND entity_id IN (
+                            SELECT id FROM runs WHERE actor_id = ?1
+                        )) OR (entity_type = 'event' AND entity_id IN (
+                            SELECT id FROM events WHERE actor_id = ?1
+                        )) OR (entity_type = 'tool_attempt' AND entity_id IN (
+                            SELECT tool_attempts.id FROM tool_attempts
+                            JOIN runs ON runs.id = tool_attempts.run_id
+                            WHERE runs.actor_id = ?1
+                        ))",
+                    [actor.as_str()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM legacy_outbox_archive WHERE actor_id = ?1",
+                    [actor.as_str()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM result_bundles
+                     WHERE request_id IN (
+                        SELECT request_id FROM local_requests WHERE actor_id = ?1
+                     )",
+                    [actor.as_str()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM local_requests WHERE actor_id = ?1",
+                    [actor.as_str()],
+                )?;
+                transaction.execute("DELETE FROM actors WHERE id = ?1", [actor.as_str()])?;
+                transaction.commit()?;
+                Ok(ActorDeleteOutcome::Deleted { artifact_paths })
+            })
+            .await
+            .map_err(map_call_error)
+    }
 }
 
 async fn mutate_actor_tools(
@@ -396,7 +557,8 @@ mod tests {
         model::{ActorId, Timestamp},
         sqlite::SqliteRuntimeStore,
         store::{
-            ActorAdminStore, ActorBootstrapOutcome, ActorCreateOutcome, ActorStore, RuntimeActor,
+            ActorAdminStore, ActorBootstrapOutcome, ActorCreateOutcome, ActorDeleteMode,
+            ActorDeleteOutcome, ActorStore, RuntimeActor,
         },
     };
 
@@ -422,6 +584,97 @@ mod tests {
                 })
                 .await
                 .map_err(|error| anyhow!("failed to load actor creation time: {error}"))
+        }
+
+        async fn attach_identity_for_test(&self, actor: &ActorId) -> Result<()> {
+            let actor = actor.to_string();
+            self.connection
+                .call(move |connection| -> Result<()> {
+                    connection.execute(
+                        "INSERT INTO identities(provider, subject, actor_id)
+                         VALUES ('test', 'subject', ?1)",
+                        [actor],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| anyhow!("failed to attach identity: {error}"))
+        }
+
+        async fn insert_actor_lease_for_test(&self, actor: &ActorId) -> Result<()> {
+            let actor = actor.to_string();
+            self.connection
+                .call(move |connection| -> Result<()> {
+                    connection.execute(
+                        "INSERT INTO actor_leases(actor_id, generation, owner_id, expires_at)
+                         VALUES (?1, 1, 'test-owner', 100)",
+                        [actor],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| anyhow!("failed to insert actor lease: {error}"))
+        }
+
+        async fn insert_gateway_delivery_for_test(
+            &self,
+            actor: &ActorId,
+            state: &str,
+        ) -> Result<()> {
+            let actor = actor.to_string();
+            let state = state.to_string();
+            self.connection
+                .call(move |connection| -> Result<()> {
+                    connection.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+                    connection.execute(
+                        "INSERT INTO work_items(
+                            id, actor_id, kind, audience_kind, state, created_at, updated_at
+                         ) VALUES ('delete-work', ?1, 'interactive', 'actor_private',
+                            'completed', 1, 1)",
+                        [actor.as_str()],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO runs(
+                            id, actor_id, work_item_id, state, lease_generation,
+                            observed_sequence, created_at, updated_at
+                         ) VALUES ('delete-run', ?1, 'delete-work', 'completed', 1, 0, 1, 1)",
+                        [actor.as_str()],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO outbox(
+                            id, intent_key, actor_id, work_item_id, run_id, intent_class,
+                            audience_kind, payload_json, created_at
+                         ) VALUES ('delete-outbox', 'delete-intent', ?1, 'delete-work',
+                            'delete-run', 'response', 'actor_private', '{}', 1)",
+                        [actor.as_str()],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO gateway_deliveries(
+                            id, intent_key, source_outbox_id, gateway, address,
+                            max_text_chars, max_caption_chars, ordinal, payload_json,
+                            state, created_at, updated_at
+                         ) VALUES ('delete-delivery', 'delete-gateway-intent', 'delete-outbox',
+                            'test', 'address', 4096, 1024, 0, '{}', ?1, 1, 1)",
+                        [state],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| anyhow!("failed to insert gateway delivery: {error}"))
+        }
+
+        async fn set_gateway_delivery_state_for_test(&self, state: &str) -> Result<()> {
+            let state = state.to_string();
+            self.connection
+                .call(move |connection| -> Result<()> {
+                    connection.execute(
+                        "UPDATE gateway_deliveries SET state = ?1 WHERE id = 'delete-delivery'",
+                        [state],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| anyhow!("failed to update gateway delivery: {error}"))
         }
     }
 
@@ -573,6 +826,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_delete_succeeds_but_nonempty_delete_requires_force() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let empty = ActorId::parse_workspace_safe("empty")?;
+        store.create_actor(&empty, Timestamp(10)).await?;
+        assert!(matches!(
+            store
+                .delete_actor(&empty, ActorDeleteMode::EmptyOnly, Timestamp(20))
+                .await?,
+            ActorDeleteOutcome::Deleted { artifact_paths } if artifact_paths.is_empty()
+        ));
+
+        let used = ActorId::parse_workspace_safe("used")?;
+        store.create_actor(&used, Timestamp(11)).await?;
+        store.attach_identity_for_test(&used).await?;
+        assert_eq!(
+            store
+                .delete_actor(&used, ActorDeleteMode::EmptyOnly, Timestamp(21))
+                .await?,
+            ActorDeleteOutcome::Nonempty
+        );
+        assert!(store.load_actor(&used).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn force_delete_requires_disabled_idle_actor() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store.create_actor(&actor, Timestamp(10)).await?;
+        assert_eq!(
+            store
+                .delete_actor(&actor, ActorDeleteMode::Force, Timestamp(20))
+                .await?,
+            ActorDeleteOutcome::Busy
+        );
+
+        store.set_actor_enabled(&actor, false).await?;
+        store.insert_actor_lease_for_test(&actor).await?;
+        assert_eq!(
+            store
+                .delete_actor(&actor, ActorDeleteMode::EmptyOnly, Timestamp(21))
+                .await?,
+            ActorDeleteOutcome::Nonempty
+        );
+        assert_eq!(
+            store
+                .delete_actor(&actor, ActorDeleteMode::Force, Timestamp(22))
+                .await?,
+            ActorDeleteOutcome::Busy
+        );
+        assert!(store.load_actor(&actor).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn force_delete_purges_disabled_actor_identity() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store.create_actor(&actor, Timestamp(10)).await?;
+        store.set_actor_enabled(&actor, false).await?;
+        store.attach_identity_for_test(&actor).await?;
+
+        assert!(matches!(
+            store
+                .delete_actor(&actor, ActorDeleteMode::Force, Timestamp(20))
+                .await?,
+            ActorDeleteOutcome::Deleted { .. }
+        ));
+        assert!(store.load_actor(&actor).await?.is_none());
+        assert!(store.resolve_identity("test", "subject").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn seeded_identity_resolves_to_its_actor() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         store
@@ -601,6 +928,36 @@ mod tests {
                 tools: vec!["*".into(), "bash".into()],
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn force_delete_rejects_unresolved_then_purges_terminal_gateway_delivery() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("delivery")?;
+        store.create_actor(&actor, Timestamp(10)).await?;
+        store.set_actor_enabled(&actor, false).await?;
+        store
+            .insert_gateway_delivery_for_test(&actor, "pending")
+            .await?;
+
+        assert_eq!(
+            store
+                .delete_actor(&actor, ActorDeleteMode::Force, Timestamp(20))
+                .await?,
+            ActorDeleteOutcome::UnresolvedDelivery
+        );
+
+        store
+            .set_gateway_delivery_state_for_test("delivered")
+            .await?;
+        assert!(matches!(
+            store
+                .delete_actor(&actor, ActorDeleteMode::Force, Timestamp(21))
+                .await?,
+            ActorDeleteOutcome::Deleted { .. }
+        ));
+        assert!(store.load_actor(&actor).await?.is_none());
         Ok(())
     }
 }

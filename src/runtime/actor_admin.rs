@@ -1,13 +1,17 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
+    artifacts::remove_deleted_artifacts,
     model::{ActorId, Clock},
     signals::ActorDirectorySignals,
-    store::{ActorAdminStore, ActorCreateOutcome, ActorDetails, RuntimeActor},
+    store::{
+        ActorAdminStore, ActorCreateOutcome, ActorDeleteMode, ActorDeleteOutcome, ActorDetails,
+        RuntimeActor,
+    },
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,6 +22,7 @@ pub enum ActorAdminCommand {
     Create { actor_id: ActorId },
     Enable { actor_id: ActorId },
     Disable { actor_id: ActorId },
+    Delete { actor_id: ActorId, force: bool },
     ToolsList { actor_id: ActorId },
     ToolsGrant { actor_id: ActorId, tool: String },
     ToolsRevoke { actor_id: ActorId, tool: String },
@@ -37,6 +42,9 @@ pub enum ActorAdminResult {
         actor_id: ActorId,
         tools: Vec<String>,
     },
+    Deleted {
+        actor_id: ActorId,
+    },
 }
 
 #[async_trait]
@@ -50,6 +58,7 @@ pub struct ActorAdministration<S, C> {
     known_tools: BTreeSet<String>,
     signals: ActorDirectorySignals,
     clock: C,
+    artifact_root: PathBuf,
 }
 
 impl<S, C> ActorAdministration<S, C> {
@@ -59,6 +68,7 @@ impl<S, C> ActorAdministration<S, C> {
         mut known_tools: BTreeSet<String>,
         signals: ActorDirectorySignals,
         clock: C,
+        artifact_root: impl Into<PathBuf>,
     ) -> Self {
         known_tools.insert("*".into());
         Self {
@@ -67,6 +77,7 @@ impl<S, C> ActorAdministration<S, C> {
             known_tools,
             signals,
             clock,
+            artifact_root: artifact_root.into(),
         }
     }
 }
@@ -129,6 +140,36 @@ where
             changed: outcome.changed,
         })
     }
+
+    async fn delete(&self, actor: ActorId, force: bool) -> Result<ActorAdminResult> {
+        if actor == self.default_actor {
+            bail!("default actor cannot be deleted")
+        }
+        let mode = if force {
+            ActorDeleteMode::Force
+        } else {
+            ActorDeleteMode::EmptyOnly
+        };
+        match self
+            .store
+            .delete_actor(&actor, mode, self.clock.now())
+            .await?
+        {
+            ActorDeleteOutcome::Deleted { artifact_paths } => {
+                remove_deleted_artifacts(&self.artifact_root, &artifact_paths).await;
+                self.signals.notify();
+                Ok(ActorAdminResult::Deleted { actor_id: actor })
+            }
+            ActorDeleteOutcome::NotFound => bail!("actor {actor} does not exist"),
+            ActorDeleteOutcome::Nonempty => {
+                bail!("actor {actor} is not empty; disable it and use --force")
+            }
+            ActorDeleteOutcome::Busy => bail!("actor {actor} is busy"),
+            ActorDeleteOutcome::UnresolvedDelivery => {
+                bail!("actor {actor} has unresolved delivery")
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -159,6 +200,7 @@ where
             }
             ActorAdminCommand::Enable { actor_id } => self.set_enabled(actor_id, true).await,
             ActorAdminCommand::Disable { actor_id } => self.set_enabled(actor_id, false).await,
+            ActorAdminCommand::Delete { actor_id, force } => self.delete(actor_id, force).await,
             ActorAdminCommand::ToolsList { actor_id } => {
                 let actor = self.details(&actor_id).await?.actor;
                 Ok(ActorAdminResult::Tools {
@@ -204,6 +246,7 @@ mod tests {
             BTreeSet::from(["*".into(), "bash".into(), "datetime".into()]),
             signals,
             ManualClock::new(2),
+            std::env::temp_dir().join("codrik-actor-admin-artifacts"),
         ))
     }
 
@@ -297,6 +340,7 @@ mod tests {
             BTreeSet::from(["datetime".into()]),
             ActorDirectorySignals::default(),
             ManualClock::new(2),
+            std::env::temp_dir().join("codrik-actor-admin-artifacts"),
         );
 
         admin
@@ -305,6 +349,73 @@ mod tests {
                 tool: "*".into(),
             })
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_actor_cannot_be_deleted() -> Result<()> {
+        let admin = administration(ActorDirectorySignals::default()).await?;
+
+        let error = admin
+            .execute(ActorAdminCommand::Delete {
+                actor_id: ActorId::parse_workspace_safe("owner")?,
+                force: false,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("default actor"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_empty_actor_notifies_directory_subscribers() -> Result<()> {
+        let signals = ActorDirectorySignals::default();
+        let mut changed = signals.subscribe();
+        let admin = administration(signals).await?;
+        let alice = ActorId::parse_workspace_safe("alice")?;
+        admin
+            .execute(ActorAdminCommand::Create {
+                actor_id: alice.clone(),
+            })
+            .await?;
+        changed.changed().await?;
+        changed.borrow_and_update();
+
+        let result = admin
+            .execute(ActorAdminCommand::Delete {
+                actor_id: alice.clone(),
+                force: false,
+            })
+            .await?;
+
+        assert_eq!(
+            result,
+            crate::runtime::actor_admin::ActorAdminResult::Deleted { actor_id: alice }
+        );
+        changed.changed().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn force_delete_requires_disabled_actor() -> Result<()> {
+        let admin = administration(ActorDirectorySignals::default()).await?;
+        let alice = ActorId::parse_workspace_safe("alice")?;
+        admin
+            .execute(ActorAdminCommand::Create {
+                actor_id: alice.clone(),
+            })
+            .await?;
+
+        let error = admin
+            .execute(ActorAdminCommand::Delete {
+                actor_id: alice,
+                force: true,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("busy"));
         Ok(())
     }
 }

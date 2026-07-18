@@ -26,6 +26,40 @@ use crate::{
 pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_ACTOR_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+pub async fn remove_deleted_artifacts(root: &Path, paths: &[PathBuf]) -> usize {
+    if paths.is_empty() {
+        return 0;
+    }
+    let root_is_real_directory = tokio::fs::symlink_metadata(root)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
+        eprintln!(r#"{{"component":"actor-admin","transition":"artifact_cleanup_failed"}}"#);
+        return 0;
+    };
+    if !root_is_real_directory {
+        eprintln!(r#"{{"component":"actor-admin","transition":"artifact_cleanup_failed"}}"#);
+        return 0;
+    }
+    let mut removed = 0;
+    for path in paths {
+        let result = async {
+            validate_confined_path(&root, path, true).await?;
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Result::<()>::Ok(())
+        }
+        .await;
+        if result.is_err() {
+            eprintln!(r#"{{"component":"actor-admin","transition":"artifact_cleanup_failed"}}"#);
+        }
+    }
+    removed
+}
+
 async fn validate_source(path: &Path) -> Result<u64> {
     let metadata = tokio::fs::symlink_metadata(path).await?;
     if !metadata.file_type().is_file() {
@@ -604,7 +638,9 @@ mod tests {
         test_fixtures::{ActorSeed, ActorSeedSet, IdentitySeed},
     };
 
-    use super::{ArtifactManager, MAX_ARTIFACT_BYTES, TestPause, validate_source};
+    use super::{
+        ArtifactManager, MAX_ARTIFACT_BYTES, TestPause, remove_deleted_artifacts, validate_source,
+    };
 
     #[tokio::test]
     async fn regular_file_passes_preflight() -> Result<()> {
@@ -883,6 +919,48 @@ mod tests {
         fixture.manager.collect_garbage(Timestamp(future)).await?;
 
         assert!(!orphan.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_does_not_follow_or_remove_symlinked_orphans() -> Result<()> {
+        let fixture = ArtifactFixture::new().await?;
+        let actor_dir = fixture.managed.join("orphan-actor");
+        tokio::fs::create_dir_all(&actor_dir).await?;
+        let outside = fixture.root.join("outside");
+        tokio::fs::write(&outside, b"outside").await?;
+        let link = actor_dir.join("orphan-link");
+        std::os::unix::fs::symlink(&outside, &link)?;
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64
+            + 3_700_000;
+
+        fixture.manager.collect_garbage(Timestamp(future)).await?;
+
+        assert!(link.is_symlink());
+        assert_eq!(tokio::fs::read(outside).await?, b"outside");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleted_actor_artifacts_are_removed_from_managed_root() -> Result<()> {
+        let root = temp_path("deleted-actor");
+        tokio::fs::create_dir_all(&root).await?;
+        let root = tokio::fs::canonicalize(root).await?;
+        let actor = root.join("actor");
+        tokio::fs::create_dir(&actor).await?;
+        let artifact = actor.join("hash");
+        tokio::fs::write(&artifact, b"artifact").await?;
+
+        assert_eq!(
+            remove_deleted_artifacts(&root, &[artifact.clone()]).await,
+            1
+        );
+        assert!(!artifact.exists());
+
+        tokio::fs::remove_dir_all(root).await?;
         Ok(())
     }
 
