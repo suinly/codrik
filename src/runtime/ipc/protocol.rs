@@ -594,6 +594,27 @@ fn require_v1(version: u8) -> Result<(), &'static str> {
 }
 
 fn validate_client_body(body: &ClientRequestBody) -> Result<(), &'static str> {
+    let actor = match body {
+        ClientRequestBody::IssueLinkCode {
+            actor_id: Some(actor),
+            ..
+        } => Some(actor),
+        ClientRequestBody::ActorAdmin { command, .. } => match command {
+            ActorAdminCommand::List => None,
+            ActorAdminCommand::Show { actor_id }
+            | ActorAdminCommand::Create { actor_id }
+            | ActorAdminCommand::Enable { actor_id }
+            | ActorAdminCommand::Disable { actor_id }
+            | ActorAdminCommand::Delete { actor_id, .. }
+            | ActorAdminCommand::ToolsList { actor_id }
+            | ActorAdminCommand::ToolsGrant { actor_id, .. }
+            | ActorAdminCommand::ToolsRevoke { actor_id, .. } => Some(actor_id),
+        },
+        _ => None,
+    };
+    if actor.is_some_and(|actor| ActorId::parse_workspace_safe(actor.as_str()).is_err()) {
+        return Err("actor_id is not workspace-safe");
+    }
     match body {
         ClientRequestBody::Submit { text, .. } if text.trim().is_empty() => {
             Err("submit text must contain non-whitespace content")
@@ -620,6 +641,21 @@ fn validate_server_body(body: &ServerEventBody) -> Result<(), &'static str> {
         uuid::Uuid::parse_str(work_item_id.as_str())
             .map(|_| ())
             .map_err(|_| "work_item_id is not a UUID")?;
+    }
+    if let ServerEventBody::ActorAdminResult { result, .. } = body {
+        let actors = match result {
+            ActorAdminOutcome::Actors { actors } => actors.iter().map(|actor| &actor.id).collect(),
+            ActorAdminOutcome::Actor { details, .. } => vec![&details.actor.id],
+            ActorAdminOutcome::Tools { actor_id, .. } | ActorAdminOutcome::Deleted { actor_id } => {
+                vec![actor_id]
+            }
+        };
+        if actors
+            .into_iter()
+            .any(|actor| ActorId::parse_workspace_safe(actor.as_str()).is_err())
+        {
+            return Err("actor_id is not workspace-safe");
+        }
     }
     Ok(())
 }
@@ -878,6 +914,9 @@ mod tests {
         );
         assert!(serde_json::from_str::<ClientRequest>(
             r#"{"version":1,"body":{"type":"actor_admin","request_id":"0190f2ef-0000-7000-8000-000000000001","command":{"action":"missing"}}}"#
+        ).is_err());
+        assert!(serde_json::from_str::<ClientRequest>(
+            r#"{"version":1,"body":{"type":"actor_admin","request_id":"0190f2ef-0000-7000-8000-000000000001","command":{"action":"show","actor_id":"../escape"}}}"#
         ).is_err());
         assert!(
             serde_json::to_string(&ClientRequest::new(ClientRequestBody::ActorAdmin {
