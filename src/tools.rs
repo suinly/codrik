@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::PathBuf,
+};
 
 mod bash;
 mod bashkit;
@@ -75,6 +78,14 @@ impl ToolRegistry {
             .collect();
 
         Self { handlers }
+    }
+
+    pub fn registered_names() -> BTreeSet<String> {
+        Self::new()
+            .handlers
+            .iter()
+            .map(|handler| handler.name().to_owned())
+            .collect()
     }
 }
 

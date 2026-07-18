@@ -9,6 +9,30 @@ pub struct ActorSignals {
     channels: Arc<Mutex<HashMap<ActorId, watch::Sender<i64>>>>,
 }
 
+#[derive(Clone)]
+pub struct ActorDirectorySignals {
+    sender: watch::Sender<u64>,
+}
+
+impl Default for ActorDirectorySignals {
+    fn default() -> Self {
+        Self {
+            sender: watch::channel(0).0,
+        }
+    }
+}
+
+impl ActorDirectorySignals {
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.sender.subscribe()
+    }
+
+    pub fn notify(&self) {
+        self.sender
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
+}
+
 impl ActorSignals {
     pub async fn subscribe(&self, actor: &ActorId) -> watch::Receiver<i64> {
         self.sender(actor).await.subscribe()

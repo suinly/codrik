@@ -149,7 +149,7 @@ pub trait ArtifactStore: Send + Sync {
     ) -> Result<Option<ReferencedArtifact>>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeActor {
     pub id: ActorId,
     pub enabled: bool,
@@ -162,7 +162,7 @@ pub enum ActorBootstrapOutcome {
     AlreadyInitialized,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActorDetails {
     pub actor: RuntimeActor,
     pub identities: Vec<LinkIdentity>,
@@ -218,7 +218,7 @@ pub trait ActorAdminStore: Send + Sync {
     ) -> Result<Option<ActorMutationOutcome>>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LinkIdentity {
     pub provider: String,
     pub subject: String,
