@@ -25,18 +25,38 @@ pub struct AppConfig {
 #[serde(deny_unknown_fields)]
 pub struct TelegramConfig {
     pub token: String,
-    pub public_url: String,
+    #[serde(default)]
+    pub mode: TelegramMode,
+    #[serde(default)]
+    pub public_url: Option<String>,
     #[serde(default = "default_telegram_listen")]
     pub listen: String,
-    pub webhook_secret: String,
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramMode {
+    #[default]
+    Webhook,
+    Polling,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ValidatedTelegramIngressConfig {
+    Webhook {
+        public_url: url::Url,
+        listen: SocketAddr,
+        webhook_secret: String,
+    },
+    Polling,
 }
 
 #[derive(Clone)]
 pub struct ValidatedTelegramConfig {
     pub token: String,
-    pub public_url: url::Url,
-    pub listen: SocketAddr,
-    pub webhook_secret: String,
+    pub ingress: ValidatedTelegramIngressConfig,
 }
 
 impl std::fmt::Debug for TelegramConfig {
@@ -44,6 +64,7 @@ impl std::fmt::Debug for TelegramConfig {
         formatter
             .debug_struct("TelegramConfig")
             .field("token", &"[REDACTED]")
+            .field("mode", &self.mode)
             .field("public_url", &self.public_url)
             .field("listen", &self.listen)
             .field("webhook_secret", &"[REDACTED]")
@@ -56,45 +77,76 @@ impl std::fmt::Debug for ValidatedTelegramConfig {
         formatter
             .debug_struct("ValidatedTelegramConfig")
             .field("token", &"[REDACTED]")
-            .field("public_url", &self.public_url)
-            .field("listen", &self.listen)
-            .field("webhook_secret", &"[REDACTED]")
+            .field("ingress", &self.ingress)
             .finish()
+    }
+}
+
+impl std::fmt::Debug for ValidatedTelegramIngressConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Webhook {
+                public_url,
+                listen,
+                webhook_secret: _,
+            } => formatter
+                .debug_struct("Webhook")
+                .field("public_url", public_url)
+                .field("listen", listen)
+                .field("webhook_secret", &"[REDACTED]")
+                .finish(),
+            Self::Polling => formatter.write_str("Polling"),
+        }
     }
 }
 
 impl TelegramConfig {
     pub fn validate(&self) -> Result<ValidatedTelegramConfig> {
-        let public_url =
-            url::Url::parse(&self.public_url).context("telegram.public_url is not a valid URL")?;
-        if public_url.scheme() != "https"
-            || public_url.host_str().is_none()
-            || public_url.query().is_some()
-            || public_url.fragment().is_some()
-        {
-            bail!("telegram.public_url must be an HTTPS URL without query or fragment");
-        }
-        let listen = self
-            .listen
-            .parse::<SocketAddr>()
-            .context("telegram.listen must be a socket address")?;
         if self.token.trim().is_empty() {
             bail!("telegram.token must not be blank");
         }
-        if self.webhook_secret.is_empty()
-            || self.webhook_secret.len() > 256
-            || !self
-                .webhook_secret
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            bail!("telegram.webhook_secret has invalid length or characters");
-        }
+        let ingress = match self.mode {
+            TelegramMode::Polling => ValidatedTelegramIngressConfig::Polling,
+            TelegramMode::Webhook => {
+                let public_url = self
+                    .public_url
+                    .as_deref()
+                    .context("telegram.public_url is required in webhook mode")?;
+                let public_url = url::Url::parse(public_url)
+                    .context("telegram.public_url is not a valid URL")?;
+                if public_url.scheme() != "https"
+                    || public_url.host_str().is_none()
+                    || public_url.query().is_some()
+                    || public_url.fragment().is_some()
+                {
+                    bail!("telegram.public_url must be an HTTPS URL without query or fragment");
+                }
+                let listen = self
+                    .listen
+                    .parse::<SocketAddr>()
+                    .context("telegram.listen must be a socket address")?;
+                let webhook_secret = self
+                    .webhook_secret
+                    .as_deref()
+                    .context("telegram.webhook_secret is required in webhook mode")?;
+                if webhook_secret.is_empty()
+                    || webhook_secret.len() > 256
+                    || !webhook_secret
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+                {
+                    bail!("telegram.webhook_secret has invalid length or characters");
+                }
+                ValidatedTelegramIngressConfig::Webhook {
+                    public_url,
+                    listen,
+                    webhook_secret: webhook_secret.to_owned(),
+                }
+            }
+        };
         Ok(ValidatedTelegramConfig {
             token: self.token.clone(),
-            public_url,
-            listen,
-            webhook_secret: self.webhook_secret.clone(),
+            ingress,
         })
     }
 }
@@ -282,7 +334,45 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{AppConfig, ImageDetailConfig};
+    use super::{AppConfig, ImageDetailConfig, ValidatedTelegramIngressConfig};
+
+    #[test]
+    fn telegram_mode_defaults_to_webhook() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: k\nbase_url: https://example.test/v1\nmodel: m\ntelegram:\n  token: t\n  public_url: https://agent.example/webhooks/telegram\n  webhook_secret: secret\n",
+        )?;
+        assert!(matches!(
+            config.telegram.unwrap().validate()?.ingress,
+            ValidatedTelegramIngressConfig::Webhook { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_polling_requires_only_token_and_ignores_webhook_fields() -> Result<()> {
+        for yaml in [
+            "telegram:\n  token: t\n  mode: polling\n",
+            "telegram:\n  token: t\n  mode: polling\n  public_url: not-a-url\n  listen: not-an-address\n  webhook_secret: 'bad secret'\n",
+        ] {
+            let document =
+                format!("api_key: k\nbase_url: https://example.test/v1\nmodel: m\n{yaml}");
+            let config: AppConfig = yaml_serde::from_str(&document)?;
+            assert_eq!(
+                config.telegram.unwrap().validate()?.ingress,
+                ValidatedTelegramIngressConfig::Polling
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_still_requires_webhook_fields() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: k\nbase_url: https://example.test/v1\nmodel: m\ntelegram:\n  token: t\n",
+        )?;
+        assert!(config.telegram.unwrap().validate().is_err());
+        Ok(())
+    }
 
     #[test]
     fn telegram_config_defaults_and_validates() -> Result<()> {
@@ -302,11 +392,12 @@ telegram:
         assert!(!config_debug.contains("abc_DEF-123"));
         let telegram = config.telegram.as_ref().unwrap().validate()?;
 
-        assert_eq!(telegram.listen, "127.0.0.1:8080".parse()?);
-        assert_eq!(
-            telegram.public_url.as_str(),
-            "https://agent.example/webhooks/telegram"
-        );
+        assert!(matches!(
+            &telegram.ingress,
+            ValidatedTelegramIngressConfig::Webhook { public_url, listen, .. }
+                if *listen == "127.0.0.1:8080".parse()?
+                    && public_url.as_str() == "https://agent.example/webhooks/telegram"
+        ));
         assert!(!format!("{telegram:?}").contains("bot-token"));
         assert!(!format!("{telegram:?}").contains("abc_DEF-123"));
         Ok(())
@@ -351,11 +442,12 @@ telegram:
     }
 
     #[test]
-    fn obsolete_telegram_secret_config_is_rejected() {
-        let result = yaml_serde::from_str::<AppConfig>(
+    fn obsolete_telegram_secret_config_is_rejected() -> Result<()> {
+        let config = yaml_serde::from_str::<AppConfig>(
             "api_key: key\nbase_url: https://example.test/v1\nmodel: test\ntelegram:\n  token: secret\n",
-        );
-        assert!(result.is_err());
+        )?;
+        assert!(config.telegram.unwrap().validate().is_err());
+        Ok(())
     }
 
     #[test]

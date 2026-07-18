@@ -1587,7 +1587,7 @@ mod telegram_acceptance {
 
     use super::{ACTOR, InjectedLlm, InjectedReply};
     use codrik::{
-        config::ValidatedTelegramConfig,
+        config::{ValidatedTelegramConfig, ValidatedTelegramIngressConfig},
         interfaces::telegram::{
             activity::TelegramActivityWorker,
             api::{
@@ -1793,9 +1793,11 @@ mod telegram_acceptance {
             prepare_with_api(
                 ValidatedTelegramConfig {
                     token: "test-token".into(),
-                    public_url: url::Url::parse("https://agent.example/webhooks/telegram")?,
-                    listen: webhook_address,
-                    webhook_secret: "acceptance_secret".into(),
+                    ingress: ValidatedTelegramIngressConfig::Webhook {
+                        public_url: url::Url::parse("https://agent.example/webhooks/telegram")?,
+                        listen: webhook_address,
+                        webhook_secret: "acceptance_secret".into(),
+                    },
                 },
                 store.clone(),
                 linking,

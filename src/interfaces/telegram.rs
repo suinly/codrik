@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use tokio::{net::TcpListener, sync::watch};
 
 use crate::{
-    config::ValidatedTelegramConfig,
+    config::{ValidatedTelegramConfig, ValidatedTelegramIngressConfig},
     interfaces::telegram::{
         activity::TelegramActivityWorker,
         api::{ReqwestTelegramApi, SetWebhook, TelegramApi},
@@ -139,7 +139,15 @@ where
     A: TelegramApi + Clone + Send + Sync + 'static,
     C: Clock,
 {
-    let listener = TcpListener::bind(config.listen)
+    let ValidatedTelegramIngressConfig::Webhook {
+        public_url,
+        listen,
+        webhook_secret,
+    } = config.ingress
+    else {
+        bail!("Telegram polling ingress is not prepared yet");
+    };
+    let listener = TcpListener::bind(listen)
         .await
         .context("failed to bind Telegram webhook listener")?;
     let bot = api.get_me().await?;
@@ -151,16 +159,16 @@ where
         .username
         .filter(|value| !value.trim().is_empty())
         .context("Telegram bot username is missing")?;
-    let public_url = config.public_url.as_str().to_owned();
+    let public_url_text = public_url.as_str().to_owned();
     api.set_webhook(SetWebhook {
-        url: public_url.clone(),
-        secret_token: config.webhook_secret.clone(),
+        url: public_url_text.clone(),
+        secret_token: webhook_secret.clone(),
         allowed_updates: vec!["message".into()],
         drop_pending_updates: false,
     })
     .await?;
     let info = api.get_webhook_info().await?;
-    if info.url != public_url || info.allowed_updates != ["message"] {
+    if info.url != public_url_text || info.allowed_updates != ["message"] {
         bail!("Telegram webhook reconciliation mismatch");
     }
     let gateway = format!("telegram:{bot_id}");
@@ -174,8 +182,8 @@ where
     )?);
     Ok(PreparedTelegramGateway {
         listener: Mutex::new(Some(listener)),
-        path: config.public_url.path().to_owned(),
-        webhook_secret: config.webhook_secret,
+        path: public_url.path().to_owned(),
+        webhook_secret,
         ingress,
         store,
         api,
@@ -204,7 +212,7 @@ mod tests {
         types::TelegramBot,
     };
     use crate::{
-        config::ValidatedTelegramConfig,
+        config::{ValidatedTelegramConfig, ValidatedTelegramIngressConfig},
         runtime::{
             gateway_activity::GatewayActivityHub,
             identity_link::{IdentityLinkManager, IdentityLinkService, SystemLinkCodeGenerator},
@@ -325,9 +333,11 @@ mod tests {
         };
         let config = ValidatedTelegramConfig {
             token: "secret-token".into(),
-            public_url: url::Url::parse("https://agent.example/webhooks/telegram")?,
-            listen,
-            webhook_secret: "secret_value".into(),
+            ingress: ValidatedTelegramIngressConfig::Webhook {
+                public_url: url::Url::parse("https://agent.example/webhooks/telegram")?,
+                listen,
+                webhook_secret: "secret_value".into(),
+            },
         };
 
         let prepared = prepare_with_api(
@@ -381,9 +391,11 @@ mod tests {
         };
         let config = ValidatedTelegramConfig {
             token: "secret-token".into(),
-            public_url: url::Url::parse("https://agent.example/webhooks/telegram")?,
-            listen: "127.0.0.1:0".parse()?,
-            webhook_secret: "secret_value".into(),
+            ingress: ValidatedTelegramIngressConfig::Webhook {
+                public_url: url::Url::parse("https://agent.example/webhooks/telegram")?,
+                listen: "127.0.0.1:0".parse()?,
+                webhook_secret: "secret_value".into(),
+            },
         };
 
         let error = prepare_with_api(
