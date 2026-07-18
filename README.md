@@ -58,6 +58,7 @@ runtime:
 
 telegram:
   token: "..."
+  mode: webhook
   public_url: "https://agent.example.com/webhooks/telegram"
   listen: "127.0.0.1:8080"
   webhook_secret: "..."
@@ -76,9 +77,10 @@ telegram:
 | `runtime.lock_path` | No | `<CODRIK_HOME>/runtime.lock` | Exclusive server instance lock. |
 | `runtime.artifact_path` | No | `<CODRIK_HOME>/artifacts` | Managed tool-result files. |
 | `telegram.token` | When Telegram is enabled | None | Bot token obtained from BotFather. Keep it private. |
-| `telegram.public_url` | When Telegram is enabled | None | Public HTTPS webhook URL without a query or fragment. |
-| `telegram.listen` | No | `127.0.0.1:8080` | Local HTTP listener behind the HTTPS reverse proxy. |
-| `telegram.webhook_secret` | When Telegram is enabled | None | Secret-token value used to authenticate Telegram webhook requests. |
+| `telegram.mode` | No | `webhook` | Ingress transport: `webhook` or `polling`. |
+| `telegram.public_url` | In webhook mode | None | Public HTTPS webhook URL without a query or fragment. |
+| `telegram.listen` | In webhook mode | `127.0.0.1:8080` | Local HTTP listener behind the HTTPS reverse proxy. |
+| `telegram.webhook_secret` | In webhook mode | None | Secret-token value used to authenticate Telegram webhook requests. |
 
 ### Runtime paths
 
@@ -145,13 +147,32 @@ The daemon prints an eight-character code and the exact `/link CODE` message to
 send in the new channel. Codes expire after 10 minutes, can be used once, and a
 new code invalidates the actor's previous unused code.
 
-## Telegram webhook gateway
+## Telegram gateway
 
-Telegram support is optional. When the `telegram` section is present,
-`codrik serve` binds the configured local listener, calls `getMe`, registers
-the webhook with `setWebhook`, and verifies the resulting webhook information
-before the runtime becomes ready. Startup fails if registration or
-verification does not match the configured public URL.
+Telegram support is optional. Set `telegram.mode` explicitly to `polling` when
+the Codrik host cannot accept public inbound connections:
+
+```yaml
+telegram:
+  token: "..."
+  mode: polling
+```
+
+At startup, polling mode calls `getMe`, removes any existing webhook without
+dropping pending updates, verifies that the webhook URL is empty, and starts
+Telegram long polling. Only one running polling instance should use a bot
+token. `public_url`, `listen`, and `webhook_secret` are ignored in this mode.
+Polling retries transient failures with delays of 1, 2, 4, 8, 16, then 30
+seconds; Telegram's `retry_after` value takes precedence. Update replay after a
+restart is safe because ingress is durable and deduplicated by update ID.
+
+### Webhook mode
+
+Webhook is the default when `telegram.mode` is omitted. `codrik serve` binds
+the configured local listener, calls `getMe`, registers the webhook with
+`setWebhook`, and verifies the resulting webhook information before the
+runtime becomes ready. Startup fails if registration or verification does not
+match the configured public URL.
 
 TLS termination belongs to a reverse proxy. Proxy only the exact webhook path
 to Codrik's local listener. For example, with Caddy:

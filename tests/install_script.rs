@@ -278,4 +278,6 @@ fn active_documentation_has_no_users_json_instructions() {
     assert!(!readme.contains("users.json"));
     assert!(readme.contains("automatically creates the first actor"));
     assert!(readme.contains(r#"tools: ["*"]"#));
+    assert!(readme.contains("mode: polling"));
+    assert!(readme.contains("removes any existing webhook"));
 }
