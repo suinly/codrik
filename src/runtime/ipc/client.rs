@@ -8,6 +8,7 @@ mod tests {
     use super::{LocalIpcClient, write_operation};
     use crate::runtime::{
         BundleId, DeliveryId, RequestId,
+        actor_admin::{ActorAdminCommand, ActorAdminResult},
         ipc::protocol::{
             ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode, ServerEvent,
             ServerEventBody,
@@ -49,6 +50,43 @@ mod tests {
         ));
         server.await??;
         drop(events);
+        std::fs::remove_file(socket)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_admin_requires_matching_terminal_response() -> Result<()> {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket)?;
+        let request = RequestId::new();
+        let expected = request.clone();
+        let command = ActorAdminCommand::List;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let received = FrameReader::new(&mut stream).read_client_request().await?;
+            assert_eq!(
+                received.body,
+                ClientRequestBody::ActorAdmin {
+                    request_id: expected.clone(),
+                    command: ActorAdminCommand::List,
+                }
+            );
+            FrameWriter::new(&mut stream)
+                .write_server_event(&ServerEvent::new(ServerEventBody::ActorAdminResult {
+                    request_id: expected,
+                    result: ActorAdminResult::Actors { actors: vec![] },
+                }))
+                .await?;
+            anyhow::Ok(())
+        });
+
+        assert_eq!(
+            LocalIpcClient::new(socket.clone())
+                .actor_admin(request, command)
+                .await?,
+            ActorAdminResult::Actors { actors: vec![] }
+        );
+        server.await??;
         std::fs::remove_file(socket)?;
         Ok(())
     }
@@ -142,6 +180,7 @@ mod tests {
                 received.body,
                 ClientRequestBody::IssueLinkCode {
                     request_id: expected.clone(),
+                    actor_id: None,
                 }
             );
             FrameWriter::new(&mut stream)
@@ -266,12 +305,13 @@ use tokio::{
 
 use crate::runtime::{
     BundleId, CancelId, DeliveryId, RequestId,
+    actor_admin::{ActorAdminCommand, ActorAdminResult},
     identity_link::IssuedLinkCode,
     ipc::protocol::{
         ClientRequest, ClientRequestBody, FrameReader, FrameWriter, ProtocolErrorCode,
         ProtocolFailure, ServerEvent, ServerEventBody,
     },
-    model::Timestamp,
+    model::{ActorId, Timestamp},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -361,9 +401,20 @@ impl LocalIpcClient {
     }
 
     pub async fn issue_link_code(&self, request_id: RequestId) -> Result<IssuedLinkCode> {
+        self.issue_link_code_for(request_id, None).await
+    }
+
+    pub async fn issue_link_code_for(
+        &self,
+        request_id: RequestId,
+        actor_id: Option<ActorId>,
+    ) -> Result<IssuedLinkCode> {
         let expected_request = request_id.clone();
         let mut stream = self
-            .open(ClientRequestBody::IssueLinkCode { request_id })
+            .open(ClientRequestBody::IssueLinkCode {
+                request_id,
+                actor_id,
+            })
             .await?;
         stream.close_write().await?;
         match stream.next_event().await? {
@@ -391,6 +442,45 @@ impl LocalIpcClient {
             )),
             None => Err(anyhow!(
                 "daemon closed before issuing an identity link code for {expected_request}"
+            )),
+        }
+    }
+
+    pub async fn actor_admin(
+        &self,
+        request_id: RequestId,
+        command: ActorAdminCommand,
+    ) -> Result<ActorAdminResult> {
+        let expected_request = request_id.clone();
+        let mut stream = self
+            .open(ClientRequestBody::ActorAdmin {
+                request_id,
+                command,
+            })
+            .await?;
+        stream.close_write().await?;
+        match stream.next_event().await? {
+            Some(ServerEvent {
+                body: ServerEventBody::ActorAdminResult { request_id, result },
+                ..
+            }) if request_id == expected_request => Ok(result),
+            Some(ServerEvent {
+                body:
+                    ServerEventBody::RequestError {
+                        request_id,
+                        code,
+                        message,
+                    },
+                ..
+            }) if request_id == expected_request => Err(anyhow!(
+                "daemon rejected actor administration request ({code}): {message}"
+            )),
+            Some(event) => Err(anyhow!(
+                "daemon returned an unexpected actor administration response: {:?}",
+                event.body
+            )),
+            None => Err(anyhow!(
+                "daemon closed before completing actor administration request {expected_request}"
             )),
         }
     }

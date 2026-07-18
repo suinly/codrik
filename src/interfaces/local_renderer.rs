@@ -855,6 +855,13 @@ impl<W: Write> LocalRenderer<W> {
                     recover: false,
                 })
             }
+            ServerEventBody::ActorAdminResult { request_id, .. } => {
+                self.require_request(&request_id)?;
+                Ok(RenderAction::DaemonError {
+                    message: "unexpected actor administration response on operation stream".into(),
+                    recover: false,
+                })
+            }
         }
     }
 

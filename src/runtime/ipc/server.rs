@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use crate::runtime::{
+    actor_admin::{ActorAdminCommand, ActorAdminResult, ActorAdministrator},
     hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
     identity_link::IdentityLinkManager,
     ipc::{
@@ -224,6 +225,7 @@ pub struct LocalIpcServer {
     hooks: Arc<dyn RuntimeBoundaryHooks>,
     signals: ActorSignals,
     linking: Option<Arc<dyn IdentityLinkManager>>,
+    administration: Option<Arc<dyn ActorAdministrator>>,
 }
 
 impl LocalIpcServer {
@@ -323,6 +325,7 @@ impl LocalIpcServer {
             hooks,
             signals: ActorSignals::default(),
             linking: None,
+            administration: None,
         }
     }
 
@@ -333,6 +336,11 @@ impl LocalIpcServer {
 
     pub fn with_identity_linking(mut self, linking: Arc<dyn IdentityLinkManager>) -> Self {
         self.linking = Some(linking);
+        self
+    }
+
+    pub fn with_actor_administrator(mut self, administration: Arc<dyn ActorAdministrator>) -> Self {
+        self.administration = Some(administration);
         self
     }
 
@@ -394,6 +402,7 @@ impl LocalIpcServer {
                 hooks: self.hooks.clone(),
                 signals: self.signals.clone(),
                 linking: self.linking.clone(),
+                administration: self.administration.clone(),
             };
             let decode = self.decodes.register();
             handlers.spawn(async move {
@@ -444,6 +453,7 @@ struct ConnectionHandler {
     hooks: Arc<dyn RuntimeBoundaryHooks>,
     signals: ActorSignals,
     linking: Option<Arc<dyn IdentityLinkManager>>,
+    administration: Option<Arc<dyn ActorAdministrator>>,
 }
 
 impl ConnectionHandler {
@@ -558,7 +568,10 @@ impl ConnectionHandler {
                 }
                 sink.close().await
             }
-            ClientRequestBody::IssueLinkCode { request_id } => {
+            ClientRequestBody::IssueLinkCode {
+                request_id,
+                actor_id,
+            } => {
                 drop(decode);
                 let Some(linking) = self.linking.as_ref() else {
                     sink.send_control(request_error(
@@ -569,7 +582,44 @@ impl ConnectionHandler {
                     .await?;
                     return sink.close().await;
                 };
-                match linking.issue_code(&self.actor).await {
+                let actor = actor_id.unwrap_or_else(|| self.actor.clone());
+                let Some(administration) = self.administration.as_ref() else {
+                    sink.send_control(request_error(
+                        request_id,
+                        "actor_admin_unavailable",
+                        "actor administration is not configured",
+                    ))
+                    .await?;
+                    return sink.close().await;
+                };
+                let details = administration
+                    .execute(ActorAdminCommand::Show {
+                        actor_id: actor.clone(),
+                    })
+                    .await;
+                match details {
+                    Ok(ActorAdminResult::Actor { details, .. }) if details.actor.enabled => {}
+                    Ok(ActorAdminResult::Actor { .. }) => {
+                        sink.send_control(request_error(
+                            request_id,
+                            "actor_disabled",
+                            "actor is disabled",
+                        ))
+                        .await?;
+                        return sink.close().await;
+                    }
+                    Ok(_) => bail!("actor administrator returned an unexpected show result"),
+                    Err(error) => {
+                        sink.send_control(request_error(
+                            request_id,
+                            "actor_not_found",
+                            &error.to_string(),
+                        ))
+                        .await?;
+                        return sink.close().await;
+                    }
+                }
+                match linking.issue_code(&actor).await {
                     Ok(issued) => {
                         sink.send_control(ServerEvent::new(ServerEventBody::LinkCodeIssued {
                             request_id,
@@ -583,6 +633,39 @@ impl ConnectionHandler {
                             request_id,
                             "link_code_failed",
                             &format!("failed to issue identity link code: {error}"),
+                        ))
+                        .await?;
+                    }
+                }
+                sink.close().await
+            }
+            ClientRequestBody::ActorAdmin {
+                request_id,
+                command,
+            } => {
+                drop(decode);
+                let Some(administration) = self.administration.as_ref() else {
+                    sink.send_control(request_error(
+                        request_id,
+                        "actor_admin_unavailable",
+                        "actor administration is not configured",
+                    ))
+                    .await?;
+                    return sink.close().await;
+                };
+                match administration.execute(command).await {
+                    Ok(result) => {
+                        sink.send_control(ServerEvent::new(ServerEventBody::ActorAdminResult {
+                            request_id,
+                            result,
+                        }))
+                        .await?;
+                    }
+                    Err(error) => {
+                        sink.send_control(request_error(
+                            request_id,
+                            "actor_admin_failed",
+                            &error.to_string(),
                         ))
                         .await?;
                     }
@@ -882,7 +965,8 @@ fn request_id(body: &ClientRequestBody) -> RequestId {
         | ClientRequestBody::Resume { request_id }
         | ClientRequestBody::AckFinal { request_id, .. }
         | ClientRequestBody::Cancel { request_id, .. }
-        | ClientRequestBody::IssueLinkCode { request_id } => request_id.clone(),
+        | ClientRequestBody::IssueLinkCode { request_id, .. }
+        | ClientRequestBody::ActorAdmin { request_id, .. } => request_id.clone(),
     }
 }
 
@@ -1152,6 +1236,7 @@ mod tests {
 
     use crate::{
         runtime::{
+            actor_admin::{ActorAdminCommand, ActorAdminResult, ActorAdministrator},
             gateway::GatewayCommandKey,
             identity_link::{IdentityLinkManager, IssuedLinkCode, LinkRedemption},
             ipc::{
@@ -1168,9 +1253,9 @@ mod tests {
             outbox_worker::{BundleDeliverySink, DeliveryRegistry},
             signals::ActorSignals,
             store::{
-                AckOutcome, AckRejected, BundleAck, BundleManifest, CancelOutcome, FinalPayload,
-                LinkIdentity, LocalCancel, LocalIngressStore, LocalRequestRecord, LocalSubmission,
-                LocalSubmitOutcome, ResultBundle,
+                AckOutcome, AckRejected, ActorDetails, BundleAck, BundleManifest, CancelOutcome,
+                FinalPayload, LinkIdentity, LocalCancel, LocalIngressStore, LocalRequestRecord,
+                LocalSubmission, LocalSubmitOutcome, ResultBundle, RuntimeActor,
             },
             stream_hub::StreamHub,
         },
@@ -1184,11 +1269,61 @@ mod tests {
 
     struct SameUid;
 
-    struct TestLinking;
+    #[derive(Default)]
+    struct TestLinking(Arc<Mutex<Vec<ActorId>>>);
+
+    struct RecordingAdministrator(Arc<AtomicUsize>);
+
+    struct DisabledAdministrator;
+
+    #[async_trait]
+    impl ActorAdministrator for DisabledAdministrator {
+        async fn execute(&self, command: ActorAdminCommand) -> Result<ActorAdminResult> {
+            let ActorAdminCommand::Show { actor_id } = command else {
+                panic!("unexpected administrator command: {command:?}");
+            };
+            Ok(ActorAdminResult::Actor {
+                details: ActorDetails {
+                    actor: RuntimeActor {
+                        id: actor_id,
+                        enabled: false,
+                        tools: vec![],
+                    },
+                    identities: vec![],
+                    has_active_work: false,
+                },
+                changed: false,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ActorAdministrator for RecordingAdministrator {
+        async fn execute(&self, command: ActorAdminCommand) -> Result<ActorAdminResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(match command {
+                ActorAdminCommand::List => ActorAdminResult::Actors { actors: vec![] },
+                ActorAdminCommand::Show { actor_id } => ActorAdminResult::Actor {
+                    details: ActorDetails {
+                        actor: RuntimeActor {
+                            id: actor_id,
+                            enabled: true,
+                            tools: vec![],
+                        },
+                        identities: vec![],
+                        has_active_work: false,
+                    },
+                    changed: false,
+                },
+                other => panic!("unexpected administrator command: {other:?}"),
+            })
+        }
+    }
 
     #[async_trait]
     impl IdentityLinkManager for TestLinking {
-        async fn issue_code(&self, _actor: &ActorId) -> Result<IssuedLinkCode> {
+        async fn issue_code(&self, actor: &ActorId) -> Result<IssuedLinkCode> {
+            self.0.lock().unwrap().push(actor.clone());
             Ok(IssuedLinkCode {
                 code: "ABCD-EFGH".into(),
                 expires_at: Timestamp(1_721_234_567_890),
@@ -1220,6 +1355,14 @@ mod tests {
     impl PeerCredentials for SameUid {
         fn peer_uid(&self, _stream: &UnixStream) -> std::io::Result<u32> {
             Ok(unsafe { libc::geteuid() })
+        }
+    }
+
+    struct DifferentUid;
+
+    impl PeerCredentials for DifferentUid {
+        fn peer_uid(&self, _stream: &UnixStream) -> std::io::Result<u32> {
+            Ok(unsafe { libc::geteuid() }.wrapping_add(1))
         }
     }
 
@@ -1556,6 +1699,7 @@ mod tests {
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             signals: ActorSignals::default(),
             linking: None,
+            administration: None,
         }
     }
 
@@ -1588,6 +1732,7 @@ mod tests {
                 hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
                 signals: ActorSignals::default(),
                 linking: None,
+                administration: None,
             },
             ingress,
             outbox,
@@ -1631,6 +1776,7 @@ mod tests {
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             signals: ActorSignals::default(),
             linking: None,
+            administration: None,
         }
     }
 
@@ -1663,6 +1809,7 @@ mod tests {
                 hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
                 signals: ActorSignals::default(),
                 linking: None,
+                administration: None,
             },
             ingress,
             outbox,
@@ -2074,15 +2221,21 @@ mod tests {
     #[tokio::test]
     async fn issue_link_code_returns_terminal_response_without_submitting_work() -> Result<()> {
         let mut handler = test_handler();
-        handler.linking = Some(Arc::new(TestLinking));
+        let linking = Arc::new(TestLinking::default());
+        handler.linking = Some(linking.clone());
+        handler.administration = Some(Arc::new(RecordingAdministrator(Arc::new(
+            AtomicUsize::new(0),
+        ))));
         let ingress = handler.ingress.clone();
         let request_id = RequestId::new();
         let expected = request_id.clone();
+        let alice = ActorId::parse_workspace_safe("alice")?;
         let (server, mut client) = UnixStream::pair()?;
         let task = tokio::spawn(async move { handler.handle(server).await });
         FrameWriter::new(&mut client)
             .write_client_request(&ClientRequest::new(ClientRequestBody::IssueLinkCode {
                 request_id,
+                actor_id: Some(alice.clone()),
             }))
             .await?;
         client.shutdown().await?;
@@ -2096,6 +2249,7 @@ mod tests {
                 expires_at: 1_721_234_567_890,
             }
         );
+        assert_eq!(*linking.0.lock().unwrap(), vec![alice]);
         assert!(
             ingress
                 .resolve_local_request(&ActorId::from_string("actor:local:test"), &RequestId::new())
@@ -2103,6 +2257,76 @@ mod tests {
                 .is_none()
         );
         task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_admin_returns_terminal_response() -> Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut handler = test_handler();
+        handler.administration = Some(Arc::new(RecordingAdministrator(calls.clone())));
+        let request_id = RequestId::new();
+        let expected = request_id.clone();
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::ActorAdmin {
+                request_id,
+                command: ActorAdminCommand::List,
+            }))
+            .await?;
+        client.shutdown().await?;
+
+        assert_eq!(
+            FrameReader::new(client).read_server_event().await?.body,
+            ServerEventBody::ActorAdminResult {
+                request_id: expected,
+                result: ActorAdminResult::Actors { actors: vec![] },
+            }
+        );
+        task.await??;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn link_code_rejects_disabled_actor_before_issuance() -> Result<()> {
+        let linking = Arc::new(TestLinking::default());
+        let mut handler = test_handler();
+        handler.linking = Some(linking.clone());
+        handler.administration = Some(Arc::new(DisabledAdministrator));
+        let request_id = RequestId::new();
+        let expected = request_id.clone();
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(async move { handler.handle(server).await });
+        FrameWriter::new(&mut client)
+            .write_client_request(&ClientRequest::new(ClientRequestBody::IssueLinkCode {
+                request_id,
+                actor_id: Some(ActorId::parse_workspace_safe("alice")?),
+            }))
+            .await?;
+        client.shutdown().await?;
+
+        assert!(matches!(
+            FrameReader::new(client).read_server_event().await?.body,
+            ServerEventBody::RequestError { request_id, ref code, .. }
+                if request_id == expected && code == "actor_disabled"
+        ));
+        task.await??;
+        assert!(linking.0.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_admin_rejects_non_owner_before_administrator_call() -> Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut handler = test_handler();
+        handler.credentials = Arc::new(DifferentUid);
+        handler.administration = Some(Arc::new(RecordingAdministrator(calls.clone())));
+        let (server, _client) = UnixStream::pair()?;
+
+        assert!(handler.handle(server).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -2663,6 +2887,7 @@ mod tests {
             hooks: Arc::new(crate::runtime::hooks::NoopRuntimeBoundaryHooks),
             signals: ActorSignals::default(),
             linking: None,
+            administration: None,
         };
         let (server, mut client) = UnixStream::pair()?;
         let task = tokio::spawn(async move { handler.handle(server).await });

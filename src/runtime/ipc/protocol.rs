@@ -9,8 +9,9 @@ use tokio::{
 };
 
 use crate::runtime::{
+    actor_admin::{ActorAdminCommand, ActorAdminResult as ActorAdminOutcome},
     model::{
-        BundleId, CancelId, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES,
+        ActorId, BundleId, CancelId, DeliveryId, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES,
         MAX_FINAL_CHUNK_BYTES, MAX_FRAME_BYTES, MAX_MANIFEST_BYTES, MAX_SUBMIT_BYTES, RequestId,
         WorkItemId,
     },
@@ -88,6 +89,12 @@ pub enum ClientRequestBody {
     },
     IssueLinkCode {
         request_id: RequestId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_id: Option<ActorId>,
+    },
+    ActorAdmin {
+        request_id: RequestId,
+        command: ActorAdminCommand,
     },
 }
 
@@ -212,6 +219,10 @@ pub enum ServerEventBody {
         request_id: RequestId,
         code: String,
         expires_at: i64,
+    },
+    ActorAdminResult {
+        request_id: RequestId,
+        result: ActorAdminOutcome,
     },
 }
 
@@ -595,6 +606,11 @@ fn validate_client_body(body: &ClientRequestBody) -> Result<(), &'static str> {
         {
             Err("ack delivery count is outside the bundle limits")
         }
+        ClientRequestBody::ActorAdmin {
+            command:
+                ActorAdminCommand::ToolsGrant { tool, .. } | ActorAdminCommand::ToolsRevoke { tool, .. },
+            ..
+        } if tool.trim().is_empty() => Err("actor tool name must not be blank"),
         _ => Ok(()),
     }
 }
@@ -833,12 +849,55 @@ mod tests {
     };
     use crate::runtime::{
         ArtifactId, BundleId, BundleState, CancelId, DeliveryId, RequestId,
-        model::{MAX_BUNDLE_BYTES, MAX_FINAL_CHUNK_BYTES, MAX_FRAME_BYTES, WorkItemId},
+        actor_admin::ActorAdminCommand,
+        model::{ActorId, MAX_BUNDLE_BYTES, MAX_FINAL_CHUNK_BYTES, MAX_FRAME_BYTES, WorkItemId},
         store::{BundleManifest, FinalPayload, ManagedArtifact, ResultBundle},
     };
 
     fn request_id() -> RequestId {
         RequestId::parse("0190f2ef-0000-7000-8000-000000000001").unwrap()
+    }
+
+    #[test]
+    fn actor_admin_request_has_strict_stable_encoding() -> Result<()> {
+        let request = ClientRequest::new(ClientRequestBody::ActorAdmin {
+            request_id: request_id(),
+            command: ActorAdminCommand::ToolsGrant {
+                actor_id: ActorId::parse_workspace_safe("alice")?,
+                tool: "bash".into(),
+            },
+        });
+
+        assert_eq!(
+            serde_json::to_string(&request)?,
+            r#"{"version":1,"body":{"type":"actor_admin","request_id":"0190f2ef-0000-7000-8000-000000000001","command":{"action":"tools_grant","actor_id":"alice","tool":"bash"}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(&serde_json::to_string(&request)?)?,
+            request
+        );
+        assert!(serde_json::from_str::<ClientRequest>(
+            r#"{"version":1,"body":{"type":"actor_admin","request_id":"0190f2ef-0000-7000-8000-000000000001","command":{"action":"missing"}}}"#
+        ).is_err());
+        assert!(
+            serde_json::to_string(&ClientRequest::new(ClientRequestBody::ActorAdmin {
+                request_id: request_id(),
+                command: ActorAdminCommand::ToolsGrant {
+                    actor_id: ActorId::parse_workspace_safe("alice")?,
+                    tool: "  ".into(),
+                },
+            }))
+            .is_err()
+        );
+        let response = ServerEvent::new(ServerEventBody::ActorAdminResult {
+            request_id: request_id(),
+            result: crate::runtime::actor_admin::ActorAdminResult::Actors { actors: vec![] },
+        });
+        assert_eq!(
+            serde_json::to_string(&response)?,
+            r#"{"version":1,"body":{"type":"actor_admin_result","request_id":"0190f2ef-0000-7000-8000-000000000001","result":{"result":"actors","actors":[]}}}"#
+        );
+        Ok(())
     }
 
     fn bundle_id() -> BundleId {
@@ -884,6 +943,7 @@ mod tests {
             }),
             ClientRequest::new(ClientRequestBody::IssueLinkCode {
                 request_id: request_id(),
+                actor_id: None,
             }),
         ];
         let expected = [
