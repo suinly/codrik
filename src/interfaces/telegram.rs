@@ -2,6 +2,7 @@ pub mod activity;
 pub mod api;
 pub mod delivery;
 pub mod ingress;
+pub mod polling;
 pub mod types;
 pub mod webhook;
 
