@@ -18,6 +18,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -29,11 +30,12 @@ use uuid::Uuid;
 use codrik::{
     interfaces::local_renderer::{FinalBundleVerifier, VerifiedFinalBundle},
     runtime::{
+        actor_admin::ActorAdminCommand,
         hooks::RuntimeBoundaryHooks,
         ipc::protocol::ServerEvent,
         model::{ActorId, RequestId, Timestamp},
         sqlite::SqliteRuntimeStore,
-        store::{ActorStore, FinalPayload},
+        store::{ActorStore, FinalPayload, LocalIngressStore, LocalSubmission},
     },
 };
 
@@ -413,6 +415,7 @@ struct InjectedLlm {
     called: Arc<Notify>,
     block_call: Option<usize>,
     release: Arc<Notify>,
+    tool_sets: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl InjectedLlm {
@@ -423,6 +426,7 @@ impl InjectedLlm {
             called: Arc::new(Notify::new()),
             block_call: None,
             release: Arc::new(Notify::new()),
+            tool_sets: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -441,17 +445,34 @@ impl InjectedLlm {
             called.await;
         }
     }
+
+    async fn wait_tool_sets(&self, expected: usize) {
+        while self.tool_sets.lock().unwrap().len() < expected {
+            let called = self.called.notified();
+            if self.tool_sets.lock().unwrap().len() >= expected {
+                break;
+            }
+            called.await;
+        }
+    }
 }
 
 #[async_trait]
 impl codrik::llm::client::LlmStreamClient for InjectedLlm {
     async fn stream(
         &self,
-        _request: codrik::llm::client::LlmRequest,
+        request: codrik::llm::client::LlmRequest,
         sink: &mut dyn codrik::llm::client::LlmStreamSink,
         _context: &codrik::llm::client::RunContext,
     ) -> Result<codrik::llm::client::LlmResponse> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut tools = request
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        tools.sort();
+        self.tool_sets.lock().unwrap().push(tools);
         self.called.notify_waiters();
         if self.block_call == Some(call) {
             self.release.notified().await;
@@ -765,6 +786,66 @@ async fn clean_runtime_bootstraps_configured_actor_without_users_file() -> Resul
         r#"["*"]"#
     );
     drop(harness);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_administration_dispatches_second_actor_with_its_tools() -> Result<()> {
+    let _serial = serialize_acceptance();
+    let harness = InjectedHarness::start(vec![
+        InjectedReply::Text("owner done".into()),
+        InjectedReply::Text("alice done".into()),
+    ])
+    .await?;
+    let client = codrik::runtime::ipc::client::LocalIpcClient::new(harness.socket.clone());
+    let alice = ActorId::parse_workspace_safe("alice")?;
+    for command in [
+        ActorAdminCommand::Create {
+            actor_id: alice.clone(),
+        },
+        ActorAdminCommand::ToolsGrant {
+            actor_id: alice.clone(),
+            tool: "datetime".into(),
+        },
+        ActorAdminCommand::ToolsRevoke {
+            actor_id: ActorId::parse_workspace_safe(ACTOR)?,
+            tool: "*".into(),
+        },
+    ] {
+        client
+            .actor_admin(codrik::runtime::RequestId::new(), command)
+            .await?;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let store = SqliteRuntimeStore::open(&harness.database).await?;
+    for (actor, text) in [
+        (ActorId::parse_workspace_safe(ACTOR)?, "owner request"),
+        (alice, "alice request"),
+    ] {
+        store
+            .submit_for_actor(
+                &actor,
+                LocalSubmission {
+                    request_id: codrik::runtime::RequestId::new(),
+                    text: text.into(),
+                    prompt_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+                },
+                Timestamp(2_000),
+            )
+            .await?;
+    }
+
+    harness.llm.wait_tool_sets(2).await;
+    let mut tool_sets = harness.llm.tool_sets.lock().unwrap().clone();
+    tool_sets.sort();
+    assert_eq!(tool_sets, vec![vec![], vec![String::from("datetime")]]);
+    harness
+        .wait_scalar(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM work_items WHERE state = 'completed'",
+            "2",
+        )
+        .await?;
     Ok(())
 }
 

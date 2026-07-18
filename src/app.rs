@@ -3,8 +3,9 @@ use crate::{
     interfaces::telegram,
     llm::{client::LlmStreamClient, openai::OpenAiClient},
     runtime::{
+        actor_admin::ActorAdministration,
         artifacts::ArtifactManager,
-        dispatcher::ActorDispatcher,
+        dispatcher::{ActorDispatcher, ActorDispatcherManager},
         gateway_activity::GatewayActivityHub,
         hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
         identity_link::{IdentityLinkManager, IdentityLinkService, SystemLinkCodeGenerator},
@@ -20,7 +21,7 @@ use crate::{
         },
         outbox_worker::OutboxWorker,
         runner::{ActorRunner, RunnerLimits},
-        signals::ActorSignals,
+        signals::{ActorDirectorySignals, ActorSignals},
         sqlite::{RUNTIME_SCHEMA_VERSION, SqliteRuntimeStore},
         store::{ActorStore, RuntimeStore},
         stream_hub::{CompositeRuntimeEventPublisher, RuntimeEventPublisher, StreamHub},
@@ -212,6 +213,7 @@ where
     trace.record(StartupPhase::StaleSocketRemoved);
 
     let signals = ActorSignals::default();
+    let directory = ActorDirectorySignals::default();
     let hub = Arc::new(StreamHub::default());
     let gateway_activity = GatewayActivityHub::default();
     let outbox_owner = format!("outbox-{}", std::process::id());
@@ -227,6 +229,14 @@ where
         clock.clone(),
         SystemLinkCodeGenerator,
     ));
+    let administration = Arc::new(ActorAdministration::new(
+        store.clone(),
+        actor_id.clone(),
+        ToolRegistry::registered_names(),
+        directory.clone(),
+        clock.clone(),
+        paths.artifacts.clone(),
+    ));
     let server = LocalIpcServer::bind_with_hooks(
         &paths.socket,
         actor_id.clone(),
@@ -236,7 +246,8 @@ where
         hooks.clone(),
     )?
     .with_actor_signals(signals.clone())
-    .with_identity_linking(identity_linking.clone());
+    .with_identity_linking(identity_linking.clone())
+    .with_actor_administrator(administration);
     trace.record(StartupPhase::SocketBound);
     let recovery = store.recover_startup(clock.now()).await?;
     trace.record(StartupPhase::Recovered);
@@ -261,10 +272,6 @@ where
         )),
         None => None,
     };
-    let tool_config =
-        tool_config_for_actor_workspace(actor_workspace_path_in(&home, actor.id.as_str())?)?;
-    let instructions = agent_instructions_for_tool_config(&tool_config);
-    let tools = ToolRegistry::with_allowed_tools_and_config(actor.tools, tool_config);
     let events: Arc<dyn RuntimeEventPublisher> = match &telegram {
         Some(_) => Arc::new(CompositeRuntimeEventPublisher::new(
             hub.clone(),
@@ -272,24 +279,8 @@ where
         )),
         None => hub.clone(),
     };
-    let runner = ActorRunner::new(
-        llm,
-        tools,
-        signals.clone(),
-        events,
-        RunnerLimits::default(),
-        artifacts.clone(),
-    )
-    .with_system_instructions(instructions)
-    .with_logger(logger.clone())
-    .with_boundary_hooks(hooks);
-    let dispatcher = ActorDispatcher::new(
-        actor_id.clone(),
-        dispatcher_owner.clone(),
-        signals,
-        runner,
-        clock.clone(),
-    );
+    let llm = Arc::new(llm);
+    let dispatchers = ActorDispatcherManager::new(store.clone(), directory);
 
     let mut startup =
         RuntimeLogEvent::transition(RuntimeComponent::Startup, RuntimeTransition::Recovered);
@@ -354,8 +345,53 @@ where
             async move { telegram.streaming(shutdown).await }
         });
     }
-    service.component("dispatcher", async move {
-        dispatcher.run_with_shutdown(shutdown_rx).await
+    service.component("dispatcher", {
+        let dispatcher_task_owner = dispatcher_owner.clone();
+        let home = home.clone();
+        let signals = signals.clone();
+        let artifacts = artifacts.clone();
+        let logger = logger.clone();
+        let hooks = hooks.clone();
+        let clock = clock.clone();
+        async move {
+            dispatchers
+                .run_with(shutdown_rx, move |actor, actor_shutdown| {
+                    let home = home.clone();
+                    let signals = signals.clone();
+                    let events = events.clone();
+                    let artifacts = artifacts.clone();
+                    let logger = logger.clone();
+                    let hooks = hooks.clone();
+                    let clock = clock.clone();
+                    let llm = llm.clone();
+                    let owner = dispatcher_task_owner.clone();
+                    async move {
+                        let tool_config = tool_config_for_actor_workspace(
+                            actor_workspace_path_in(&home, actor.id.as_str())?,
+                        )?;
+                        let instructions = agent_instructions_for_tool_config(&tool_config);
+                        let tools = ToolRegistry::with_allowed_tools_and_config(
+                            actor.tools.clone(),
+                            tool_config,
+                        );
+                        let runner = ActorRunner::new(
+                            llm,
+                            tools,
+                            signals.clone(),
+                            events,
+                            RunnerLimits::default(),
+                            artifacts,
+                        )
+                        .with_system_instructions(instructions)
+                        .with_logger(logger)
+                        .with_boundary_hooks(hooks);
+                        ActorDispatcher::new(actor.id, owner, signals, runner, clock)
+                            .run_with_shutdown(actor_shutdown)
+                            .await
+                    }
+                })
+                .await
+        }
     });
     let ready_logger = logger.clone();
     let shutdown_logger = logger.clone();

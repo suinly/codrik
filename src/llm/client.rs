@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,21 @@ pub trait LlmStreamClient {
         sink: &mut dyn LlmStreamSink,
         context: &RunContext,
     ) -> Result<LlmResponse>;
+}
+
+#[async_trait]
+impl<T> LlmStreamClient for Arc<T>
+where
+    T: LlmStreamClient + Send + Sync + ?Sized,
+{
+    async fn stream(
+        &self,
+        llm_request: LlmRequest,
+        sink: &mut dyn LlmStreamSink,
+        context: &RunContext,
+    ) -> Result<LlmResponse> {
+        (**self).stream(llm_request, sink, context).await
+    }
 }
 
 #[async_trait]

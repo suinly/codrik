@@ -151,6 +151,11 @@ where
                     .await?;
                     return Ok(TelegramIngressOutcome::CommandHandled);
                 };
+                if !actor.enabled {
+                    self.enqueue_response(update_id, route, "This actor is disabled.")
+                        .await?;
+                    return Ok(TelegramIngressOutcome::CommandHandled);
+                }
                 match self
                     .store
                     .ingest(
@@ -198,7 +203,7 @@ mod tests {
             model::{ActorId, ManualClock, Timestamp},
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
-            store::{ActorStore, GatewayDeliveryStore, OutboxPayload},
+            store::{ActorAdminStore, ActorStore, GatewayDeliveryStore, OutboxPayload},
         },
     };
 
@@ -255,6 +260,80 @@ mod tests {
                 text: "This channel is now linked.".into()
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_actor_text_is_rejected_without_ingress_or_signal() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(10),
+            SystemLinkCodeGenerator,
+        ));
+        let issued = manager.issue_code(&actor).await?;
+        let signals = ActorSignals::default();
+        let signal = signals.subscribe(&actor).await;
+        let ingress = TelegramIngressService::new(
+            store.clone(),
+            manager,
+            signals,
+            "900",
+            "codrik_bot",
+            ManualClock::new(20),
+        )?;
+        ingress
+            .handle(serde_json::from_value(serde_json::json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 1,
+                    "from": {"id": 100, "is_bot": false},
+                    "chat": {"id": 100, "type": "private"},
+                    "text": format!("/link {}", issued.code)
+                }
+            }))?)
+            .await?;
+        store.set_actor_enabled(&actor, false).await?;
+
+        assert_eq!(
+            ingress
+                .handle(serde_json::from_value(serde_json::json!({
+                    "update_id": 2,
+                    "message": {
+                        "message_id": 2,
+                        "from": {"id": 100, "is_bot": false},
+                        "chat": {"id": 100, "type": "private"},
+                        "text": "hello"
+                    }
+                }))?)
+                .await?,
+            TelegramIngressOutcome::CommandHandled
+        );
+        assert_eq!(*signal.borrow(), 0);
+        assert!(!store.actor_details(&actor).await?.unwrap().has_active_work);
+        let mut deliveries = store
+            .claim_gateway_deliveries("telegram:900", "test", Timestamp(21), Timestamp(51), 10)
+            .await?;
+        for delivery in &deliveries {
+            store
+                .complete_gateway_delivery(&delivery.claim, Some("sent".into()), Timestamp(22))
+                .await?;
+        }
+        deliveries.extend(
+            store
+                .claim_gateway_deliveries("telegram:900", "test", Timestamp(23), Timestamp(53), 10)
+                .await?,
+        );
+        assert!(deliveries.iter().any(|delivery| {
+            delivery.payload
+                == OutboxPayload::Text {
+                    text: "This actor is disabled.".into(),
+                }
+        }));
         Ok(())
     }
 }
