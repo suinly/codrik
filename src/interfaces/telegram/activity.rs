@@ -301,8 +301,8 @@ mod tests {
     use super::TelegramActivityWorker;
     use crate::{
         interfaces::telegram::api::{
-            EditMessageText, SendChatAction, SendFile, SendMessage, SendRichMessage, SetWebhook,
-            TelegramApi, TelegramApiError, TelegramMessageRef, WebhookInfo,
+            EditMessageText, SendChatAction, SendFile, SendMessage, SendRichMessage, TelegramApi,
+            TelegramApiError, TelegramMessageRef,
         },
         llm::client::AgentActivityEvent,
         runtime::{
@@ -321,24 +321,6 @@ mod tests {
 
     #[async_trait]
     impl TelegramApi for ActivityApi {
-        async fn get_me(
-            &self,
-        ) -> std::result::Result<crate::interfaces::telegram::types::TelegramBot, TelegramApiError>
-        {
-            unreachable!()
-        }
-
-        async fn set_webhook(
-            &self,
-            _command: SetWebhook,
-        ) -> std::result::Result<(), TelegramApiError> {
-            unreachable!()
-        }
-
-        async fn get_webhook_info(&self) -> std::result::Result<WebhookInfo, TelegramApiError> {
-            unreachable!()
-        }
-
         async fn send_message(
             &self,
             command: SendMessage,

@@ -1592,7 +1592,8 @@ mod telegram_acceptance {
             activity::TelegramActivityWorker,
             api::{
                 EditMessageText, SendChatAction, SendFile, SendMessage, SendRichMessage,
-                SetWebhook, TelegramApi, TelegramApiError, TelegramMessageRef, WebhookInfo,
+                SetWebhook, TelegramApi, TelegramApiError, TelegramIngressApi, TelegramMessageRef,
+                WebhookInfo,
             },
             delivery::TelegramDeliveryWorker,
             prepare_with_api,
@@ -1621,7 +1622,7 @@ mod telegram_acceptance {
     }
 
     #[async_trait]
-    impl TelegramApi for TelegramApiMock {
+    impl TelegramIngressApi for TelegramApiMock {
         async fn get_me(
             &self,
         ) -> std::result::Result<codrik::interfaces::telegram::types::TelegramBot, TelegramApiError>
@@ -1647,7 +1648,10 @@ mod telegram_acceptance {
                 pending_update_count: 0,
             })
         }
+    }
 
+    #[async_trait]
+    impl TelegramApi for TelegramApiMock {
         async fn send_message(
             &self,
             command: SendMessage,

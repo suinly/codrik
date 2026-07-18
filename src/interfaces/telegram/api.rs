@@ -132,9 +132,6 @@ pub struct TelegramMessageRef {
 
 #[async_trait]
 pub trait TelegramApi: Send + Sync {
-    async fn get_me(&self) -> Result<TelegramBot, TelegramApiError>;
-    async fn set_webhook(&self, command: SetWebhook) -> Result<(), TelegramApiError>;
-    async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramApiError>;
     async fn send_message(
         &self,
         command: SendMessage,
@@ -150,6 +147,13 @@ pub trait TelegramApi: Send + Sync {
         &self,
         command: SendFile,
     ) -> Result<TelegramMessageRef, TelegramApiError>;
+}
+
+#[async_trait]
+pub trait TelegramIngressApi: Send + Sync {
+    async fn get_me(&self) -> Result<TelegramBot, TelegramApiError>;
+    async fn set_webhook(&self, command: SetWebhook) -> Result<(), TelegramApiError>;
+    async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramApiError>;
 }
 
 #[derive(Clone)]
@@ -285,7 +289,7 @@ impl ReqwestTelegramApi {
 }
 
 #[async_trait]
-impl TelegramApi for ReqwestTelegramApi {
+impl TelegramIngressApi for ReqwestTelegramApi {
     async fn get_me(&self) -> Result<TelegramBot, TelegramApiError> {
         self.post_json("getMe", &serde_json::json!({}), true).await
     }
@@ -299,7 +303,10 @@ impl TelegramApi for ReqwestTelegramApi {
         self.post_json("getWebhookInfo", &serde_json::json!({}), true)
             .await
     }
+}
 
+#[async_trait]
+impl TelegramApi for ReqwestTelegramApi {
     async fn send_message(
         &self,
         command: SendMessage,
@@ -437,7 +444,7 @@ mod tests {
 
     use super::{
         InputRichMessage, ReqwestTelegramApi, SendChatAction, SendMessage, SendRichMessage,
-        TelegramApi, TelegramApiErrorClass, TelegramChatAction,
+        TelegramApi, TelegramApiErrorClass, TelegramChatAction, TelegramIngressApi,
     };
 
     #[tokio::test]

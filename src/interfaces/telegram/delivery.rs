@@ -397,12 +397,9 @@ mod tests {
 
     use super::{TelegramDeliveryWorker, retry_at, validate_managed_file};
     use crate::{
-        interfaces::telegram::{
-            api::{
-                EditMessageText, SendFile, SendMessage, SendRichMessage, SetWebhook, TelegramApi,
-                TelegramApiError, TelegramApiErrorClass, TelegramMessageRef, WebhookInfo,
-            },
-            types::TelegramBot,
+        interfaces::telegram::api::{
+            EditMessageText, SendFile, SendMessage, SendRichMessage, TelegramApi, TelegramApiError,
+            TelegramApiErrorClass, TelegramMessageRef,
         },
         runtime::{
             gateway::{
@@ -475,18 +472,6 @@ mod tests {
 
     #[async_trait]
     impl TelegramApi for RecordingApi {
-        async fn get_me(&self) -> Result<TelegramBot, TelegramApiError> {
-            unreachable!()
-        }
-
-        async fn set_webhook(&self, _command: SetWebhook) -> Result<(), TelegramApiError> {
-            unreachable!()
-        }
-
-        async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramApiError> {
-            unreachable!()
-        }
-
         async fn send_message(
             &self,
             command: SendMessage,

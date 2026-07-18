@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod api;
 pub mod delivery;
+pub mod ingress;
 pub mod types;
 pub mod webhook;
 
@@ -16,9 +17,10 @@ use crate::{
     config::{ValidatedTelegramConfig, ValidatedTelegramIngressConfig},
     interfaces::telegram::{
         activity::TelegramActivityWorker,
-        api::{ReqwestTelegramApi, SetWebhook, TelegramApi},
+        api::{ReqwestTelegramApi, SetWebhook, TelegramApi, TelegramIngressApi},
         delivery::TelegramDeliveryWorker,
-        webhook::{SecretToken, TelegramIngressService, TelegramWebhookServer},
+        ingress::TelegramIngressService,
+        webhook::{SecretToken, TelegramWebhookServer},
     },
     runtime::{
         gateway_activity::GatewayActivityHub,
@@ -47,7 +49,7 @@ pub struct PreparedTelegramGateway<S, A, C> {
 impl<S, A, C> PreparedTelegramGateway<S, A, C>
 where
     S: ActorStore + IngressStore + GatewayDeliveryStore + Clone + Send + Sync + 'static,
-    A: TelegramApi + Clone + Send + Sync + 'static,
+    A: TelegramApi + TelegramIngressApi + Clone + Send + Sync + 'static,
     C: Clock,
 {
     pub fn bot_id(&self) -> &str {
@@ -136,7 +138,7 @@ pub async fn prepare_with_api<S, A, C>(
 ) -> Result<PreparedTelegramGateway<S, A, C>>
 where
     S: ActorStore + IngressStore + GatewayDeliveryStore + Clone + Send + Sync + 'static,
-    A: TelegramApi + Clone + Send + Sync + 'static,
+    A: TelegramApi + TelegramIngressApi + Clone + Send + Sync + 'static,
     C: Clock,
 {
     let ValidatedTelegramIngressConfig::Webhook {
@@ -206,7 +208,7 @@ mod tests {
     use super::{
         api::{
             EditMessageText, SendFile, SendMessage, SendRichMessage, SetWebhook, TelegramApi,
-            TelegramApiError, TelegramMessageRef, WebhookInfo,
+            TelegramApiError, TelegramIngressApi, TelegramMessageRef, WebhookInfo,
         },
         prepare_with_api,
         types::TelegramBot,
@@ -231,7 +233,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl TelegramApi for StartupApi {
+    impl TelegramIngressApi for StartupApi {
         async fn get_me(&self) -> std::result::Result<TelegramBot, TelegramApiError> {
             self.calls.lock().unwrap().push("getMe".into());
             if let Some(address) = self.expected_bound {
@@ -265,7 +267,10 @@ mod tests {
             self.calls.lock().unwrap().push("getWebhookInfo".into());
             Ok(self.info.clone())
         }
+    }
 
+    #[async_trait]
+    impl TelegramApi for StartupApi {
         async fn send_message(
             &self,
             _command: SendMessage,
