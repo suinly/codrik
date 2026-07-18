@@ -158,6 +158,10 @@ telegram:
   mode: polling
 ```
 
+Polling and webhook are mutually exclusive ingress modes. Change
+`telegram.mode` and restart `codrik serve` to switch between them; Codrik does
+not fall back from one mode to the other automatically.
+
 At startup, polling mode calls `getMe`, removes any existing webhook without
 dropping pending updates, verifies that the webhook URL is empty, and starts
 Telegram long polling. Only one running polling instance should use a bot

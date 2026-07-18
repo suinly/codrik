@@ -27,7 +27,8 @@ where
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut offset = None;
-        let mut failures = 0;
+        let mut poll_failures = 0;
+        let mut ingress_failures = 0;
 
         'poll: loop {
             if *shutdown.borrow() {
@@ -50,7 +51,7 @@ where
             };
             let mut updates = match response {
                 Ok(updates) => {
-                    failures = 0;
+                    poll_failures = 0;
                     updates
                 }
                 Err(error) => {
@@ -60,10 +61,12 @@ where
                             return Err(anyhow!(error));
                         }
                     };
-                    if wait_before_retry(&mut shutdown, retry_delay(failures, retry_after)).await {
+                    if wait_before_retry(&mut shutdown, retry_delay(poll_failures, retry_after))
+                        .await
+                    {
                         return Ok(());
                     }
-                    failures = failures.saturating_add(1);
+                    poll_failures = poll_failures.saturating_add(1);
                     continue;
                 }
             };
@@ -72,12 +75,13 @@ where
                 let update_id = update.update_id;
                 if self.ingress.handle(update).await.is_err() {
                     offset = Some(offset.map_or(update_id, |current: i64| current.max(update_id)));
-                    if wait_before_retry(&mut shutdown, retry_delay(failures, None)).await {
+                    if wait_before_retry(&mut shutdown, retry_delay(ingress_failures, None)).await {
                         return Ok(());
                     }
-                    failures = failures.saturating_add(1);
+                    ingress_failures = ingress_failures.saturating_add(1);
                     continue 'poll;
                 }
+                ingress_failures = 0;
                 let next = update_id
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("Telegram update ID overflow"))?;
@@ -132,6 +136,7 @@ mod tests {
     struct ScriptedApi {
         responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
         commands: Arc<Mutex<Vec<GetUpdates>>>,
+        calls_at: Arc<Mutex<Vec<tokio::time::Instant>>>,
         shutdown: watch::Sender<bool>,
     }
 
@@ -164,6 +169,10 @@ mod tests {
             command: GetUpdates,
         ) -> std::result::Result<Vec<TelegramUpdate>, TelegramApiError> {
             self.commands.lock().unwrap().push(command);
+            self.calls_at
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
             let response = self.responses.lock().unwrap().pop_front();
             match response {
                 Some(ScriptedResponse::Updates(batch)) => Ok(batch),
@@ -213,6 +222,7 @@ mod tests {
                 vec![update(3), update(1), update(2)],
             )]))),
             commands: commands.clone(),
+            calls_at: Arc::new(Mutex::new(Vec::new())),
             shutdown: shutdown_tx,
         };
         let handled = Arc::new(Mutex::new(Vec::new()));
@@ -246,6 +256,7 @@ mod tests {
                 ScriptedResponse::Updates(vec![update(2)]),
             ]))),
             commands: commands.clone(),
+            calls_at: Arc::new(Mutex::new(Vec::new())),
             shutdown: shutdown_tx,
         };
         let handled = Arc::new(Mutex::new(Vec::new()));
@@ -281,6 +292,7 @@ mod tests {
                 ScriptedResponse::Pending,
             ]))),
             commands: commands.clone(),
+            calls_at: Arc::new(Mutex::new(Vec::new())),
             shutdown: shutdown_tx.clone(),
         };
         let ingress = Arc::new(RecordingIngress {
@@ -305,6 +317,7 @@ mod tests {
         let api = ScriptedApi {
             responses: Arc::new(Mutex::new(VecDeque::from([ScriptedResponse::Pending]))),
             commands: commands.clone(),
+            calls_at: Arc::new(Mutex::new(Vec::new())),
             shutdown: shutdown_tx.clone(),
         };
         let ingress = Arc::new(RecordingIngress {
@@ -319,6 +332,39 @@ mod tests {
         shutdown_tx.send_replace(true);
 
         tokio::time::timeout(Duration::from_secs(1), task).await???;
+        Ok(())
+    }
+
+    struct FailingIngress;
+
+    #[async_trait]
+    impl TelegramIngress for FailingIngress {
+        async fn handle(&self, _update: TelegramUpdate) -> Result<TelegramIngressOutcome> {
+            bail!("durable ingress failed")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_ingress_failures_use_exponential_backoff() -> Result<()> {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let calls_at = Arc::new(Mutex::new(Vec::new()));
+        let api = ScriptedApi {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                ScriptedResponse::Updates(vec![update(7)]),
+                ScriptedResponse::Updates(vec![update(7)]),
+            ]))),
+            commands: Arc::new(Mutex::new(Vec::new())),
+            calls_at: calls_at.clone(),
+            shutdown: shutdown_tx,
+        };
+
+        TelegramPollingWorker::new(api, Arc::new(FailingIngress))
+            .run(shutdown_rx)
+            .await?;
+
+        let calls_at = calls_at.lock().unwrap();
+        assert_eq!(calls_at[1] - calls_at[0], Duration::from_secs(1));
+        assert_eq!(calls_at[2] - calls_at[1], Duration::from_secs(2));
         Ok(())
     }
 
