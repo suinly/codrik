@@ -10,6 +10,7 @@ use crate::{
     },
     runtime::{
         RequestId,
+        actor_admin::{ActorAdminCommand, ActorAdminResult},
         ipc::client::{ClientEventStream, LocalIpcClient},
         model::{ActorId, Clock, SystemClock},
     },
@@ -20,7 +21,8 @@ pub async fn run() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
         CliCommand::Update => updater::update().await,
         CliCommand::Serve => crate::app::serve(AppConfig::load_default()?).await,
-        CliCommand::Link => link().await,
+        CliCommand::Link(actor) => link(actor).await,
+        CliCommand::Actors(command) => actors(command).await,
         CliCommand::Submit(prompt) => submit(prompt).await,
         CliCommand::Resume(request) => resume(request).await,
         CliCommand::Cancel(request) => cancel(request).await,
@@ -88,9 +90,102 @@ async fn cancel(request: RequestId) -> Result<()> {
     }
 }
 
-async fn link() -> Result<()> {
-    let issued = local_client()?.issue_link_code(RequestId::new()).await?;
+async fn link(actor: Option<ActorId>) -> Result<()> {
+    let issued = local_client()?
+        .issue_link_code_for(RequestId::new(), actor)
+        .await?;
     write_link_instructions(&mut std::io::stdout(), &issued.code)
+}
+
+async fn actors(command: ActorAdminCommand) -> Result<()> {
+    let result = local_client()?
+        .actor_admin(RequestId::new(), command.clone())
+        .await?;
+    render_actor_admin(&mut std::io::stdout(), &command, result)
+}
+
+fn render_actor_admin(
+    output: &mut impl Write,
+    command: &ActorAdminCommand,
+    result: ActorAdminResult,
+) -> Result<()> {
+    match (command, result) {
+        (ActorAdminCommand::List, ActorAdminResult::Actors { mut actors }) => {
+            actors.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+            for actor in actors {
+                let mut tools = actor.tools;
+                tools.sort();
+                let tools = if tools.is_empty() {
+                    "-".into()
+                } else {
+                    tools.join(", ")
+                };
+                writeln!(
+                    output,
+                    "{}\t{}\t{}",
+                    actor.id,
+                    if actor.enabled { "enabled" } else { "disabled" },
+                    tools
+                )?;
+            }
+        }
+        (ActorAdminCommand::Show { .. }, ActorAdminResult::Actor { mut details, .. }) => {
+            details.actor.tools.sort();
+            details.identities.sort_by(|left, right| {
+                (&left.provider, &left.username).cmp(&(&right.provider, &right.username))
+            });
+            writeln!(output, "Actor: {}", details.actor.id)?;
+            writeln!(
+                output,
+                "Status: {}",
+                if details.actor.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )?;
+            writeln!(
+                output,
+                "Active work: {}",
+                if details.has_active_work { "yes" } else { "no" }
+            )?;
+            writeln!(
+                output,
+                "Tools: {}",
+                if details.actor.tools.is_empty() {
+                    "-".into()
+                } else {
+                    details.actor.tools.join(", ")
+                }
+            )?;
+            writeln!(output, "Identities:")?;
+            for identity in details.identities {
+                match identity.username {
+                    Some(username) => writeln!(output, "  {} @{}", identity.provider, username)?,
+                    None => writeln!(output, "  {}", identity.provider)?,
+                }
+            }
+        }
+        (ActorAdminCommand::ToolsList { .. }, ActorAdminResult::Tools { mut tools, .. }) => {
+            tools.sort();
+            for tool in tools {
+                writeln!(output, "{tool}")?;
+            }
+        }
+        (ActorAdminCommand::Delete { .. }, ActorAdminResult::Deleted { actor_id }) => {
+            writeln!(output, "{actor_id} deleted")?;
+        }
+        (_, ActorAdminResult::Actor { details, changed }) => {
+            writeln!(
+                output,
+                "{} {}",
+                details.actor.id,
+                if changed { "updated" } else { "unchanged" }
+            )?;
+        }
+        _ => bail!("daemon returned an unexpected actor administration result"),
+    }
+    Ok(())
 }
 
 fn write_link_instructions(output: &mut impl Write, code: &str) -> Result<()> {
@@ -237,7 +332,8 @@ where
 enum CliCommand {
     Update,
     Serve,
-    Link,
+    Link(Option<ActorId>),
+    Actors(ActorAdminCommand),
     Resume(RequestId),
     Cancel(RequestId),
     Submit(String),
@@ -252,7 +348,12 @@ impl CliCommand {
         let parsed = match command.as_str() {
             "update" => Self::Update,
             "serve" => Self::Serve,
-            "link" => Self::Link,
+            "link" => Self::Link(
+                args.next()
+                    .map(|actor| ActorId::parse_workspace_safe(&actor))
+                    .transpose()?,
+            ),
+            "actors" => Self::Actors(parse_actor_command(&mut args)?),
             "resume" => {
                 let request_id = args.next().context("missing request id")?;
                 Self::Resume(RequestId::parse(&request_id)?)
@@ -281,6 +382,55 @@ impl CliCommand {
     }
 }
 
+fn parse_actor_command(args: &mut impl Iterator<Item = String>) -> Result<ActorAdminCommand> {
+    let command = args.next().context("missing actors command")?;
+    let actor =
+        |raw: Option<String>| ActorId::parse_workspace_safe(&raw.context("missing actor id")?);
+    Ok(match command.as_str() {
+        "list" => ActorAdminCommand::List,
+        "show" => ActorAdminCommand::Show {
+            actor_id: actor(args.next())?,
+        },
+        "create" => ActorAdminCommand::Create {
+            actor_id: actor(args.next())?,
+        },
+        "enable" => ActorAdminCommand::Enable {
+            actor_id: actor(args.next())?,
+        },
+        "disable" => ActorAdminCommand::Disable {
+            actor_id: actor(args.next())?,
+        },
+        "delete" => {
+            let actor_id = actor(args.next())?;
+            let force = match args.next().as_deref() {
+                None => false,
+                Some("--force") => true,
+                Some(option) => bail!("unknown actors delete option: {option}"),
+            };
+            ActorAdminCommand::Delete { actor_id, force }
+        }
+        "tools" => {
+            let action = args.next().context("missing actors tools command")?;
+            match action.as_str() {
+                "list" => ActorAdminCommand::ToolsList {
+                    actor_id: actor(args.next())?,
+                },
+                "grant" | "revoke" => {
+                    let actor_id = actor(args.next())?;
+                    let tool = args.next().context("missing tool name")?;
+                    if action == "grant" {
+                        ActorAdminCommand::ToolsGrant { actor_id, tool }
+                    } else {
+                        ActorAdminCommand::ToolsRevoke { actor_id, tool }
+                    }
+                }
+                _ => bail!("unknown actors tools command: {action}"),
+            }
+        }
+        _ => bail!("unknown actors command: {command}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{future::pending, path::PathBuf, sync::Arc, time::Duration};
@@ -288,7 +438,7 @@ mod tests {
     use anyhow::Result;
     use tokio::{io::AsyncReadExt, net::UnixListener, sync::Notify};
 
-    use super::{CliCommand, drive_operation, write_link_instructions};
+    use super::{CliCommand, drive_operation, render_actor_admin, write_link_instructions};
     use crate::{
         interfaces::{
             local_renderer::LocalRenderer,
@@ -296,12 +446,17 @@ mod tests {
         },
         runtime::{
             BundleId, BundleState, DeliveryId, RequestId,
+            actor_admin::{ActorAdminCommand, ActorAdminResult},
             ipc::{
                 client::LocalIpcClient,
                 protocol::{ClientRequestBody, FrameReader, FrameWriter, encode_bundle},
                 server::MAX_CONNECTIONS,
             },
-            store::{BundleManifest, FinalPayload, ResultBundle},
+            model::ActorId,
+            store::{
+                ActorDetails, BundleManifest, FinalPayload, LinkIdentity, ResultBundle,
+                RuntimeActor,
+            },
         },
     };
 
@@ -311,7 +466,80 @@ mod tests {
         let parse = |args: &[&str]| CliCommand::parse(args.iter().copied().map(String::from));
 
         assert_eq!(parse(&["serve"])?, CliCommand::Serve);
-        assert_eq!(parse(&["link"])?, CliCommand::Link);
+        assert_eq!(parse(&["link"])?, CliCommand::Link(None));
+        assert_eq!(
+            parse(&["link", "alice"])?,
+            CliCommand::Link(Some(ActorId::parse_workspace_safe("alice")?))
+        );
+        assert_eq!(
+            parse(&["actors", "list"])?,
+            CliCommand::Actors(ActorAdminCommand::List)
+        );
+        assert_eq!(
+            parse(&["actors", "show", "alice"])?,
+            CliCommand::Actors(ActorAdminCommand::Show {
+                actor_id: ActorId::parse_workspace_safe("alice")?,
+            })
+        );
+        for (verb, expected) in [
+            (
+                "create",
+                ActorAdminCommand::Create {
+                    actor_id: ActorId::parse_workspace_safe("alice")?,
+                },
+            ),
+            (
+                "enable",
+                ActorAdminCommand::Enable {
+                    actor_id: ActorId::parse_workspace_safe("alice")?,
+                },
+            ),
+            (
+                "disable",
+                ActorAdminCommand::Disable {
+                    actor_id: ActorId::parse_workspace_safe("alice")?,
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse(&["actors", verb, "alice"])?,
+                CliCommand::Actors(expected)
+            );
+        }
+        assert_eq!(
+            parse(&["actors", "delete", "alice"])?,
+            CliCommand::Actors(ActorAdminCommand::Delete {
+                actor_id: ActorId::parse_workspace_safe("alice")?,
+                force: false,
+            })
+        );
+        assert_eq!(
+            parse(&["actors", "tools", "list", "alice"])?,
+            CliCommand::Actors(ActorAdminCommand::ToolsList {
+                actor_id: ActorId::parse_workspace_safe("alice")?,
+            })
+        );
+        assert_eq!(
+            parse(&["actors", "tools", "grant", "alice", "bash"])?,
+            CliCommand::Actors(ActorAdminCommand::ToolsGrant {
+                actor_id: ActorId::parse_workspace_safe("alice")?,
+                tool: "bash".into(),
+            })
+        );
+        assert_eq!(
+            parse(&["actors", "delete", "alice", "--force"])?,
+            CliCommand::Actors(ActorAdminCommand::Delete {
+                actor_id: ActorId::parse_workspace_safe("alice")?,
+                force: true,
+            })
+        );
+        assert_eq!(
+            parse(&["actors", "tools", "revoke", "alice", "bash"])?,
+            CliCommand::Actors(ActorAdminCommand::ToolsRevoke {
+                actor_id: ActorId::parse_workspace_safe("alice")?,
+                tool: "bash".into(),
+            })
+        );
         assert_eq!(parse(&["update"])?, CliCommand::Update);
         assert_eq!(
             parse(&["resume", UUID])?,
@@ -336,11 +564,126 @@ mod tests {
         assert!(parse(&["--stream", "hello"]).is_err());
         assert!(parse(&["update", "extra"]).is_err());
         assert!(parse(&["serve", "extra"]).is_err());
-        assert!(parse(&["link", "extra"]).is_err());
+        assert!(parse(&["link", "alice", "extra"]).is_err());
+        assert!(parse(&["actors", "delete", "alice", "--unknown"]).is_err());
+        assert!(parse(&["actors", "tools", "grant", "alice"]).is_err());
         assert!(parse(&["resume", UUID, "extra"]).is_err());
         assert!(parse(&["cancel", UUID, "extra"]).is_err());
         assert!(parse(&["hello", "extra"]).is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn renders_actor_results_without_identity_subjects() -> Result<()> {
+        let alice = ActorId::parse_workspace_safe("alice")?;
+        let bob = ActorId::parse_workspace_safe("bob")?;
+        let mut output = Vec::new();
+        render_actor_admin(
+            &mut output,
+            &ActorAdminCommand::List,
+            ActorAdminResult::Actors {
+                actors: vec![
+                    RuntimeActor {
+                        id: bob,
+                        enabled: false,
+                        tools: vec!["bash".into(), "*".into()],
+                    },
+                    RuntimeActor {
+                        id: alice.clone(),
+                        enabled: true,
+                        tools: vec![],
+                    },
+                ],
+            },
+        )?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            "alice\tenabled\t-\nbob\tdisabled\t*, bash\n"
+        );
+
+        let mut output = Vec::new();
+        render_actor_admin(
+            &mut output,
+            &ActorAdminCommand::Show {
+                actor_id: alice.clone(),
+            },
+            ActorAdminResult::Actor {
+                details: ActorDetails {
+                    actor: RuntimeActor {
+                        id: alice,
+                        enabled: true,
+                        tools: vec!["datetime".into(), "bash".into()],
+                    },
+                    identities: vec![LinkIdentity {
+                        provider: "telegram".into(),
+                        subject: "secret-subject".into(),
+                        username: Some("daniel".into()),
+                    }],
+                    has_active_work: true,
+                },
+                changed: false,
+            },
+        )?;
+        let rendered = String::from_utf8(output)?;
+        assert_eq!(
+            rendered,
+            "Actor: alice\nStatus: enabled\nActive work: yes\nTools: bash, datetime\nIdentities:\n  telegram @daniel\n"
+        );
+        assert!(!rendered.contains("secret-subject"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_actor_mutation_tools_and_deletion() -> Result<()> {
+        let alice = ActorId::parse_workspace_safe("alice")?;
+        let details = ActorDetails {
+            actor: RuntimeActor {
+                id: alice.clone(),
+                enabled: true,
+                tools: vec![],
+            },
+            identities: vec![],
+            has_active_work: false,
+        };
+        for (changed, expected) in [(true, "alice updated\n"), (false, "alice unchanged\n")] {
+            let mut output = Vec::new();
+            render_actor_admin(
+                &mut output,
+                &ActorAdminCommand::Enable {
+                    actor_id: alice.clone(),
+                },
+                ActorAdminResult::Actor {
+                    details: details.clone(),
+                    changed,
+                },
+            )?;
+            assert_eq!(String::from_utf8(output)?, expected);
+        }
+
+        let mut output = Vec::new();
+        render_actor_admin(
+            &mut output,
+            &ActorAdminCommand::ToolsList {
+                actor_id: alice.clone(),
+            },
+            ActorAdminResult::Tools {
+                actor_id: alice.clone(),
+                tools: vec!["datetime".into(), "*".into(), "bash".into()],
+            },
+        )?;
+        assert_eq!(String::from_utf8(output)?, "*\nbash\ndatetime\n");
+
+        let mut output = Vec::new();
+        render_actor_admin(
+            &mut output,
+            &ActorAdminCommand::Delete {
+                actor_id: alice.clone(),
+                force: true,
+            },
+            ActorAdminResult::Deleted { actor_id: alice },
+        )?;
+        assert_eq!(String::from_utf8(output)?, "alice deleted\n");
         Ok(())
     }
 

@@ -147,6 +147,29 @@ The daemon prints an eight-character code and the exact `/link CODE` message to
 send in the new channel. Codes expire after 10 minutes, can be used once, and a
 new code invalidates the actor's previous unused code.
 
+### Actor administration
+
+Manage actors through the running daemon's private Unix socket:
+
+```sh
+codrik actors list
+codrik actors create alice
+codrik actors show alice
+codrik actors tools grant alice '*'
+codrik actors tools grant alice bash
+codrik actors tools list alice
+codrik link alice
+codrik actors disable alice
+codrik actors delete alice --force
+```
+
+New actors are enabled with no tool grants. Grant `'*'` for standard tools;
+privileged `bash` still requires its own explicit grant. The actor configured
+as `runtime.actor_id` cannot be disabled or deleted. Disabling an actor lets
+its active work finish but prevents new work from starting. A normal delete
+only removes an empty actor; `--force` permanently removes all durable state
+for an already disabled and idle actor, and cannot be undone.
+
 ## Telegram gateway
 
 Telegram support is optional. Set `telegram.mode` explicitly to `polling` when
