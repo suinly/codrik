@@ -497,6 +497,7 @@ fn prepare_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {
         validate_secure_directory(parent)?;
     }
     create_secure_directory(&paths.artifacts)?;
+    create_secure_directory(&paths.reticulum)?;
     Ok(())
 }
 
@@ -505,7 +506,8 @@ fn validate_runtime_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {
     for parent in required_parents(paths)? {
         validate_secure_directory(parent)?;
     }
-    validate_secure_directory(&paths.artifacts)
+    validate_secure_directory(&paths.artifacts)?;
+    validate_secure_directory(&paths.reticulum)
 }
 
 fn required_parents(paths: &RuntimePaths) -> Result<Vec<&Path>> {
@@ -514,6 +516,7 @@ fn required_parents(paths: &RuntimePaths) -> Result<Vec<&Path>> {
         &paths.lock,
         &paths.socket,
         &paths.artifacts,
+        &paths.reticulum,
     ]
     .into_iter()
     .map(|path| {

@@ -19,6 +19,61 @@ pub struct AppConfig {
     pub runtime: Option<RuntimeConfig>,
     #[serde(default)]
     pub telegram: Option<TelegramConfig>,
+    #[serde(default)]
+    pub reticulum: Option<ReticulumConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReticulumConfig {
+    #[serde(deserialize_with = "deserialize_strict_string")]
+    pub rns_address: String,
+    #[serde(
+        default = "default_reticulum_python",
+        deserialize_with = "deserialize_strict_string"
+    )]
+    pub python: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedReticulumConfig {
+    pub host: String,
+    pub port: u16,
+    pub python: PathBuf,
+}
+
+impl ReticulumConfig {
+    pub fn validate(&self) -> Result<ValidatedReticulumConfig> {
+        let (host, port) = self
+            .rns_address
+            .rsplit_once(':')
+            .context("reticulum.rns_address must be host:port")?;
+        if host.trim().is_empty()
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+        {
+            bail!("reticulum.rns_address host is invalid");
+        }
+        let port = port
+            .parse::<u16>()
+            .context("reticulum.rns_address port is invalid")?;
+        if port == 0 {
+            bail!("reticulum.rns_address port must be greater than zero");
+        }
+        if self.python.trim().is_empty() {
+            bail!("reticulum.python must not be blank");
+        }
+        Ok(ValidatedReticulumConfig {
+            host: host.to_owned(),
+            port,
+            python: PathBuf::from(&self.python),
+        })
+    }
+}
+
+fn default_reticulum_python() -> String {
+    "python3".into()
 }
 
 #[derive(Clone, Deserialize)]
@@ -176,6 +231,7 @@ pub struct RuntimePaths {
     pub lock: PathBuf,
     pub artifacts: PathBuf,
     pub client_requests: PathBuf,
+    pub reticulum: PathBuf,
 }
 
 fn deserialize_strict_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -229,6 +285,7 @@ impl RuntimeConfig {
                 "artifacts",
             ),
             client_requests: codrik_home.join("client").join("requests"),
+            reticulum: codrik_home.join("reticulum"),
         })
     }
 }
@@ -335,6 +392,37 @@ mod tests {
     use anyhow::Result;
 
     use super::{AppConfig, ImageDetailConfig, ValidatedTelegramIngressConfig};
+
+    #[test]
+    fn reticulum_config_parses_endpoint_and_defaults_python() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nreticulum:\n  rns_address: mesh.example:4242\n",
+        )?;
+        let reticulum = config.reticulum.unwrap().validate()?;
+        assert_eq!(reticulum.host, "mesh.example");
+        assert_eq!(reticulum.port, 4242);
+        assert_eq!(reticulum.python, PathBuf::from("python3"));
+        Ok(())
+    }
+
+    #[test]
+    fn reticulum_config_rejects_invalid_values_and_unknown_fields() {
+        for section in [
+            "reticulum:\n  rns_address: ''",
+            "reticulum:\n  rns_address: missing-port",
+            "reticulum:\n  rns_address: host:0",
+            "reticulum:\n  rns_address: host:70000",
+            "reticulum:\n  rns_address: host:4242\n  python: ' '",
+            "reticulum:\n  rns_address: host:4242\n  extra: true",
+        ] {
+            let yaml =
+                format!("api_key: k\nbase_url: https://example.test/v1\nmodel: m\n{section}\n");
+            let invalid = yaml_serde::from_str::<AppConfig>(&yaml)
+                .map(|config| config.reticulum.unwrap().validate().is_err())
+                .unwrap_or(true);
+            assert!(invalid, "accepted invalid config:\n{yaml}");
+        }
+    }
 
     #[test]
     fn telegram_mode_defaults_to_webhook() -> Result<()> {
@@ -467,6 +555,7 @@ telegram:
         assert_eq!(paths.socket, PathBuf::from("/tmp/codrik-home/codrik.sock"));
         assert_eq!(paths.lock, PathBuf::from("/tmp/codrik-home/runtime.lock"));
         assert_eq!(paths.artifacts, PathBuf::from("/tmp/codrik-home/artifacts"));
+        assert_eq!(paths.reticulum, PathBuf::from("/tmp/codrik-home/reticulum"));
         assert_eq!(
             paths.client_requests,
             PathBuf::from("/tmp/codrik-home/client/requests")
