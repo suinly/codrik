@@ -17,6 +17,7 @@ pub enum RuntimeComponent {
     TelegramWebhook,
     TelegramDelivery,
     TelegramStreaming,
+    Reticulum,
     Recovery,
     Supervisor,
 }
@@ -89,6 +90,8 @@ pub struct RuntimeLogEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telegram_bot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reticulum_destination: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RuntimeRecoveryCounts>,
 }
 
@@ -113,6 +116,7 @@ impl RuntimeLogEvent {
             socket_path: None,
             schema_version: None,
             telegram_bot_id: None,
+            reticulum_destination: None,
             recovery: None,
         }
     }
@@ -242,6 +246,7 @@ mod tests {
         event.gateway_delivery_id = Some(GatewayDeliveryId::from_string("gateway-delivery-id"));
         event.gateway_update_id = Some(4242);
         event.telegram_bot_id = Some("900".into());
+        event.reticulum_destination = Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
         event.lease_generation = Some(7);
         event.error_class = Some(RuntimeErrorClass::UnknownExternalOutcome);
         event.recovery = Some(RuntimeRecoveryCounts {
@@ -266,6 +271,10 @@ mod tests {
         }
         assert_eq!(json["gateway_update_id"], 4242);
         assert_eq!(json["telegram_bot_id"], "900");
+        assert_eq!(
+            json["reticulum_destination"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
         assert_eq!(json["error_class"], "unknown_external_outcome");
         assert_eq!(json["recovery"]["orphaned_running_attempts"], 3);
         for forbidden in [

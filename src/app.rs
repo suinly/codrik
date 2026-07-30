@@ -1,6 +1,6 @@
 use crate::{
     config::{AppConfig, RuntimePaths, codrik_dir},
-    interfaces::telegram,
+    interfaces::{reticulum, telegram},
     llm::{client::LlmStreamClient, openai::OpenAiClient},
     runtime::{
         actor_admin::ActorAdministration,
@@ -186,6 +186,11 @@ where
         .as_ref()
         .map(crate::config::TelegramConfig::validate)
         .transpose()?;
+    let reticulum_config = config
+        .reticulum
+        .as_ref()
+        .map(crate::config::ReticulumConfig::validate)
+        .transpose()?;
     let runtime = config.required_runtime()?.clone();
     let paths = runtime.resolve_paths(&home)?;
     prepare_paths(&home, &paths)?;
@@ -272,6 +277,20 @@ where
         )),
         None => None,
     };
+    let reticulum = match reticulum_config {
+        Some(config) => Some(Arc::new(
+            reticulum::prepare(
+                config,
+                store.clone(),
+                identity_linking.clone(),
+                signals.clone(),
+                clock.clone(),
+                paths.reticulum.clone(),
+            )
+            .await?,
+        )),
+        None => None,
+    };
     let events: Arc<dyn RuntimeEventPublisher> = match &telegram {
         Some(_) => Arc::new(CompositeRuntimeEventPublisher::new(
             hub.clone(),
@@ -289,6 +308,9 @@ where
     startup.socket_path = Some(paths.socket.clone());
     startup.schema_version = Some(RUNTIME_SCHEMA_VERSION);
     startup.telegram_bot_id = telegram.as_ref().map(|gateway| gateway.bot_id().to_owned());
+    startup.reticulum_destination = reticulum
+        .as_ref()
+        .map(|gateway| gateway.destination().to_owned());
     startup.recovery = Some(RuntimeRecoveryCounts {
         expired_actor_leases: recovery.expired_actor_leases,
         expired_bundle_claims: recovery.expired_bundle_claims,
@@ -343,6 +365,12 @@ where
         service.component("telegram-streaming", {
             let shutdown = shutdown_rx.clone();
             async move { telegram.streaming(shutdown).await }
+        });
+    }
+    if let Some(reticulum) = reticulum {
+        service.component("reticulum", {
+            let shutdown = shutdown_rx.clone();
+            async move { reticulum.run(shutdown).await }
         });
     }
     service.component("dispatcher", {
