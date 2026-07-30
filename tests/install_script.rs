@@ -286,4 +286,15 @@ fn active_documentation_has_no_users_json_instructions() {
     assert!(readme.contains("codrik link alice"));
     assert!(readme.contains("next run"));
     assert!(readme.contains("--force"));
+    for required in [
+        "reticulum:",
+        "rns_address: \"127.0.0.1:4242\"",
+        "python: \"/absolute/path/to/venv/bin/python3\"",
+        "python3 -m venv",
+        "python -m pip install lxmf",
+        "/link CODE",
+        "<CODRIK_HOME>/reticulum/identity",
+    ] {
+        assert!(readme.contains(required), "README missing {required}");
+    }
 }

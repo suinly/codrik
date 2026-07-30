@@ -62,6 +62,10 @@ telegram:
   public_url: "https://agent.example.com/webhooks/telegram"
   listen: "127.0.0.1:8080"
   webhook_secret: "..."
+
+reticulum:
+  rns_address: "127.0.0.1:4242"
+  python: "/absolute/path/to/venv/bin/python3"
 ```
 
 | Field | Required | Default | Description |
@@ -81,6 +85,8 @@ telegram:
 | `telegram.public_url` | In webhook mode | None | Public HTTPS webhook URL without a query or fragment. |
 | `telegram.listen` | In webhook mode | `127.0.0.1:8080` | Local HTTP listener behind the HTTPS reverse proxy. |
 | `telegram.webhook_secret` | In webhook mode | None | Secret-token value used to authenticate Telegram webhook requests. |
+| `reticulum.rns_address` | When Reticulum is enabled | None | Existing Reticulum `TCPServerInterface` endpoint as `host:port`. |
+| `reticulum.python` | No | `python3` | Python executable containing the `RNS` and `LXMF` packages. |
 
 ### Runtime paths
 
@@ -323,6 +329,77 @@ because doing so could duplicate a message.
 - `outcome_unknown`: a transport interruption occurred after a send may have
   reached Telegram. Inspect the chat before taking manual action to avoid a
   duplicate message.
+
+## Reticulum LXMF gateway
+
+Reticulum support is optional. Codrik starts a bundled Python bridge and
+connects it to an existing RNS `TCPServerInterface`. Create a dedicated Python
+environment and install LXMF, which includes its `RNS` dependency:
+
+```sh
+python3 -m venv ~/.codrik/reticulum-venv
+~/.codrik/reticulum-venv/bin/python -m pip install lxmf
+```
+
+Configure the TCP endpoint and that environment's Python executable:
+
+```yaml
+reticulum:
+  rns_address: "127.0.0.1:4242"
+  python: "/absolute/path/to/venv/bin/python3"
+```
+
+`rns_address` targets the configured RNS `TCPServerInterface`; it is not the
+Reticulum local shared-instance port. Codrik does not install Python packages,
+start `rnsd`, or configure a propagation node.
+
+At startup, the structured runtime log includes `reticulum_destination`, the
+32-character public LXMF destination. The private identity remains at
+`<CODRIK_HOME>/reticulum/identity` and is reused across restarts. Do not delete
+that file unless changing the public destination is intentional.
+
+Generate a one-time code with `codrik link`, then send this direct LXMF text
+message from Sideband, MeshChat, or another compatible client:
+
+```text
+/link CODE
+```
+
+The first version accepts direct, signed UTF-8 text only. Attachments, titles,
+fields, groups, rich rendering, and propagation-node retrieval are unsupported.
+Normal messages use the LXMF message hash for durable deduplication. Replies
+are plain text. A definitive failure is recorded as `failed_terminal`; a bridge
+loss after submission is `outcome_unknown` and is not automatically resent.
+
+The Reticulum bridge is part of the fail-fast runtime. If it exits, `codrik
+serve` stops with an error; systemd, launchd, or another service manager owns
+restart policy.
+
+### Reticulum troubleshooting
+
+- `ModuleNotFoundError: RNS` or `ModuleNotFoundError: LXMF`: set
+  `reticulum.python` to the virtual environment where `lxmf` was installed.
+- TCP connection refused or startup readiness timeout: verify `rnsd` is running,
+  port `4242` is reachable, and `rns_address` names its `TCPServerInterface`.
+- No path to a peer: have the peer announce its LXMF destination and verify both
+  nodes share reachable Reticulum interfaces.
+- State permission failure: `<CODRIK_HOME>/reticulum` must be a real,
+  owner-controlled mode-`0700` directory; identity and generated config files
+  must be regular mode-`0600` files.
+- `failed_terminal`: correct the destination or message; Codrik will not retry.
+- `outcome_unknown`: inspect the remote client before manual retry to avoid a
+  duplicate.
+- Bridge exit: inspect the preceding Reticulum bridge error, then let the
+  external service manager restart `codrik serve` after correcting it.
+
+### Manual Reticulum check
+
+1. Start `rnsd` with `TCPServerInterface` on port `4242`.
+2. Start `codrik serve`; record `reticulum_destination`.
+3. Run `codrik link`; send `/link CODE` from an LXMF client.
+4. Send `hello over LXMF`; verify exactly one agent reply.
+5. Restart Codrik; verify `reticulum_destination` is unchanged.
+6. Replay the same LXMF message; verify no duplicate agent work occurs.
 
 Resume a disconnected request:
 
