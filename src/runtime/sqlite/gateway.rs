@@ -134,14 +134,18 @@ impl GatewayDeliveryStore for SqliteRuntimeStore {
                                WHERE earlier.gateway = candidate.gateway
                                  AND earlier.address = candidate.address
                                  AND earlier.state IN ('pending','failed_retryable')
-                                 AND (
-                                     earlier.created_at < candidate.created_at
-                                     OR (
-                                         earlier.created_at = candidate.created_at
-                                         AND earlier.id < candidate.id
-                                     )
-                                 )
-                                 AND NOT EXISTS (
+                                  AND (
+                                      earlier.created_at < candidate.created_at
+                                      OR (
+                                          earlier.created_at = candidate.created_at
+                                          AND earlier.id < candidate.id
+                                      )
+                                  )
+                                  AND NOT (
+                                      earlier.source_outbox_id = candidate.source_outbox_id
+                                      AND earlier.ordinal > candidate.ordinal
+                                  )
+                                  AND NOT EXISTS (
                                      SELECT 1 FROM gateway_deliveries blocked_by
                                      WHERE earlier.source_outbox_id IS NOT NULL
                                        AND blocked_by.source_outbox_id = earlier.source_outbox_id
