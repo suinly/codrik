@@ -27,7 +27,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_STDERR_LINE_BYTES: usize = 4096;
 
 pub struct BridgeProcess {
-    child: Child,
+    child: Option<Child>,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     start: BridgeCommand,
@@ -65,7 +65,7 @@ impl BridgeProcess {
         let (stderr_tx, stderr_rx) = mpsc::channel(32);
         tokio::spawn(drain_stderr(stderr, stderr_tx));
         Ok(Self {
-            child,
+            child: Some(child),
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
             start: BridgeCommand::Start {
@@ -109,32 +109,78 @@ impl BridgeProcess {
 
     pub async fn shutdown(mut self) -> Result<()> {
         let _ = self.send(&BridgeCommand::Shutdown).await;
-        drop(self.stdin);
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
+        let mut child = self
+            .child
+            .take()
+            .context("Reticulum bridge child missing")?;
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
             Ok(status) => {
                 status?;
             }
             Err(_) => {
-                self.child.kill().await?;
-                self.child.wait().await?;
+                child.kill().await?;
+                child.wait().await?;
             }
         }
         Ok(())
     }
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr, sender: mpsc::Sender<String>) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let sanitized: String = line
-            .chars()
-            .filter(|character| *character == '\t' || !character.is_control())
-            .take(MAX_STDERR_LINE_BYTES)
-            .collect();
-        if sender.try_send(sanitized).is_err() && sender.is_closed() {
+impl Drop for BridgeProcess {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
             return;
+        };
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
         }
     }
+}
+
+async fn drain_stderr(stderr: tokio::process::ChildStderr, sender: mpsc::Sender<String>) {
+    let mut reader = BufReader::new(stderr);
+    let mut line = Vec::with_capacity(MAX_STDERR_LINE_BYTES);
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(_) => return,
+        };
+        if available.is_empty() {
+            if !line.is_empty() {
+                send_stderr_line(&sender, &line);
+            }
+            return;
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let remaining = MAX_STDERR_LINE_BYTES.saturating_sub(line.len());
+        line.extend_from_slice(&available[..consumed.min(remaining)]);
+        let complete = available[..consumed].last() == Some(&b'\n');
+        reader.consume(consumed);
+        if complete {
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            send_stderr_line(&sender, &line);
+            line.clear();
+        }
+    }
+}
+
+fn send_stderr_line(sender: &mpsc::Sender<String>, bytes: &[u8]) {
+    let sanitized: String = String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| *character == '\t' || !character.is_control())
+        .collect();
+    if !sanitized.is_empty() {
+        eprintln!("reticulum bridge: {sanitized}");
+    }
+    let _ = sender.try_send(sanitized);
 }
 
 async fn read_protocol_line(reader: &mut BufReader<ChildStdout>) -> Result<Vec<u8>> {

@@ -23,6 +23,7 @@ pub struct PreparedReticulumGateway<S, C> {
     clock: C,
     gateway: String,
     owner: String,
+    active_delivery: tokio::sync::Mutex<Option<ClaimedGatewayDelivery>>,
 }
 
 impl<S, C> PreparedReticulumGateway<S, C>
@@ -35,6 +36,16 @@ where
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        if let Some(delivery) = self.active_delivery.lock().await.take() {
+            Self::transition_delivery(
+                &self.store,
+                &delivery,
+                protocol::BridgeDeliveryOutcome::OutcomeUnknown,
+                None,
+                self.clock.now(),
+            )
+            .await?;
+        }
         if let Some(bridge) = self.bridge.lock().await.take() {
             bridge.shutdown().await?;
         }
@@ -61,6 +72,22 @@ where
             .await?;
             return Ok(1);
         };
+        let command = protocol::BridgeCommand::Send {
+            delivery_id: delivery.claim.id.as_str().to_owned(),
+            destination: delivery.route.address.clone(),
+            text: text.clone(),
+        };
+        if protocol::encode_command(&command).is_err() {
+            Self::transition_delivery(
+                &self.store,
+                &delivery,
+                protocol::BridgeDeliveryOutcome::Terminal,
+                None,
+                self.clock.now(),
+            )
+            .await?;
+            return Ok(1);
+        }
         if !self
             .store
             .set_gateway_delivery_retry_safe(&delivery.claim, false, now)
@@ -68,13 +95,9 @@ where
         {
             bail!("Reticulum delivery claim was lost before bridge submission");
         }
+        *self.active_delivery.lock().await = Some(delivery.clone());
         let mut guard = self.bridge.lock().await;
         let bridge = guard.as_mut().context("Reticulum bridge is stopped")?;
-        let command = protocol::BridgeCommand::Send {
-            delivery_id: delivery.claim.id.as_str().to_owned(),
-            destination: delivery.route.address.clone(),
-            text: text.clone(),
-        };
         if let Err(error) = bridge.send(&command).await {
             Self::transition_delivery(
                 &self.store,
@@ -84,6 +107,7 @@ where
                 self.clock.now(),
             )
             .await?;
+            self.active_delivery.lock().await.take();
             return Err(error.context("failed to submit Reticulum delivery"));
         }
         let mut renewal = tokio::time::interval(Duration::from_secs(10));
@@ -119,10 +143,23 @@ where
                         self.clock.now(),
                     )
                     .await?;
+                    self.active_delivery.lock().await.take();
                     return Ok(1);
                 }
-                Ok(protocol::BridgeEvent::Inbound { .. }) => {
-                    bail!("Reticulum inbound event arrived during delivery-only poll")
+                Ok(protocol::BridgeEvent::Inbound {
+                    message_hash,
+                    source,
+                    timestamp,
+                    text,
+                }) => {
+                    self.ingress
+                        .handle(ingress::InboundMessage {
+                            message_hash,
+                            source,
+                            timestamp,
+                            text,
+                        })
+                        .await?;
                 }
                 Ok(protocol::BridgeEvent::Fatal { error }) => {
                     Self::transition_delivery(
@@ -133,6 +170,7 @@ where
                         self.clock.now(),
                     )
                     .await?;
+                    self.active_delivery.lock().await.take();
                     bail!("Reticulum bridge failed: {error}");
                 }
                 Ok(_) => bail!("Reticulum bridge emitted an unexpected event"),
@@ -145,16 +183,23 @@ where
                         self.clock.now(),
                     )
                     .await?;
+                    self.active_delivery.lock().await.take();
                     return Err(error);
                 }
             }
         }
     }
 
-    pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(&self, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+        let result = self.run_inner(shutdown).await;
+        let cleanup = self.shutdown().await;
+        result.and(cleanup)
+    }
+
+    async fn run_inner(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         loop {
             if *shutdown.borrow() {
-                return self.shutdown().await;
+                return Ok(());
             }
             let delivery = self.run_delivery_once();
             tokio::pin!(delivery);
@@ -166,7 +211,7 @@ where
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        return self.shutdown().await;
+                        return Ok(());
                     }
                     continue;
                 }
@@ -177,7 +222,7 @@ where
                 changed = shutdown.changed() => {
                     drop(guard);
                     if changed.is_err() || *shutdown.borrow() {
-                        return self.shutdown().await;
+                        return Ok(());
                     }
                 }
                 event = tokio::time::timeout(Duration::from_millis(500), bridge.next_event()) => {
@@ -277,7 +322,13 @@ where
 {
     crate::runtime::ipc::security::validate_secure_directory(&state_dir)?;
     let mut bridge = bridge::BridgeProcess::spawn(&config, &state_dir).await?;
-    let destination = bridge.start().await?;
+    let destination = match bridge.start().await {
+        Ok(destination) => destination,
+        Err(error) => {
+            let _ = bridge.shutdown().await;
+            return Err(error);
+        }
+    };
     let ingress = ingress::ReticulumIngressService::new(
         store.clone(),
         linking,
@@ -293,6 +344,7 @@ where
         ingress,
         clock,
         owner: format!("reticulum-delivery-{}", std::process::id()),
+        active_delivery: tokio::sync::Mutex::new(None),
     })
 }
 
@@ -424,6 +476,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_event_during_delivery_is_dispatched_before_completion() -> Result<()> {
+        let root = std::env::temp_dir().canonicalize()?.join(format!(
+            "codrik-reticulum-concurrent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::runtime::ipc::security::create_secure_directory(&root)?;
+        let python = root.join("fake-python");
+        fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nread start\nprintf '%s\\n' '{{\"type\":\"ready\",\"destination\":\"{DESTINATION}\"}}'\nread send\nid=$(printf '%s' \"$send\" | sed -n 's/.*\"delivery_id\":\"\\([^\"]*\\)\".*/\\1/p')\nprintf '%s\\n' '{{\"type\":\"inbound\",\"message_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"source\":\"cccccccccccccccccccccccccccccccc\",\"timestamp\":2.0,\"text\":\"hello\"}}'\nprintf '{{\"type\":\"delivery\",\"delivery_id\":\"%s\",\"outcome\":\"delivered\",\"retry_after_ms\":null}}\\n' \"$id\"\nread shutdown\n"
+            ),
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700))?;
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = crate::runtime::model::ActorId::from_string("owner");
+        crate::runtime::store::ActorStore::ensure_initial_actor(&store, &actor, &[], Timestamp(1))
+            .await?;
+        let linking: Arc<dyn crate::runtime::identity_link::IdentityLinkManager> =
+            Arc::new(crate::runtime::identity_link::IdentityLinkService::new(
+                store.clone(),
+                ManualClock::new(1),
+                crate::runtime::identity_link::SystemLinkCodeGenerator,
+            ));
+        let code = linking.issue_code(&actor).await?.code;
+        let gateway = super::prepare(
+            crate::config::ValidatedReticulumConfig {
+                host: "mesh.example".into(),
+                port: 4242,
+                python,
+            },
+            store.clone(),
+            linking,
+            crate::runtime::signals::ActorSignals::default(),
+            ManualClock::new(2),
+            root.clone(),
+        )
+        .await?;
+        gateway
+            .ingress
+            .handle(crate::interfaces::reticulum::ingress::InboundMessage {
+                message_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+                source: "cccccccccccccccccccccccccccccccc".into(),
+                timestamp: 1.0,
+                text: format!("/link {code}"),
+            })
+            .await?;
+        let gateway_name = format!("reticulum:{DESTINATION}");
+        store
+            .enqueue_gateway_delivery(
+                NewGatewayDelivery::new(
+                    "concurrent-delivery",
+                    None,
+                    0,
+                    DeliveryRoute::new(
+                        &gateway_name,
+                        "cccccccccccccccccccccccccccccccc",
+                        None,
+                        4096,
+                        1,
+                    )?,
+                    OutboxPayload::Text {
+                        text: "reply".into(),
+                    },
+                )?,
+                Timestamp(1),
+            )
+            .await?;
+        assert_eq!(gateway.run_delivery_once().await?, 1);
+        gateway.shutdown().await?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn delivery_outcomes_map_to_existing_durable_states() -> Result<()> {
         for (outcome, expected) in [
             (BridgeDeliveryOutcome::Delivered, None),
@@ -534,6 +662,51 @@ mod tests {
                 .await?
                 .len(),
             1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_utf8_delivery_fails_terminal_before_bridge_submission() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let gateway = format!("reticulum:{DESTINATION}");
+        store
+            .enqueue_gateway_delivery(
+                NewGatewayDelivery::new(
+                    "oversized-unicode",
+                    None,
+                    0,
+                    DeliveryRoute::new(
+                        &gateway,
+                        "cccccccccccccccccccccccccccccccc",
+                        None,
+                        262_144,
+                        1,
+                    )?,
+                    OutboxPayload::Text {
+                        text: "🦀".repeat(70_000),
+                    },
+                )?,
+                Timestamp(1),
+            )
+            .await?;
+        let delivery = store
+            .claim_gateway_deliveries(&gateway, "test", Timestamp(2), Timestamp(32), 1)
+            .await?
+            .remove(0);
+        let command = crate::interfaces::reticulum::protocol::BridgeCommand::Send {
+            delivery_id: delivery.claim.id.as_str().into(),
+            destination: delivery.route.address.clone(),
+            text: match &delivery.payload {
+                OutboxPayload::Text { text } => text.clone(),
+                _ => unreachable!(),
+            },
+        };
+        assert!(crate::interfaces::reticulum::protocol::encode_command(&command).is_err());
+        assert!(
+            store
+                .set_gateway_delivery_retry_safe(&delivery.claim, true, Timestamp(3))
+                .await?
         );
         Ok(())
     }

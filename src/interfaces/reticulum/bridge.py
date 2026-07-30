@@ -49,6 +49,9 @@ def self_check():
         "send",
         "shutdown",
     ]
+    assert validate_send({"delivery_id": "one", "destination": "b" * 32, "text": "hi"}) is None
+    assert validate_send({"delivery_id": "one", "destination": "bad", "text": "hi"}) == "terminal"
+    assert validate_send({"delivery_id": "one", "destination": "b" * 32, "text": " "}) == "terminal"
     print("reticulum bridge self-check passed")
 
 
@@ -59,6 +62,8 @@ def ensure_directory(path):
             raise ValueError(f"unsafe directory: {path}")
         if stat.S_IMODE(metadata.st_mode) != 0o700:
             raise ValueError(f"directory must have mode 0700: {path}")
+        if metadata.st_uid != os.geteuid():
+            raise ValueError(f"directory has unsafe owner: {path}")
     else:
         os.makedirs(path, mode=0o700)
 
@@ -69,6 +74,8 @@ def validate_regular_file(path):
         raise ValueError(f"unsafe file: {path}")
     if stat.S_IMODE(metadata.st_mode) != 0o600:
         raise ValueError(f"file must have mode 0600: {path}")
+    if metadata.st_uid != os.geteuid():
+        raise ValueError(f"file has unsafe owner: {path}")
 
 
 def write_private(path, data):
@@ -92,6 +99,16 @@ def validate_hash(value):
         and len(value) == HASH_CHARS
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def validate_send(command):
+    destination = command.get("destination")
+    text = command.get("text")
+    if not validate_hash(destination) or not isinstance(text, str):
+        return "terminal"
+    if not text.strip() or len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+        return "terminal"
+    return None
 
 
 def run():
@@ -215,13 +232,11 @@ def run():
         text = command.get("text")
         if not isinstance(delivery_id, str) or not delivery_id or delivery_id in active:
             raise ValueError("invalid or duplicate delivery ID")
-        if not validate_hash(destination_hex) or not isinstance(text, str):
-            delivery(delivery_id, "terminal")
-            return
-        if not text.strip() or len(text.encode("utf-8")) > MAX_TEXT_BYTES:
-            delivery(delivery_id, "terminal")
-            return
+        invalid = validate_send(command)
         active.add(delivery_id)
+        if invalid is not None:
+            delivery(delivery_id, invalid)
+            return
         destination_hash = bytes.fromhex(destination_hex)
         if not RNS.Transport.has_path(destination_hash):
             RNS.Transport.request_path(destination_hash)
