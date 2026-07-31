@@ -284,6 +284,7 @@ where
                 store.clone(),
                 identity_linking.clone(),
                 signals.clone(),
+                gateway_activity.clone(),
                 clock.clone(),
                 paths.reticulum.clone(),
             )

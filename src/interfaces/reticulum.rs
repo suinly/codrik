@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod bridge;
 pub mod ingress;
 pub mod protocol;
@@ -8,12 +9,19 @@ use anyhow::{Context, Result, bail};
 
 use crate::runtime::{
     gateway::{ClaimedGatewayDelivery, GatewayDeliveryState},
+    gateway_activity::GatewayActivityHub,
     identity_link::IdentityLinkManager,
     model::{Clock, Timestamp},
     signals::ActorSignals,
     sqlite::SqliteRuntimeStore,
     store::{ActorStore, GatewayDeliveryStore, IngressStore, OutboxPayload},
 };
+
+const THINKING_INTENT_PREFIX: &str = "reticulum-thinking:";
+
+fn is_thinking_delivery(delivery: &ClaimedGatewayDelivery) -> bool {
+    delivery.intent_key.starts_with(THINKING_INTENT_PREFIX)
+}
 
 pub struct PreparedReticulumGateway<S, C> {
     destination: String,
@@ -23,6 +31,7 @@ pub struct PreparedReticulumGateway<S, C> {
     clock: C,
     gateway: String,
     owner: String,
+    activity_hub: GatewayActivityHub,
     active_delivery: tokio::sync::Mutex<Option<ClaimedGatewayDelivery>>,
 }
 
@@ -33,6 +42,16 @@ where
 {
     pub fn destination(&self) -> &str {
         &self.destination
+    }
+
+    pub async fn activity(&self, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+        activity::ReticulumActivityWorker::new(
+            self.store.clone(),
+            self.clock.clone(),
+            self.gateway.clone(),
+        )
+        .run(self.activity_hub.subscribe(), shutdown)
+        .await
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -262,22 +281,34 @@ where
                     .await?
             }
             protocol::BridgeDeliveryOutcome::Retryable => {
-                let delay = retry_after_ms.unwrap_or_else(|| {
-                    let exponent = delivery.attempt_count.saturating_sub(1).min(5);
-                    1000_u64
-                        .checked_shl(exponent as u32)
-                        .unwrap_or(30_000)
-                        .min(30_000)
-                });
-                store
-                    .retry_gateway_delivery(
-                        &delivery.claim,
-                        now.plus_millis(delay.min(i64::MAX as u64) as i64),
-                        "reticulum_retryable",
-                        "LXMF delivery failed retryably",
-                        now,
-                    )
-                    .await?
+                if is_thinking_delivery(delivery) {
+                    store
+                        .fail_gateway_delivery(
+                            &delivery.claim,
+                            GatewayDeliveryState::FailedTerminal,
+                            "reticulum_thinking_failed",
+                            "Reticulum thinking status delivery failed",
+                            now,
+                        )
+                        .await?
+                } else {
+                    let delay = retry_after_ms.unwrap_or_else(|| {
+                        let exponent = delivery.attempt_count.saturating_sub(1).min(5);
+                        1000_u64
+                            .checked_shl(exponent as u32)
+                            .unwrap_or(30_000)
+                            .min(30_000)
+                    });
+                    store
+                        .retry_gateway_delivery(
+                            &delivery.claim,
+                            now.plus_millis(delay.min(i64::MAX as u64) as i64),
+                            "reticulum_retryable",
+                            "LXMF delivery failed retryably",
+                            now,
+                        )
+                        .await?
+                }
             }
             protocol::BridgeDeliveryOutcome::Terminal => {
                 store
@@ -314,6 +345,7 @@ pub async fn prepare<C>(
     store: SqliteRuntimeStore,
     linking: Arc<dyn IdentityLinkManager>,
     signals: ActorSignals,
+    activity_hub: GatewayActivityHub,
     clock: C,
     state_dir: PathBuf,
 ) -> Result<PreparedReticulumGateway<SqliteRuntimeStore, C>>
@@ -344,6 +376,7 @@ where
         ingress,
         clock,
         owner: format!("reticulum-delivery-{}", std::process::id()),
+        activity_hub,
         active_delivery: tokio::sync::Mutex::new(None),
     })
 }
@@ -397,6 +430,7 @@ mod tests {
             store,
             linking,
             crate::runtime::signals::ActorSignals::default(),
+            crate::runtime::gateway_activity::GatewayActivityHub::default(),
             ManualClock::new(1),
             root.clone(),
         )
@@ -438,6 +472,7 @@ mod tests {
             store.clone(),
             linking,
             crate::runtime::signals::ActorSignals::default(),
+            crate::runtime::gateway_activity::GatewayActivityHub::default(),
             ManualClock::new(2),
             root.clone(),
         )
@@ -510,6 +545,7 @@ mod tests {
             store.clone(),
             linking,
             crate::runtime::signals::ActorSignals::default(),
+            crate::runtime::gateway_activity::GatewayActivityHub::default(),
             ManualClock::new(2),
             root.clone(),
         )
@@ -662,6 +698,52 @@ mod tests {
                 .await?
                 .len(),
             1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retryable_thinking_delivery_is_terminal() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let gateway = format!("reticulum:{DESTINATION}");
+        store
+            .enqueue_gateway_delivery(
+                NewGatewayDelivery::new(
+                    format!("reticulum-thinking:{gateway}:work"),
+                    None,
+                    0,
+                    DeliveryRoute::new(
+                        &gateway,
+                        "cccccccccccccccccccccccccccccccc",
+                        None,
+                        4096,
+                        1,
+                    )?,
+                    OutboxPayload::Text {
+                        text: "Думаю...".into(),
+                    },
+                )?,
+                Timestamp(1),
+            )
+            .await?;
+        let delivery = store
+            .claim_gateway_deliveries(&gateway, "test", Timestamp(2), Timestamp(32), 1)
+            .await?
+            .remove(0);
+        PreparedReticulumGateway::<SqliteRuntimeStore, ManualClock>::transition_delivery(
+            &store,
+            &delivery,
+            BridgeDeliveryOutcome::Retryable,
+            Some(5_000),
+            Timestamp(3),
+        )
+        .await?;
+
+        assert!(
+            store
+                .claim_gateway_deliveries(&gateway, "test", Timestamp(5_003), Timestamp(5_033), 1)
+                .await?
+                .is_empty()
         );
         Ok(())
     }
