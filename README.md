@@ -371,6 +371,11 @@ Normal messages use the LXMF message hash for durable deduplication. Replies
 are plain text. A definitive failure is recorded as `failed_terminal`; a bridge
 loss after submission is `outcome_unknown` and is not automatically resent.
 
+For agent requests that take longer than five seconds, Codrik sends one
+`Думаю...` status before the final reply. Reticulum replies are intentionally
+concise and limited to 500 Unicode characters to reduce airtime. CLI and
+Telegram replies are unaffected.
+
 The Reticulum bridge is part of the fail-fast runtime. If it exits, `codrik
 serve` stops with an error; systemd, launchd, or another service manager owns
 restart policy.

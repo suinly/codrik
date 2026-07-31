@@ -43,6 +43,10 @@ const ARTIFACT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 const IDENTITY_LINK_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 const IDENTITY_LINK_GC_BATCH: usize = 256;
 
+fn publishes_gateway_activity(telegram: bool, reticulum: bool) -> bool {
+    telegram || reticulum
+}
+
 pub async fn serve(config: AppConfig) -> Result<()> {
     let home = codrik_dir()?;
     let llm = OpenAiClient::new(
@@ -292,13 +296,15 @@ where
         )),
         None => None,
     };
-    let events: Arc<dyn RuntimeEventPublisher> = match &telegram {
-        Some(_) => Arc::new(CompositeRuntimeEventPublisher::new(
-            hub.clone(),
-            gateway_activity,
-        )),
-        None => hub.clone(),
-    };
+    let events: Arc<dyn RuntimeEventPublisher> =
+        if publishes_gateway_activity(telegram.is_some(), reticulum.is_some()) {
+            Arc::new(CompositeRuntimeEventPublisher::new(
+                hub.clone(),
+                gateway_activity.clone(),
+            ))
+        } else {
+            hub.clone()
+        };
     let llm = Arc::new(llm);
     let dispatchers = ActorDispatcherManager::new(store.clone(), directory);
 
@@ -369,6 +375,11 @@ where
         });
     }
     if let Some(reticulum) = reticulum {
+        service.component("reticulum-activity", {
+            let reticulum = reticulum.clone();
+            let shutdown = shutdown_rx.clone();
+            async move { reticulum.activity(shutdown).await }
+        });
         service.component("reticulum", {
             let shutdown = shutdown_rx.clone();
             async move { reticulum.run(shutdown).await }
@@ -873,6 +884,13 @@ mod tests {
             .await?;
         assert_eq!(created_at, 12_345);
         Ok(())
+    }
+
+    #[test]
+    fn reticulum_activity_publisher_is_enabled_without_telegram() {
+        assert!(publishes_gateway_activity(false, true));
+        assert!(publishes_gateway_activity(true, false));
+        assert!(!publishes_gateway_activity(false, false));
     }
 
     #[tokio::test]
