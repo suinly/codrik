@@ -31,7 +31,9 @@ pub struct PreparedReticulumGateway<S, C> {
     clock: C,
     gateway: String,
     owner: String,
-    activity_hub: GatewayActivityHub,
+    activity: tokio::sync::Mutex<
+        Option<tokio::sync::broadcast::Receiver<crate::runtime::gateway_activity::GatewayActivity>>,
+    >,
     active_delivery: tokio::sync::Mutex<Option<ClaimedGatewayDelivery>>,
 }
 
@@ -45,12 +47,18 @@ where
     }
 
     pub async fn activity(&self, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+        let receiver = self
+            .activity
+            .lock()
+            .await
+            .take()
+            .context("Reticulum activity worker already started")?;
         activity::ReticulumActivityWorker::new(
             self.store.clone(),
             self.clock.clone(),
             self.gateway.clone(),
         )
-        .run(self.activity_hub.subscribe(), shutdown)
+        .run(receiver, shutdown)
         .await
     }
 
@@ -376,7 +384,7 @@ where
         ingress,
         clock,
         owner: format!("reticulum-delivery-{}", std::process::id()),
-        activity_hub,
+        activity: tokio::sync::Mutex::new(Some(activity_hub.subscribe())),
         active_delivery: tokio::sync::Mutex::new(None),
     })
 }

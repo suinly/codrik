@@ -107,6 +107,15 @@ where
                 | AgentActivityEvent::Failed
                 | AgentActivityEvent::Cancelled,
             ) => {
+                let due = self
+                    .states
+                    .lock()
+                    .expect("Reticulum activity states poisoned")
+                    .get(&activity.work_item_id)
+                    .is_some_and(|state| Instant::now() >= state.due_at);
+                if due {
+                    self.maintain().await;
+                }
                 self.states
                     .lock()
                     .expect("Reticulum activity states poisoned")
@@ -282,6 +291,55 @@ mod tests {
             worker.maintain().await;
             assert!(claim_reticulum(&store).await?.is_empty());
         }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_event_after_deadline_preserves_status() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let gateway = format!("reticulum:{DESTINATION}");
+        let worker =
+            ReticulumActivityWorker::new(store.clone(), ManualClock::new(1_000), gateway.clone());
+        let route = DeliveryRoute::new(gateway, SOURCE, None, 256 * 1024, 1)?;
+        let work = WorkItemId::new();
+        worker
+            .handle(activity(
+                work.clone(),
+                route.clone(),
+                AgentActivityEvent::ModelStepStarted,
+            ))
+            .await;
+        tokio::time::advance(Duration::from_millis(5_001)).await;
+        worker
+            .handle(activity(work, route, AgentActivityEvent::Completed))
+            .await;
+
+        assert_eq!(claim_reticulum(&store).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscribed_receiver_retains_event_before_worker_starts() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let gateway = format!("reticulum:{DESTINATION}");
+        let worker =
+            ReticulumActivityWorker::new(store.clone(), ManualClock::new(1_000), gateway.clone());
+        let hub = crate::runtime::gateway_activity::GatewayActivityHub::default();
+        let receiver = hub.subscribe();
+        hub.publish(
+            WorkItemId::new(),
+            DeliveryRoute::new(gateway, SOURCE, None, 256 * 1024, 1)?,
+            GatewayActivityEvent::Activity(AgentActivityEvent::ModelStepStarted),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(async move { worker.run(receiver, shutdown_rx).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true)?;
+        run.await??;
+
+        assert_eq!(claim_reticulum(&store).await?.len(), 1);
         Ok(())
     }
 
