@@ -30,6 +30,33 @@ use crate::{
     },
 };
 
+const RETICULUM_GATEWAY_PREFIX: &str = "reticulum:";
+const RETICULUM_RESPONSE_CHARS: usize = 500;
+const RETICULUM_RESPONSE_PREFIX_CHARS: usize = RETICULUM_RESPONSE_CHARS - 3;
+const RETICULUM_RESPONSE_INSTRUCTIONS: &str = "Reticulum airtime is scarce. Answer directly and completely in at most 500 Unicode characters. Omit preambles, repetition, and optional detail.";
+
+fn is_reticulum_route(route: Option<&crate::runtime::gateway::DeliveryRoute>) -> bool {
+    route.is_some_and(|route| route.gateway.starts_with(RETICULUM_GATEWAY_PREFIX))
+}
+
+fn bounded_reticulum_response(
+    route: Option<&crate::runtime::gateway::DeliveryRoute>,
+    text: String,
+) -> String {
+    if !is_reticulum_route(route) || text.chars().count() <= RETICULUM_RESPONSE_CHARS {
+        return text;
+    }
+    let prefix = text
+        .chars()
+        .take(RETICULUM_RESPONSE_PREFIX_CHARS)
+        .collect::<Vec<_>>();
+    let end = prefix
+        .iter()
+        .rposition(|character| matches!(character, '.' | '!' | '?' | '\n'))
+        .map_or(prefix.len(), |index| index + 1);
+    format!("{}...", prefix[..end].iter().collect::<String>().trim_end())
+}
+
 #[derive(Clone, Debug)]
 pub struct RunnerLimits {
     pub max_events: usize,
@@ -329,6 +356,9 @@ where
             if let Some(instructions) = &self.system_instructions {
                 request_messages.insert(0, Message::system(instructions.clone()));
             }
+            if is_reticulum_route(run.delivery_route.as_ref()) {
+                request_messages.insert(0, Message::system(RETICULUM_RESPONSE_INSTRUCTIONS));
+            }
             let request = LlmRequest {
                 messages: request_messages,
                 tools: self.tools.definitions(),
@@ -388,6 +418,8 @@ where
                 }
             };
             if response.tool_calls.is_empty() {
+                let content =
+                    bounded_reticulum_response(run.delivery_route.as_ref(), response.content);
                 let intent_key = format!("run:{}:final", run.run_id);
                 match self
                     .store
@@ -395,15 +427,13 @@ where
                         FinalizeRun {
                             run: run.clone(),
                             incorporated_event_ids: run.source_event_ids.clone(),
-                            final_messages: vec![Message::assistant(response.content.clone())],
+                            final_messages: vec![Message::assistant(content.clone())],
                             outbox: vec![NewOutboxIntent {
                                 id: OutboxId::new(),
                                 intent_key,
                                 intent_class: "interactive_reply".into(),
                                 audience: run.audience.clone(),
-                                payload: OutboxPayload::Text {
-                                    text: response.content,
-                                },
+                                payload: OutboxPayload::Text { text: content },
                             }],
                         },
                         self.clock.now(),
@@ -776,10 +806,11 @@ mod tests {
         runtime::{
             artifacts::{ArtifactManager, TestPause},
             dispatcher::ActorDispatcher,
+            gateway::DeliveryRoute,
             ipc::protocol::{ActivityEvent, ServerEventBody},
             model::{ActorId, AttemptId, Audience, EventKind, ManualClock, RequestId, Timestamp},
             observability::{RuntimeLogEvent, RuntimeLogger},
-            runner::{ActorRunner, RunOnceOutcome, RunnerLimits},
+            runner::{ActorRunner, RunOnceOutcome, RunnerLimits, bounded_reticulum_response},
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
             store::{
@@ -1419,6 +1450,72 @@ mod tests {
             assert_eq!(request.messages[0].text(), "system plus skills");
             assert_eq!(request.tools.len(), 1);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reticulum_response_limit_preserves_short_and_bounds_unicode() -> Result<()> {
+        let route = DeliveryRoute::new(
+            "reticulum:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "c".repeat(32),
+            None,
+            256 * 1024,
+            1,
+        )?;
+        assert_eq!(
+            bounded_reticulum_response(Some(&route), "Коротко.".into()),
+            "Коротко."
+        );
+
+        let bounded = bounded_reticulum_response(Some(&route), "я".repeat(600));
+        assert_eq!(bounded.chars().count(), 500);
+        assert!(bounded.ends_with("..."));
+        Ok(())
+    }
+
+    #[test]
+    fn non_reticulum_response_is_not_bounded() -> Result<()> {
+        let route = DeliveryRoute::new("telegram:1", "2", None, 4096, 1024)?;
+        let text = "x".repeat(700);
+        assert_eq!(bounded_reticulum_response(Some(&route), text.clone()), text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reticulum_response_instruction_and_limit_apply_to_final_outbox() -> Result<()> {
+        let route = DeliveryRoute::new(
+            "reticulum:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "c".repeat(32),
+            None,
+            256 * 1024,
+            1,
+        )?;
+        let store = store_with_gateway_text(route).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            CapturingScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                    content: "x".repeat(600),
+                    tool_calls: Vec::new(),
+                }]))),
+                requests: requests.clone(),
+            },
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+
+        assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+        assert!(requests.lock().await[0].messages.iter().any(|message| {
+            message.role == Role::System && message.text().contains("500 Unicode characters")
+        }));
+        let OutboxPayload::Text { text } = &store.outbox_intents().await?[0].payload else {
+            panic!("expected text outbox");
+        };
+        assert_eq!(text.chars().count(), 500);
+        assert!(text.ends_with("..."));
         Ok(())
     }
 
@@ -2343,6 +2440,45 @@ mod tests {
                     "local",
                     "owner",
                     Audience::ActorPrivate,
+                    "hello",
+                )
+                .unwrap(),
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        store
+    }
+
+    async fn store_with_gateway_text(route: DeliveryRoute) -> SqliteRuntimeStore {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
+                        id: "actor:local:1".into(),
+                        enabled: true,
+                        tools: vec![],
+                        identities: vec![IdentitySeed {
+                            provider: "local".into(),
+                            subject: "owner".into(),
+                            username: None,
+                        }],
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .ingest(
+                NewInboundEvent::text_with_route(
+                    "local",
+                    "event-1",
+                    "local",
+                    "owner",
+                    Audience::ActorPrivate,
+                    route,
                     "hello",
                 )
                 .unwrap(),
