@@ -37,6 +37,62 @@ def read_command(stream):
 def self_check():
     import io
 
+    class FakeIdentity:
+        remembered = None
+
+        @staticmethod
+        def remember(packet_hash, destination_hash, public_key):
+            FakeIdentity.remembered = (packet_hash, destination_hash, public_key)
+
+    class FakeDestination:
+        @staticmethod
+        def hash_from_name_and_identity(name, identity):
+            assert name == "lxmf.delivery"
+            assert identity == "identity"
+            return b"d" * 16
+
+    class FakeRns:
+        Identity = FakeIdentity
+        Destination = FakeDestination
+
+    class FakeLink:
+        link_id = b"l" * 16
+
+    class UnknownMessage:
+        unverified_reason = 1
+        source_hash = b"s" * 16
+        packed = b"packed"
+
+    class FakeTransport:
+        requested = None
+
+        @staticmethod
+        def request_path(destination_hash):
+            FakeTransport.requested = destination_hash
+
+    class RecoveringIdentity:
+        calls = 0
+
+        @staticmethod
+        def recall(destination_hash, _no_use=False):
+            RecoveringIdentity.calls += 1
+            return "identity" if RecoveringIdentity.calls > 1 else None
+
+    class RecoveringRns:
+        Identity = RecoveringIdentity
+        Transport = FakeTransport
+
+    class RecoveringLxMessage:
+        SOURCE_UNKNOWN = 1
+
+        @staticmethod
+        def unpack_from_bytes(packed):
+            assert packed == b"packed"
+            return "verified-message"
+
+    class RecoveringLxmf:
+        LXMessage = RecoveringLxMessage
+
     class Input:
         buffer = io.BytesIO(
             b'{"type":"start"}\n'
@@ -52,6 +108,27 @@ def self_check():
     assert validate_send({"delivery_id": "one", "destination": "b" * 32, "text": "hi"}) is None
     assert validate_send({"delivery_id": "one", "destination": "bad", "text": "hi"}) == "terminal"
     assert validate_send({"delivery_id": "one", "destination": "b" * 32, "text": " "}) == "terminal"
+    assert inbound_is_text(
+        signature_validated=True,
+        text="hello",
+        title="",
+        fields={0x0F: [1, b"ticket"]},
+        message_hash=b"a" * 32,
+        source_hash=b"b" * 16,
+    )
+    assert inbound_rejection_reason(
+        False, "hello", "", {}, b"a" * 32, b"b" * 16
+    ) == "signature_unverified"
+    remember_link_identity(FakeRns, FakeLink(), "identity", b"public-key")
+    assert FakeIdentity.remembered == (b"l" * 16, b"d" * 16, b"public-key")
+    assert recover_unknown_source(
+        RecoveringRns,
+        RecoveringLxmf,
+        UnknownMessage(),
+        deadline=lambda: False,
+        sleep=lambda _: None,
+    ) == "verified-message"
+    assert FakeTransport.requested == b"s" * 16
     print("reticulum bridge self-check passed")
 
 
@@ -109,6 +186,48 @@ def validate_send(command):
     if not text.strip() or len(text.encode("utf-8")) > MAX_TEXT_BYTES:
         return "terminal"
     return None
+
+
+def inbound_is_text(signature_validated, text, title, fields, message_hash, source_hash):
+    return inbound_rejection_reason(
+        signature_validated, text, title, fields, message_hash, source_hash
+    ) is None
+
+
+def inbound_rejection_reason(
+    signature_validated, text, title, fields, message_hash, source_hash
+):
+    if not signature_validated:
+        return "signature_unverified"
+    if text is None or not text.strip():
+        return "empty_text"
+    if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+        return "text_too_large"
+    if title:
+        return "title_not_supported"
+    if not isinstance(fields, dict):
+        return "invalid_fields"
+    if len(message_hash) != 32 or len(source_hash) != 16:
+        return "invalid_hash"
+    return None
+
+
+def remember_link_identity(rns, link, identity, public_key):
+    destination_hash = rns.Destination.hash_from_name_and_identity(
+        "lxmf.delivery", identity
+    )
+    rns.Identity.remember(link.link_id, destination_hash, public_key)
+
+
+def recover_unknown_source(rns, lxmf, message, deadline, sleep):
+    if message.unverified_reason != lxmf.LXMessage.SOURCE_UNKNOWN:
+        return message
+    rns.Transport.request_path(message.source_hash)
+    while rns.Identity.recall(message.source_hash, _no_use=True) is None:
+        if deadline():
+            return message
+        sleep(0.1)
+    return lxmf.LXMessage.unpack_from_bytes(message.packed)
 
 
 def run():
@@ -190,17 +309,25 @@ def run():
         raise ValueError("failed to register LXMF identity")
 
     def inbound(message):
+        recovery_deadline = time.monotonic() + 7
+        message = recover_unknown_source(
+            RNS,
+            LXMF,
+            message,
+            deadline=lambda: time.monotonic() >= recovery_deadline,
+            sleep=time.sleep,
+        )
         text = message.content_as_string()
-        if (
-            not message.signature_validated
-            or text is None
-            or not text.strip()
-            or len(text.encode("utf-8")) > MAX_TEXT_BYTES
-            or message.title_as_string()
-            or message.fields
-            or len(message.hash) != 32
-            or len(message.source_hash) != 16
-        ):
+        rejection = inbound_rejection_reason(
+            message.signature_validated,
+            text,
+            message.title_as_string(),
+            message.fields,
+            message.hash,
+            message.source_hash,
+        )
+        if rejection is not None:
+            print(f"inbound LXMF rejected: {rejection}", file=sys.stderr, flush=True)
             return
         emit(
             {
@@ -213,6 +340,20 @@ def run():
         )
 
     router.register_delivery_callback(inbound)
+    original_remote_identified = router.delivery_remote_identified
+
+    def remote_identified(link, remote_identity):
+        original_remote_identified(link, remote_identity)
+        remember_link_identity(
+            RNS, link, remote_identity, remote_identity.get_public_key()
+        )
+
+    source.set_link_established_callback(
+        lambda link: (
+            router.delivery_link_established(link),
+            link.set_remote_identified_callback(remote_identified),
+        )
+    )
     router.announce(source.hash)
     emit({"type": "ready", "destination": source.hash.hex()})
     active = set()
