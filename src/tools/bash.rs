@@ -116,13 +116,20 @@ async fn run_bash(arguments: BashArguments, default_cwd: Option<PathBuf>) -> Res
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    if let Some(cwd) = arguments.cwd.or(default_cwd) {
+    let cwd = arguments.cwd.or(default_cwd);
+    if let Some(cwd) = &cwd {
         command.current_dir(cwd);
     }
 
     configure_process_group(&mut command);
 
-    let mut child = command.spawn().context("failed to spawn server bash")?;
+    let mut child = command.spawn().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to spawn server bash /bin/bash in {}: {error}",
+            cwd.as_deref()
+                .map_or_else(|| "process cwd".into(), |cwd| cwd.display().to_string())
+        )
+    })?;
     let pid = child.id();
     let stdout = child
         .stdout
@@ -391,5 +398,29 @@ mod tests {
                 .trim(),
             explicit_cwd.to_string_lossy()
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_error_identifies_shell_cwd_and_os_error() {
+        let cwd = std::env::current_dir()
+            .expect("current dir should exist")
+            .join(".codrik-missing-bash-cwd");
+        assert!(!cwd.exists());
+
+        let error = BashTool::default()
+            .execute(&format!(
+                r#"{{"command":"true","cwd":{}}}"#,
+                serde_json::to_string(&cwd).expect("cwd should serialize")
+            ))
+            .await
+            .expect_err("missing cwd should prevent bash spawn")
+            .to_string();
+
+        assert!(error.contains("/bin/bash"), "{error}");
+        assert!(
+            error.contains(&cwd.to_string_lossy().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("No such file"), "{error}");
     }
 }
