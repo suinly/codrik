@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
     agent::{
         message::Message,
-        tool::{ToolCallContext, ToolExecutor},
+        tool::{Tool, ToolCallContext, ToolExecutor},
         tool_observation,
     },
     llm::client::{
@@ -15,7 +15,7 @@ use crate::{
     runtime::{
         artifacts::ArtifactManager,
         hooks::{NoopRuntimeBoundaryHooks, RuntimeBoundaryHooks},
-        model::{AttemptId, Clock, EventKind, OutboxId},
+        model::{AttemptId, Clock, EventKind, ExecutionPolicy, OutboxId},
         observability::{
             NoopRuntimeLogger, RuntimeComponent, RuntimeErrorClass, RuntimeLogEvent, RuntimeLogger,
             RuntimeTransition,
@@ -233,6 +233,52 @@ where
         let context = RunContext::new();
         let mut tool_steps = 0;
         for attempt in self.store.unresolved_attempts(&run).await? {
+            if !run.execution_policy.allows(&attempt.tool_name) {
+                let outcome = AttemptOutcome::FailedKnown {
+                    message: format!("tool is not allowed for this event: {}", attempt.tool_name),
+                };
+                self.store
+                    .mark_attempt_running(&run, &attempt.id, self.clock.now())
+                    .await?;
+                self.store
+                    .finish_attempt(&run, &attempt.id, outcome.clone(), self.clock.now())
+                    .await?;
+                let assistant = Message::assistant_tool_calls(
+                    "",
+                    vec![LlmToolCall {
+                        id: attempt.tool_call_id.clone(),
+                        name: attempt.tool_name,
+                        arguments: attempt.arguments_json,
+                    }],
+                );
+                let mut recovered_messages = Vec::new();
+                if !messages.iter().any(|message| {
+                    message
+                        .tool_calls
+                        .iter()
+                        .any(|call| call.id == attempt.tool_call_id)
+                }) {
+                    recovered_messages.push(assistant);
+                }
+                recovered_messages.push(Message::tool_result(
+                    attempt.tool_call_id,
+                    observation_for_outcome(&outcome),
+                ));
+                self.store
+                    .checkpoint_run(
+                        CheckpointRun {
+                            run: run.clone(),
+                            incorporated_event_ids: Vec::new(),
+                            checkpointed_attempt_ids: vec![attempt.id],
+                            messages: recovered_messages.clone(),
+                        },
+                        self.clock.now(),
+                    )
+                    .await?;
+                advance_progress(progress, QuantumProgress::KnownToolOutcome);
+                messages.extend(recovered_messages);
+                continue;
+            }
             let recovery = self.store.recover_attempt(&attempt.id).await?;
             let outcome = match recovery {
                 AttemptRecovery::MayInvoke => {
@@ -361,7 +407,7 @@ where
             }
             let request = LlmRequest {
                 messages: request_messages,
-                tools: self.tools.definitions(),
+                tools: definitions_for_policy(&self.tools, run.execution_policy),
             };
             self.events
                 .publish_activity(&run, AgentActivityEvent::ModelStepStarted);
@@ -494,6 +540,10 @@ where
                 Message::assistant_tool_calls(response.content, response.tool_calls.clone());
             let mut prepared = Vec::new();
             for tool_call in response.tool_calls {
+                if !run.execution_policy.allows(&tool_call.name) {
+                    prepared.push((tool_call, None));
+                    continue;
+                }
                 let capabilities = self
                     .tools
                     .capabilities(&tool_call.name)
@@ -512,7 +562,7 @@ where
                         self.clock.now(),
                     )
                     .await?;
-                prepared.push((tool_call, attempt));
+                prepared.push((tool_call, Some(attempt)));
             }
             self.store
                 .checkpoint_run(
@@ -532,6 +582,16 @@ where
             let mut checkpointed_attempt_ids = Vec::new();
             let mut budget_exhausted = false;
             for (tool_call, attempt) in prepared {
+                let Some(attempt) = attempt else {
+                    let outcome = AttemptOutcome::FailedKnown {
+                        message: format!("tool is not allowed for this event: {}", tool_call.name),
+                    };
+                    checkpoint_messages.push(Message::tool_result(
+                        tool_call.id,
+                        observation_for_outcome(&outcome),
+                    ));
+                    continue;
+                };
                 if tool_steps >= self.limits.max_tool_steps {
                     budget_exhausted = true;
                     break;
@@ -601,7 +661,7 @@ where
                 checkpointed_attempt_ids.push(attempt.id);
                 checkpoint_messages.push(Message::tool_result(tool_call.id, observation));
             }
-            if !checkpointed_attempt_ids.is_empty() {
+            if !checkpoint_messages.is_empty() {
                 self.store
                     .checkpoint_run(
                         CheckpointRun {
@@ -622,6 +682,14 @@ where
         }
         Ok(RunOnceOutcome::Yielded)
     }
+}
+
+fn definitions_for_policy<T: ToolExecutor>(tools: &T, policy: ExecutionPolicy) -> Vec<Tool> {
+    tools
+        .definitions()
+        .into_iter()
+        .filter(|tool| policy.allows(&tool.name))
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -808,7 +876,10 @@ mod tests {
             dispatcher::ActorDispatcher,
             gateway::DeliveryRoute,
             ipc::protocol::{ActivityEvent, ServerEventBody},
-            model::{ActorId, AttemptId, Audience, EventKind, ManualClock, RequestId, Timestamp},
+            model::{
+                ActorId, AttemptId, Audience, EventKind, ExecutionPolicy, ManualClock, RequestId,
+                Timestamp,
+            },
             observability::{RuntimeLogEvent, RuntimeLogger},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits, bounded_reticulum_response},
             signals::ActorSignals,
@@ -816,8 +887,9 @@ mod tests {
             store::{
                 AttemptOutcome, AttemptRecovery, CheckpointStore, DispatchStore,
                 DurableToolExecution, FailureFence, FailureStore, IngressStore, LocalIngressStore,
-                LocalSubmission, NewInboundEvent, NewToolAttempt, OutboxPayload, QuantumProgress,
-                QuantumRunner, ToolAttemptStore,
+                LocalSubmission, NewInboundEvent, NewToolAttempt, NewWebhookEvent, OutboxPayload,
+                QuantumProgress, QuantumRunner, ToolAttemptStore, WebhookIdempotency,
+                WebhookIngressStore,
             },
             stream_hub::{NoopRuntimeEventPublisher, StreamHub},
         },
@@ -1123,6 +1195,270 @@ mod tests {
             self.attempts.lock().await.push(context.attempt_id.clone());
             Ok(ToolExecution::text("2026-07-14"))
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct SkillsPolicyTools {
+        names: Vec<&'static str>,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SkillsPolicyTools {
+        fn definitions(&self) -> Vec<Tool> {
+            self.names
+                .iter()
+                .map(|name| Tool::new(*name, *name, Default::default()))
+                .collect()
+        }
+
+        fn capabilities(&self, name: &str) -> Option<ToolCapabilities> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("capabilities:{name}"));
+            self.names.contains(&name).then(ToolCapabilities::read_only)
+        }
+
+        async fn execute(
+            &self,
+            name: &str,
+            _arguments: &str,
+            _context: &ToolCallContext,
+        ) -> Result<ToolExecution> {
+            self.calls.lock().unwrap().push(format!("execute:{name}"));
+            Ok(ToolExecution::text(format!("ran {name}")))
+        }
+    }
+
+    async fn store_with_skills_only(tools: &[&str]) -> SqliteRuntimeStore {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
+                        id: "actor:local:1".into(),
+                        enabled: true,
+                        tools: tools.iter().map(|tool| (*tool).into()).collect(),
+                        identities: Vec::new(),
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await
+            .unwrap();
+        store
+            .ingest_webhook(
+                NewWebhookEvent {
+                    endpoint: "test".into(),
+                    actor_id: ActorId::from_string("actor:local:1"),
+                    idempotency: WebhookIdempotency::Explicit([1; 32]),
+                    payload_json: r#"{"type":"webhook","source":"test","received_at":"1970-01-01T00:00:00.002Z","data":{}}"#.into(),
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn skills_only_model_definitions_intersect_actor_grants() -> Result<()> {
+        for (actor_tools, expected) in [
+            (
+                vec![
+                    "skills_list",
+                    "skills_read",
+                    "skills_create",
+                    "skills_update",
+                    "datetime",
+                ],
+                vec!["skills_list", "skills_read"],
+            ),
+            (vec!["skills_read", "datetime"], vec!["skills_read"]),
+            (vec!["datetime"], vec![]),
+        ] {
+            let store = store_with_skills_only(&actor_tools).await;
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let runner = ActorRunner::new(
+                CapturingScriptedLlm {
+                    responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                        content: "done".into(),
+                        tool_calls: vec![],
+                    }]))),
+                    requests: requests.clone(),
+                },
+                SkillsPolicyTools {
+                    names: actor_tools,
+                    ..Default::default()
+                },
+                ActorSignals::default(),
+                Arc::new(NoopRuntimeEventPublisher),
+                RunnerLimits::default(),
+                test_artifacts(&store, ManualClock::new(1_000)),
+            );
+
+            assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+            assert_eq!(
+                requests.lock().await[0]
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        let store = store_with_text().await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            CapturingScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                }]))),
+                requests: requests.clone(),
+            },
+            SkillsPolicyTools {
+                names: vec!["datetime", "skills_create"],
+                ..Default::default()
+            },
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+        assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+        assert_eq!(
+            requests.lock().await[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["datetime", "skills_create"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_only_forged_fresh_call_is_observed_without_tool_preparation() -> Result<()> {
+        let store = store_with_skills_only(&["skills_read", "skills_update"]).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            CapturingScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([
+                    LlmResponse {
+                        content: "forged".into(),
+                        tool_calls: vec![LlmToolCall {
+                            id: "forbidden".into(),
+                            name: "skills_update".into(),
+                            arguments: "{}".into(),
+                        }],
+                    },
+                    LlmResponse {
+                        content: "allowed".into(),
+                        tool_calls: vec![LlmToolCall {
+                            id: "allowed".into(),
+                            name: "skills_read".into(),
+                            arguments: "{}".into(),
+                        }],
+                    },
+                    LlmResponse {
+                        content: "done".into(),
+                        tool_calls: vec![],
+                    },
+                ]))),
+                requests: requests.clone(),
+            },
+            SkillsPolicyTools {
+                names: vec!["skills_read", "skills_update"],
+                calls: calls.clone(),
+            },
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+
+        assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["capabilities:skills_read", "execute:skills_read"]
+        );
+        let requests = requests.lock().await;
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message
+                    .text()
+                    .contains("tool is not allowed for this event: skills_update")
+        }));
+        assert!(requests[2].messages.iter().any(
+            |message| message.role == Role::Tool && message.text().contains("ran skills_read")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_only_recovered_forbidden_attempt_is_failed_known_without_execution()
+    -> Result<()> {
+        let store = store_with_skills_only(&["skills_update"]).await;
+        let lease = store
+            .acquire_ready_actor("seed", Timestamp(10), Timestamp(1_000))
+            .await?
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await?
+            .unwrap();
+        assert_eq!(run.execution_policy, ExecutionPolicy::SkillsOnly);
+        store
+            .checkpoint_run(
+                crate::runtime::store::CheckpointRun {
+                    run: run.clone(),
+                    incorporated_event_ids: run.source_event_ids.clone(),
+                    checkpointed_attempt_ids: vec![],
+                    messages: run.messages.clone(),
+                },
+                Timestamp(12),
+            )
+            .await?;
+        let attempt = store
+            .prepare_attempt(
+                &run,
+                NewToolAttempt {
+                    id: AttemptId::new(),
+                    tool_call_id: "corrupt".into(),
+                    tool_name: "skills_update".into(),
+                    arguments_json: "{}".into(),
+                    capabilities: ToolCapabilities::read_only(),
+                },
+                Timestamp(13),
+            )
+            .await?;
+        store.release_lease(&lease).await?;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            FinalLlm,
+            SkillsPolicyTools {
+                names: vec!["skills_update"],
+                calls: calls.clone(),
+            },
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_001)),
+        );
+
+        assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await?,
+            AttemptRecovery::Terminal(AttemptOutcome::FailedKnown {
+                message: "tool is not allowed for this event: skills_update".into()
+            })
+        );
+        Ok(())
     }
 
     #[async_trait]
