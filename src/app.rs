@@ -186,6 +186,31 @@ where
     L: LlmStreamClient + Send + Sync + 'static,
     F: std::future::Future<Output = ()>,
 {
+    serve_at_until_with_hooks_and_webhook_component(
+        config, logger, trace, home, clock, llm, hooks, shutdown, None,
+    )
+    .await
+}
+
+type AppComponentFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_at_until_with_hooks_and_webhook_component<C, L, F>(
+    config: AppConfig,
+    logger: Arc<dyn RuntimeLogger>,
+    trace: &dyn StartupTrace,
+    home: PathBuf,
+    clock: C,
+    llm: L,
+    hooks: Arc<dyn RuntimeBoundaryHooks>,
+    shutdown: F,
+    mut webhook_component: Option<AppComponentFuture>,
+) -> Result<()>
+where
+    C: Clock,
+    L: LlmStreamClient + Send + Sync + 'static,
+    F: std::future::Future<Output = ()>,
+{
     let telegram_config = config
         .telegram
         .as_ref()
@@ -421,10 +446,11 @@ where
         });
     }
     if let Some(webhook) = webhook {
-        service.component("webhook-ingress", {
+        let component = webhook_component.take().unwrap_or_else(|| {
             let shutdown = shutdown_rx.clone();
-            async move { webhook.run(shutdown).await }
+            Box::pin(async move { webhook.run(shutdown).await })
         });
+        service.component("webhook-ingress", component);
     }
     service.component("dispatcher", {
         let dispatcher_task_owner = dispatcher_owner.clone();
@@ -1389,6 +1415,59 @@ mod tests {
             "{error:#}"
         );
         fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_component_exit_after_readiness_fails_application() -> Result<()> {
+        let home = short_runtime_root("webhook-exit")?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+        let trace = Arc::new(RecordingStartupTrace::default());
+        let terminate = Arc::new(tokio::sync::Notify::new());
+        let exit = {
+            let terminate = terminate.clone();
+            async move {
+                terminate.notified().await;
+                bail!("injected webhook termination")
+            }
+        };
+        let task = {
+            let trace = trace.clone();
+            tokio::spawn(async move {
+                serve_at_until_with_hooks_and_webhook_component(
+                    webhook_config(unused_tcp_address()?, "owner")?,
+                    Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+                    trace.as_ref(),
+                    home,
+                    SystemClock,
+                    RecordingLlm::default(),
+                    Arc::new(NoopRuntimeBoundaryHooks),
+                    std::future::pending(),
+                    Some(Box::pin(exit)),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if trace.0.lock().unwrap().contains(&StartupPhase::Ready) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        terminate.notify_one();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await??
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("webhook-ingress exited unexpectedly")
+        );
+        assert!(error.to_string().contains("injected webhook termination"));
         Ok(())
     }
 

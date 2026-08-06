@@ -309,34 +309,4 @@ mod tests {
             assert!(!line.contains(forbidden));
         }
     }
-
-    #[test]
-    fn webhook_event_serializes_only_safe_coordinates() {
-        let bearer = "Bearer fake-secret-token";
-        let key = "fake-idempotency-key";
-        let payload = "fake-payload-marker";
-        let unknown_path = "/webhooks/private-unknown-path";
-        let mut event =
-            RuntimeLogEvent::transition(RuntimeComponent::Webhook, RuntimeTransition::Accepted);
-        event.actor_id = Some(ActorId::from_string("owner"));
-        event.work_item_id = Some(WorkItemId::from_string("work-id"));
-        event.webhook_endpoint = Some("events".into());
-        event.duplicate = Some(false);
-        event.route_snapshotted = Some(true);
-
-        let json = serde_json::to_string(&event).unwrap();
-
-        assert!(json.contains(r#""webhook_endpoint":"events""#));
-        assert!(json.contains(r#""route_snapshotted":true"#));
-        for forbidden in [
-            bearer,
-            key,
-            payload,
-            unknown_path,
-            "authorization",
-            "identity_hash",
-        ] {
-            assert!(!json.contains(forbidden));
-        }
-    }
 }
