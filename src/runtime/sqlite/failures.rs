@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 
 use crate::runtime::{
+    gateway::DeliveryRoute,
     model::{ActorId, Audience, Clock, LocalRequestState, OutboxId, RequestId, RunId, Timestamp},
     sqlite::{
         SqliteRuntimeStore,
@@ -64,14 +65,34 @@ impl FailureStore for SqliteRuntimeStore {
 
                     let active_run = transaction.query_row(
                         "SELECT runs.id, runs.actor_id, work_items.audience_kind, work_items.audience_address,
-                                runs.execution_policy, runs.ingress_source
+                                runs.execution_policy, runs.ingress_source, runs.delivery_gateway,
+                                runs.delivery_address, runs.reply_to_external_id,
+                                runs.delivery_max_text_chars, runs.delivery_max_caption_chars
                          FROM runs JOIN work_items ON work_items.id = runs.work_item_id
                          WHERE runs.work_item_id = ?1 AND runs.state = 'active'",
                         [fence.work_item_id.as_str()],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?)),
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, Option<i64>>(9)?, row.get::<_, Option<i64>>(10)?)),
                     ).optional()?;
-                    if let Some((run_id, actor_id, audience_kind, audience_address, execution_policy, ingress_source)) = active_run {
+                    if let Some((run_id, actor_id, audience_kind, audience_address, execution_policy, ingress_source, delivery_gateway, delivery_address, reply_to_external_id, max_text_chars, max_caption_chars)) = active_run {
                         let audience = decode_audience(&audience_kind, audience_address)?;
+                        let delivery_route = match (
+                            delivery_gateway,
+                            delivery_address,
+                            max_text_chars,
+                            max_caption_chars,
+                        ) {
+                            (Some(gateway), Some(address), Some(max_text), Some(max_caption)) => {
+                                Some(DeliveryRoute::new(
+                                    gateway,
+                                    address,
+                                    reply_to_external_id,
+                                    max_text as usize,
+                                    max_caption as usize,
+                                )?)
+                            }
+                            (None, None, None, None) if reply_to_external_id.is_none() => None,
+                            _ => anyhow::bail!("stored run has an incomplete delivery route"),
+                        };
                         let request_ids = {
                             let mut statement = transaction.prepare(
                                 "SELECT local_requests.request_id FROM local_requests
@@ -89,7 +110,7 @@ impl FailureStore for SqliteRuntimeStore {
                             work_item_id: fence.work_item_id.clone(),
                             run_id: RunId::from_string(run_id.clone()),
                             audience: audience.clone(),
-                            delivery_route: None,
+                            delivery_route,
                             execution_policy: match execution_policy.as_str() {
                                 "actor_tools" => crate::runtime::model::ExecutionPolicy::ActorTools,
                                 "skills_only" => crate::runtime::model::ExecutionPolicy::SkillsOnly,
@@ -309,17 +330,20 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::Result;
+    use tokio_rusqlite::params;
 
     use crate::{
         agent::tool::ToolCapabilities,
         runtime::{
+            gateway::DeliveryRoute,
             model::{ActorId, AttemptId, LocalRequestState, ManualClock, RequestId, Timestamp},
             sqlite::SqliteRuntimeStore,
             store::{
-                AttemptRecovery, BundleStore, CheckpointRun, CheckpointStore, DispatchStore,
-                FailureDisposition, FailureFence, FailureStore, FinalizeRun, LocalIngressStore,
-                LocalSubmission, NewOutboxIntent, NewToolAttempt, OutboxPayload, QuantumProgress,
-                ToolAttemptStore,
+                ActorStore, AttemptRecovery, BundleStore, CheckpointRun, CheckpointStore,
+                DispatchStore, FailureDisposition, FailureFence, FailureStore, FinalizeRun,
+                LocalIngressStore, LocalSubmission, NewOutboxIntent, NewToolAttempt,
+                NewWebhookEvent, OutboxPayload, QuantumProgress, ToolAttemptStore,
+                WebhookIdempotency, WebhookIngressStore,
             },
         },
         test_fixtures::{ActorSeed, ActorSeedSet},
@@ -395,6 +419,201 @@ mod tests {
     #[test]
     fn sqlite_store_implements_failure_store() {
         requires_failure_store::<SqliteRuntimeStore>();
+    }
+
+    async fn webhook_failure_run(
+        route: Option<DeliveryRoute>,
+    ) -> (
+        SqliteRuntimeStore,
+        crate::runtime::store::AttachedRun,
+        FailureFence,
+    ) {
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        webhook_failure_run_in(store, route).await
+    }
+
+    async fn webhook_failure_run_in(
+        store: SqliteRuntimeStore,
+        route: Option<DeliveryRoute>,
+    ) -> (
+        SqliteRuntimeStore,
+        crate::runtime::store::AttachedRun,
+        FailureFence,
+    ) {
+        let actor = ActorId::from_string("webhook-owner");
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await
+            .unwrap();
+        if let Some(route) = route {
+            store
+                .connection
+                .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                    connection.execute(
+                        "INSERT INTO actor_latest_telegram_routes(
+                            actor_id, gateway, address, max_text_chars, max_caption_chars,
+                            mailbox_sequence, updated_at
+                         ) VALUES ('webhook-owner', ?1, ?2, ?3, ?4, 1, 1)",
+                        params![
+                            route.gateway,
+                            route.address,
+                            route.max_text_chars as i64,
+                            route.max_caption_chars as i64,
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .ingest_webhook(
+                NewWebhookEvent {
+                    endpoint: "grafana".into(),
+                    actor_id: actor,
+                    idempotency: WebhookIdempotency::Explicit([42; 32]),
+                    payload_json: r#"{"type":"webhook","source":"grafana","received_at":"1970-01-01T00:00:00.001Z","data":{}}"#.into(),
+                },
+                Timestamp(2),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(1_000))
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap()
+            .unwrap();
+        let fence = FailureFence::from(&run);
+        (store, run, fence)
+    }
+
+    async fn terminalize_failure(store: &SqliteRuntimeStore, fence: &FailureFence) {
+        for attempt in 0..4 {
+            assert!(matches!(
+                store
+                    .record_failure(
+                        fence,
+                        "failed",
+                        QuantumProgress::None,
+                        &ManualClock::new(20 + attempt),
+                    )
+                    .await
+                    .unwrap(),
+                FailureDisposition::RetryAt(_)
+            ));
+        }
+        assert_eq!(
+            store
+                .record_failure(
+                    fence,
+                    "terminal",
+                    QuantumProgress::None,
+                    &ManualClock::new(30),
+                )
+                .await
+                .unwrap(),
+            FailureDisposition::Terminalized
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_checkpoint_webhook_failure_terminalizes_without_null_sequence() {
+        let (store, _run, fence) = webhook_failure_run(None).await;
+
+        terminalize_failure(&store, &fence).await;
+
+        let deferred = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT event_sequence, state FROM deferred_webhook_results",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(deferred, (1, "pending".into()));
+    }
+
+    #[tokio::test]
+    async fn deferred_webhook_failure_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "codrik-deferred-reopen-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SqliteRuntimeStore::open(&path).await.unwrap();
+        let (store, _run, fence) = webhook_failure_run_in(store, None).await;
+        terminalize_failure(&store, &fence).await;
+        drop(store);
+
+        let reopened = SqliteRuntimeStore::open(&path).await.unwrap();
+        let deferred = reopened
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT event_sequence, state FROM deferred_webhook_results",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(deferred, (1, "pending".into()));
+        drop(reopened);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_webhook_failure_projects_to_immutable_route_without_reply_to() {
+        let accepted_route = DeliveryRoute::new("telegram:900", "100", None, 4096, 1024).unwrap();
+        let (store, _run, fence) = webhook_failure_run(Some(accepted_route.clone())).await;
+        store
+            .connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute(
+                    "UPDATE actor_latest_telegram_routes
+                     SET gateway = 'telegram:901', address = '200', mailbox_sequence = 2",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        terminalize_failure(&store, &fence).await;
+
+        let projected = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT gateway, address, reply_to_external_id,
+                            (SELECT COUNT(*) FROM deferred_webhook_results)
+                     FROM gateway_deliveries",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            projected,
+            (accepted_route.gateway, accepted_route.address, None, 0,)
+        );
     }
 
     #[tokio::test]

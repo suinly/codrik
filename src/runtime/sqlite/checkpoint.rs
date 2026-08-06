@@ -916,13 +916,18 @@ pub(super) fn create_terminal_bundles(
     } else if context.ingress_source.is_some()
         && context.execution_policy == ExecutionPolicy::SkillsOnly
     {
-        let event_sequence = transaction.query_row(
-            "SELECT MAX(events.mailbox_sequence)
+        let event_sequence = transaction
+            .query_row(
+                "SELECT COALESCE(
+                MAX(CASE WHEN run_events.incorporated = 1 THEN events.mailbox_sequence END),
+                MAX(events.mailbox_sequence)
+             )
              FROM events JOIN run_events ON run_events.event_id = events.id
-             WHERE run_events.run_id = ?1 AND run_events.incorporated = 1",
-            [context.run_id.as_str()],
-            |row| row.get::<_, i64>(0),
-        )?;
+             WHERE run_events.run_id = ?1",
+                [context.run_id.as_str()],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .ok_or_else(|| anyhow!("webhook run has no source event sequence"))?;
         for outbox_id in &outbox_ids {
             transaction.execute(
                 "INSERT INTO deferred_webhook_results(

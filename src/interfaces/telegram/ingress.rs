@@ -205,8 +205,9 @@ mod tests {
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
             store::{
-                ActorAdminStore, ActorStore, GatewayDeliveryStore, NewWebhookEvent, OutboxPayload,
-                WebhookIdempotency, WebhookIngressOutcome, WebhookIngressStore,
+                ActorAdminStore, ActorStore, DispatchStore, FailureDisposition, FailureFence,
+                FailureStore, GatewayDeliveryStore, NewWebhookEvent, OutboxPayload,
+                QuantumProgress, WebhookIdempotency, WebhookIngressOutcome, WebhookIngressStore,
             },
         },
     };
@@ -393,6 +394,112 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nonaccepted_inputs_do_not_release_deferred_webhook_result() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::from_string("owner");
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await?;
+        store
+            .ingest_webhook(
+                NewWebhookEvent {
+                    endpoint: "grafana".into(),
+                    actor_id: actor.clone(),
+                    idempotency: WebhookIdempotency::Explicit([8; 32]),
+                    payload_json: r#"{"type":"webhook","source":"grafana","received_at":"1970-01-01T00:00:00.001Z","data":{}}"#.into(),
+                },
+                Timestamp(2),
+            )
+            .await?;
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(3), Timestamp(100))
+            .await?
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(4))
+            .await?
+            .unwrap();
+        let fence = FailureFence::from(&run);
+        for attempt in 0..5 {
+            let disposition = store
+                .record_failure(
+                    &fence,
+                    "terminal webhook",
+                    QuantumProgress::None,
+                    &ManualClock::new(5 + attempt),
+                )
+                .await?;
+            if attempt == 4 {
+                assert_eq!(disposition, FailureDisposition::Terminalized);
+            }
+        }
+        store.release_lease(&lease).await?;
+
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(20),
+            SystemLinkCodeGenerator,
+        ));
+        let code = manager.issue_code(&actor).await?.code;
+        let ingress = TelegramIngressService::new(
+            store.clone(),
+            manager,
+            ActorSignals::default(),
+            "900",
+            "codrik_bot",
+            ManualClock::new(30),
+        )?;
+        for update in [
+            serde_json::json!({"update_id": 10, "inline_query": {"id": "x", "from": {"id": 100, "is_bot": false}, "query": "ignored", "offset": ""}}),
+            serde_json::json!({"update_id": 11, "message": {"message_id": 11, "from": {"id": 100, "is_bot": false}, "chat": {"id": 100, "type": "private"}, "text": "unlinked"}}),
+            serde_json::json!({"update_id": 12, "message": {"message_id": 12, "from": {"id": 100, "is_bot": false}, "chat": {"id": 100, "type": "private"}, "text": format!("/link {code}")}}),
+        ] {
+            ingress.handle(serde_json::from_value(update)?).await?;
+        }
+        store.set_actor_enabled(&actor, false).await?;
+        ingress
+            .handle(serde_json::from_value(serde_json::json!({
+                "update_id": 13,
+                "message": {
+                    "message_id": 13,
+                    "from": {"id": 100, "is_bot": false},
+                    "chat": {"id": 100, "type": "private"},
+                    "text": "disabled"
+                }
+            }))?)
+            .await?;
+        store.set_actor_enabled(&actor, true).await?;
+
+        assert!(matches!(
+            store
+                .ingest_webhook(
+                    NewWebhookEvent {
+                        endpoint: "grafana".into(),
+                        actor_id: actor,
+                        idempotency: WebhookIdempotency::Explicit([9; 32]),
+                        payload_json: "{}".into(),
+                    },
+                    Timestamp(40),
+                )
+                .await?,
+            WebhookIngressOutcome::Accepted {
+                route_snapshotted: false,
+                ..
+            }
+        ));
+        let deliveries = store
+            .claim_gateway_deliveries("telegram:900", "test", Timestamp(41), Timestamp(71), 20)
+            .await?;
+        assert!(deliveries.iter().all(|delivery| {
+            delivery.payload
+                != (OutboxPayload::Text {
+                    text: "terminal webhook".into(),
+                })
+        }));
         Ok(())
     }
 }
