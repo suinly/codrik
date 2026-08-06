@@ -9,8 +9,8 @@ use crate::{
     runtime::{
         gateway::{DeliveryRoute, split_unicode},
         model::{
-            AttemptId, AttemptState, Audience, BundleId, DeliveryId, EventId, GatewayDeliveryId,
-            LocalRequestState, OutboxId, RequestId, Timestamp,
+            AttemptId, AttemptState, Audience, BundleId, DeliveryId, EventId, ExecutionPolicy,
+            GatewayDeliveryId, LocalRequestState, OutboxId, RequestId, Timestamp,
         },
         sqlite::{
             SqliteRuntimeStore,
@@ -535,10 +535,19 @@ fn validate_run(
     now: Timestamp,
 ) -> Result<()> {
     ensure_current_lease(transaction, &run.lease, now)?;
-    let (actor_id, work_item_id, lease_generation, audience_kind, audience_address) = transaction
+    let (
+        actor_id,
+        work_item_id,
+        lease_generation,
+        audience_kind,
+        audience_address,
+        execution_policy,
+        ingress_source,
+    ) = transaction
         .query_row(
             "SELECT runs.actor_id, runs.work_item_id, runs.lease_generation,
-                    work_items.audience_kind, work_items.audience_address
+                    work_items.audience_kind, work_items.audience_address,
+                    runs.execution_policy, runs.ingress_source
              FROM runs
              JOIN work_items ON work_items.id = runs.work_item_id
              WHERE runs.id = ?1 AND runs.state = 'active'",
@@ -550,19 +559,32 @@ fn validate_run(
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )
         .map_err(|_| anyhow!("run is not active"))?;
     let expected_audience = encode_audience(&run.audience)?;
+    let execution_policy = decode_execution_policy(&execution_policy)?;
     if actor_id != run.lease.actor_id.as_str()
         || work_item_id != run.work_item_id.as_str()
         || lease_generation != run.lease.generation
         || (audience_kind, audience_address) != expected_audience
+        || execution_policy != run.execution_policy
+        || ingress_source != run.ingress_source
     {
         bail!("attached run does not match durable run state");
     }
     Ok(())
+}
+
+fn decode_execution_policy(policy: &str) -> Result<ExecutionPolicy> {
+    match policy {
+        "actor_tools" => Ok(ExecutionPolicy::ActorTools),
+        "skills_only" => Ok(ExecutionPolicy::SkillsOnly),
+        _ => bail!("invalid stored execution policy: {policy}"),
+    }
 }
 
 fn incorporate_events(
@@ -1140,13 +1162,15 @@ impl SqliteRuntimeStore {
     async fn work_item_state(&self, run: &AttachedRun) -> Result<String> {
         let work_item_id = run.work_item_id.to_string();
         self.connection
-            .call(move |connection| {
-                connection.query_row(
-                    "SELECT state FROM work_items WHERE id = ?1",
-                    [work_item_id],
-                    |row| row.get(0),
-                )
-            })
+            .call(
+                move |connection| -> tokio_rusqlite::rusqlite::Result<String> {
+                    connection.query_row(
+                        "SELECT state FROM work_items WHERE id = ?1",
+                        [work_item_id],
+                        |row| row.get(0),
+                    )
+                },
+            )
             .await
             .map_err(|error| anyhow!("failed to inspect work item: {error}"))
     }
@@ -1195,7 +1219,8 @@ mod tests {
         runtime::{
             gateway::DeliveryRoute,
             model::{
-                ActorId, Audience, CancelId, LocalRequestState, OutboxId, RequestId, Timestamp,
+                ActorId, Audience, CancelId, ExecutionPolicy, LocalRequestState, OutboxId,
+                RequestId, Timestamp,
             },
             sqlite::SqliteRuntimeStore,
             store::{
@@ -1255,6 +1280,78 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, run)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_attached_policy_or_source_different_from_durable_run() {
+        let (store, run) = store_with_run().await;
+        let mut wrong_policy = run.clone();
+        wrong_policy.execution_policy = ExecutionPolicy::SkillsOnly;
+        let policy_error = store
+            .checkpoint_run(
+                CheckpointRun {
+                    run: wrong_policy,
+                    incorporated_event_ids: Vec::new(),
+                    checkpointed_attempt_ids: Vec::new(),
+                    messages: Vec::new(),
+                },
+                Timestamp(110),
+            )
+            .await
+            .unwrap_err();
+        assert!(policy_error.to_string().contains("durable run state"));
+
+        let mut wrong_source = run;
+        wrong_source.ingress_source = Some("grafana".into());
+        let source_error = store
+            .checkpoint_run(
+                CheckpointRun {
+                    run: wrong_source,
+                    incorporated_event_ids: Vec::new(),
+                    checkpointed_attempt_ids: Vec::new(),
+                    messages: Vec::new(),
+                },
+                Timestamp(111),
+            )
+            .await
+            .unwrap_err();
+        assert!(source_error.to_string().contains("durable run state"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_unknown_durable_execution_policy() {
+        let (store, run) = store_with_run().await;
+        let run_id = run.run_id.to_string();
+        store
+            .connection
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.pragma_update(None, "ignore_check_constraints", true)?;
+                connection.execute(
+                    "UPDATE runs SET execution_policy = 'unknown' WHERE id = ?1",
+                    [run_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let error = store
+            .checkpoint_run(
+                CheckpointRun {
+                    run,
+                    incorporated_event_ids: Vec::new(),
+                    checkpointed_attempt_ids: Vec::new(),
+                    messages: Vec::new(),
+                },
+                Timestamp(110),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid stored execution policy")
+        );
     }
 
     async fn routed_store_with_run() -> (SqliteRuntimeStore, crate::runtime::store::AttachedRun) {
