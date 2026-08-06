@@ -312,6 +312,7 @@ mod tests {
         let server = WebhookServer::new(listener, vec![endpoint], Arc::new(AcceptingIngress))?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(server.run(shutdown_rx));
+        tokio::task::yield_now().await;
         Ok((format!("http://{address}"), shutdown_tx, task))
     }
 
@@ -333,6 +334,7 @@ mod tests {
         let server = WebhookServer::new(listener, vec![endpoint], ingress)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(server.run(shutdown_rx));
+        tokio::task::yield_now().await;
         Ok((format!("http://{address}"), shutdown_tx, task))
     }
 
