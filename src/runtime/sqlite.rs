@@ -595,6 +595,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v6_to_v7_migration_preserves_existing_runtime_rows() -> Result<()> {
+        let db = TempDb::new("generic-webhook-v7");
+        let connection = Connection::open(db.path()).await?;
+        connection
+            .call(|connection| -> Result<()> {
+                connection.execute_batch(INITIAL_MIGRATION)?;
+                connection.execute_batch("PRAGMA user_version = 1;")?;
+                super::migrate_to_v2(connection)?;
+                super::migrate_to_v3(connection)?;
+                super::migrate_to_v4(connection)?;
+                super::migrate_to_v5(connection)?;
+                super::migrate_to_v6(connection)?;
+                connection.execute_batch(
+                    "INSERT INTO actors(id, enabled, tools_json, created_at) VALUES ('actor', 1, '[\"read_file\"]', 1);
+                     INSERT INTO work_items(id, actor_id, kind, audience_kind, state, created_at, updated_at)
+                     VALUES ('work', 'actor', 'interactive', 'actor_private', 'ready', 1, 1);
+                     INSERT INTO events(id, actor_id, work_item_id, mailbox_sequence, gateway, external_id,
+                         kind, audience_kind, payload_json, state, created_at, updated_at)
+                     VALUES ('event', 'actor', 'work', 1, 'telegram', 'external', 'user_message',
+                         'actor_private', '{\"type\":\"text\",\"text\":\"preserve\"}', 'pending', 1, 1);
+                     INSERT INTO runs(id, actor_id, work_item_id, state, lease_generation, observed_sequence, created_at, updated_at)
+                     VALUES ('run', 'actor', 'work', 'active', 1, 1, 1, 1);",
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(super::map_call_error)?;
+        connection.close().await?;
+
+        let store = SqliteRuntimeStore::open(db.path()).await?;
+        let preserved = store
+            .connection
+            .call(|connection| {
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                    connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+                    connection.query_row(
+                        "SELECT payload_json FROM events WHERE id = 'event'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT execution_policy FROM events WHERE id = 'event'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT execution_policy FROM runs WHERE id = 'run'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT count(*) FROM pragma_foreign_key_check",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await?;
+        assert_eq!(
+            preserved,
+            (
+                7,
+                r#"{"type":"text","text":"preserve"}"#.into(),
+                "actor_tools".into(),
+                "actor_tools".into(),
+                0
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fresh_database_applies_v1_then_v2_with_foreign_key_integrity() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         let (foreign_keys, tables) = store.schema_probe().await?;

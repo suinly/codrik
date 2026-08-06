@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde::de::{MapAccess, Visitor};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,7 +32,41 @@ pub struct AppConfig {
 pub struct WebhookConfig {
     #[serde(deserialize_with = "deserialize_strict_string")]
     pub listen: String,
+    #[serde(deserialize_with = "deserialize_unique_map")]
     pub endpoints: BTreeMap<String, WebhookEndpointConfig>,
+}
+
+fn deserialize_unique_map<'de, D, V>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct UniqueMapVisitor<V>(std::marker::PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<V> {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map with unique string keys")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry()? {
+                if values.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate webhook endpoint name"));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMapVisitor(std::marker::PhantomData))
 }
 
 #[derive(Clone, Deserialize)]
@@ -549,6 +584,12 @@ mod tests {
 
         assert!(config.webhooks.unwrap().validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn webhook_config_rejects_duplicate_yaml_endpoint_keys() {
+        let yaml = "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nwebhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    audit: { path: /first, token: one, actor_id: owner }\n    audit: { path: /second, token: two, actor_id: owner }\n";
+        assert!(yaml_serde::from_str::<AppConfig>(yaml).is_err());
     }
 
     #[test]

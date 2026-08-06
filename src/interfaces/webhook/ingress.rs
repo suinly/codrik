@@ -3,6 +3,14 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use sha2::{Digest, Sha256};
 
+#[derive(serde::Serialize)]
+struct WebhookEnvelope<'a> {
+    r#type: &'static str,
+    source: &'a str,
+    received_at: String,
+    data: &'a serde_json::value::RawValue,
+}
+
 use crate::{
     config::ValidatedWebhookEndpoint,
     runtime::{
@@ -59,13 +67,13 @@ where
         idempotency_key: Option<&[u8]>,
     ) -> Result<WebhookIngressOutcome> {
         let now = self.clock.now();
-        let data: serde_json::Value = serde_json::from_slice(&body)?;
-        let payload_json = serde_json::to_string(&serde_json::json!({
-            "type": "webhook",
-            "source": endpoint.name,
-            "received_at": now.to_rfc3339_utc()?,
-            "data": data,
-        }))?;
+        let data: Box<serde_json::value::RawValue> = serde_json::from_slice(&body)?;
+        let payload_json = serde_json::to_string(&WebhookEnvelope {
+            r#type: "webhook",
+            source: &endpoint.name,
+            received_at: now.to_rfc3339_utc()?,
+            data: &data,
+        })?;
         let idempotency = match idempotency_key {
             Some(key) => WebhookIdempotency::Explicit(Sha256::digest(key).into()),
             None => WebhookIdempotency::Automatic(Sha256::digest(&body).into()),
@@ -180,6 +188,30 @@ mod tests {
         assert_eq!(payload["received_at"], "1970-01-01T00:00:00.001Z");
         assert_eq!(payload["data"]["status"], "firing");
         assert!(!payload.to_string().contains("event-1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_envelope_preserves_unbounded_json_number() -> Result<()> {
+        let store = RecordingStore::default();
+        let service = WebhookIngressService::new(
+            store.clone(),
+            ActorSignals::default(),
+            ManualClock::new(1),
+            Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+        );
+        let endpoint = ValidatedWebhookEndpoint {
+            name: "grafana".into(),
+            path: "/webhooks/grafana".into(),
+            token: "secret".into(),
+            actor_id: ActorId::from_string("owner"),
+        };
+
+        service
+            .handle(&endpoint, Bytes::from_static(br#"{"huge":1e400}"#), None)
+            .await?;
+        let payload = store.0.lock().unwrap().clone().unwrap().payload_json;
+        assert!(payload.contains(r#""data":{"huge":1e400}"#));
         Ok(())
     }
 }

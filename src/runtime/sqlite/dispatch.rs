@@ -1319,6 +1319,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_persisted_policy_returns_authority_error_without_spinning() {
+        let store = store_with_event().await;
+        store
+            .connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute_batch("PRAGMA ignore_check_constraints = ON")?;
+                connection.execute("UPDATE events SET execution_policy = 'unknown'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor("worker", Timestamp(10), Timestamp(20))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid stored execution policy")
+        );
+    }
+
+    #[tokio::test]
     async fn ready_acquisition_honors_persisted_next_attempt_at() {
         let store = store_with_event().await;
         let lease = store
