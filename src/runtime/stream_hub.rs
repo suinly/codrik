@@ -54,6 +54,7 @@ impl RuntimeEventPublisher for CompositeRuntimeEventPublisher {
             self.gateway.publish(
                 run.work_item_id.clone(),
                 route.clone(),
+                run.ingress_source.clone(),
                 GatewayActivityEvent::TextDelta(delta.to_owned()),
             );
         }
@@ -65,6 +66,7 @@ impl RuntimeEventPublisher for CompositeRuntimeEventPublisher {
             self.gateway.publish(
                 run.work_item_id.clone(),
                 route.clone(),
+                run.ingress_source.clone(),
                 GatewayActivityEvent::Activity(event),
             );
         }

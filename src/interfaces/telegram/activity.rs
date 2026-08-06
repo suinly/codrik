@@ -112,6 +112,24 @@ where
             activity.route.gateway.clone(),
             activity.route.address.clone(),
         );
+        if activity.ingress_source.is_some() {
+            match activity.event {
+                GatewayActivityEvent::Activity(AgentActivityEvent::ModelStepStarted) => {}
+                GatewayActivityEvent::Activity(
+                    AgentActivityEvent::Completed
+                    | AgentActivityEvent::Cancelled
+                    | AgentActivityEvent::Failed,
+                ) => {
+                    self.states
+                        .lock()
+                        .expect("Telegram activity states poisoned")
+                        .remove(&key);
+                    return;
+                }
+                GatewayActivityEvent::Activity(_) => return,
+                GatewayActivityEvent::TextDelta(_) => unreachable!(),
+            }
+        }
         let now = Instant::now();
         let mut state = self
             .states
@@ -372,7 +390,15 @@ mod tests {
         GatewayActivity {
             work_item_id: work_item.clone(),
             route: DeliveryRoute::new("telegram:900", "100", None, 4096, 1024).unwrap(),
+            ingress_source: None,
             event,
+        }
+    }
+
+    fn webhook_activity(work_item: &WorkItemId, event: GatewayActivityEvent) -> GatewayActivity {
+        GatewayActivity {
+            ingress_source: Some("grafana".into()),
+            ..activity(work_item, event)
         }
     }
 
@@ -394,6 +420,85 @@ mod tests {
 
         assert_eq!(api.actions.lock().unwrap().len(), 2);
         assert!(api.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn webhook_tool_run_keeps_typing_without_status_messages() {
+        let api = ActivityApi::default();
+        let worker = TelegramActivityWorker::new(api.clone(), "telegram:900");
+        let work = WorkItemId::new();
+
+        for event in [
+            AgentActivityEvent::ModelStepStarted,
+            AgentActivityEvent::Description("Использую skill".into()),
+            AgentActivityEvent::ToolStarted {
+                name: "skills_read".into(),
+            },
+            AgentActivityEvent::ToolFinished {
+                name: "skills_read".into(),
+                succeeded: true,
+            },
+        ] {
+            worker
+                .handle(webhook_activity(
+                    &work,
+                    GatewayActivityEvent::Activity(event),
+                ))
+                .await;
+        }
+
+        assert_eq!(api.actions.lock().unwrap().len(), 1);
+        assert!(api.sent.lock().unwrap().is_empty());
+        assert!(api.edited.lock().unwrap().is_empty());
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        worker.maintain().await;
+        assert_eq!(api.actions.lock().unwrap().len(), 2);
+
+        worker
+            .handle(webhook_activity(
+                &work,
+                GatewayActivityEvent::Activity(AgentActivityEvent::Completed),
+            ))
+            .await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        worker.maintain().await;
+
+        assert_eq!(api.actions.lock().unwrap().len(), 2);
+        assert!(api.sent.lock().unwrap().is_empty());
+        assert!(api.edited.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_webhook_terminal_clears_typing_without_status_messages() {
+        for terminal in [
+            AgentActivityEvent::Completed,
+            AgentActivityEvent::Cancelled,
+            AgentActivityEvent::Failed,
+        ] {
+            let api = ActivityApi::default();
+            let worker = TelegramActivityWorker::new(api.clone(), "telegram:900");
+            let work = WorkItemId::new();
+            worker
+                .handle(webhook_activity(
+                    &work,
+                    GatewayActivityEvent::Activity(AgentActivityEvent::ModelStepStarted),
+                ))
+                .await;
+            worker
+                .handle(webhook_activity(
+                    &work,
+                    GatewayActivityEvent::Activity(terminal),
+                ))
+                .await;
+
+            tokio::time::advance(Duration::from_secs(4)).await;
+            worker.maintain().await;
+
+            assert_eq!(api.actions.lock().unwrap().len(), 1);
+            assert!(api.sent.lock().unwrap().is_empty());
+            assert!(api.edited.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]

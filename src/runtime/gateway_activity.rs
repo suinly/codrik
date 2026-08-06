@@ -11,6 +11,7 @@ const DEFAULT_CAPACITY: usize = 256;
 pub struct GatewayActivity {
     pub work_item_id: WorkItemId,
     pub route: DeliveryRoute,
+    pub ingress_source: Option<String>,
     pub event: GatewayActivityEvent,
 }
 
@@ -47,11 +48,13 @@ impl GatewayActivityHub {
         &self,
         work_item_id: WorkItemId,
         route: DeliveryRoute,
+        ingress_source: Option<String>,
         event: GatewayActivityEvent,
     ) {
         let _ = self.sender.send(GatewayActivity {
             work_item_id,
             route,
+            ingress_source,
             event,
         });
     }
@@ -104,11 +107,13 @@ mod tests {
         hub.publish(
             work_item_id.clone(),
             route.clone(),
+            None,
             GatewayActivityEvent::Activity(AgentActivityEvent::ModelStepStarted),
         );
         hub.publish(
             work_item_id.clone(),
             route,
+            None,
             GatewayActivityEvent::TextDelta("hello".into()),
         );
 
@@ -132,6 +137,7 @@ mod tests {
         hub.publish(
             WorkItemId::new(),
             DeliveryRoute::new("telegram:900", "100", None, 4096, 1024)?,
+            None,
             GatewayActivityEvent::Activity(AgentActivityEvent::Completed),
         );
         Ok(())
@@ -163,6 +169,36 @@ mod tests {
             gateway_receiver.recv().await?.event,
             GatewayActivityEvent::TextDelta(ref delta) if delta == "hello"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn composite_copies_webhook_source_only_to_gateway_metadata() -> Result<()> {
+        let local = StreamHub::default();
+        let gateway = GatewayActivityHub::with_capacity(2);
+        let mut gateway_receiver = gateway.subscribe();
+        let composite =
+            CompositeRuntimeEventPublisher::new(std::sync::Arc::new(local.clone()), gateway);
+        let mut run = run(Some(DeliveryRoute::new(
+            "telegram:900",
+            "100",
+            None,
+            4096,
+            1024,
+        )?));
+        run.ingress_source = Some("grafana".into());
+        let mut local_receiver = local.subscribe(run.request_ids[0].clone()).unwrap();
+
+        composite.publish_activity(&run, AgentActivityEvent::ModelStepStarted);
+
+        assert!(matches!(
+            local_receiver.recv().await.unwrap().body,
+            ServerEventBody::Activity { .. }
+        ));
+        assert_eq!(
+            gateway_receiver.recv().await?.ingress_source.as_deref(),
+            Some("grafana")
+        );
         Ok(())
     }
 
