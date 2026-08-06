@@ -9,7 +9,10 @@ use tokio::{net::TcpListener, sync::watch};
 use crate::{
     config::ValidatedWebhookConfig,
     interfaces::webhook::{ingress::WebhookIngressService, server::WebhookServer},
-    runtime::{model::Clock, signals::ActorSignals, store::WebhookIngressStore},
+    runtime::{
+        model::Clock, observability::RuntimeLogger, signals::ActorSignals,
+        store::WebhookIngressStore,
+    },
 };
 
 pub struct PreparedWebhookGateway<S, C> {
@@ -41,6 +44,7 @@ pub async fn prepare<S, C>(
     store: S,
     signals: ActorSignals,
     clock: C,
+    logger: Arc<dyn RuntimeLogger>,
 ) -> Result<PreparedWebhookGateway<S, C>>
 where
     S: WebhookIngressStore + Send + Sync + 'static,
@@ -52,12 +56,14 @@ where
     Ok(PreparedWebhookGateway {
         listener: Mutex::new(Some(listener)),
         endpoints: config.endpoints,
-        ingress: Arc::new(WebhookIngressService::new(store, signals, clock)),
+        ingress: Arc::new(WebhookIngressService::new(store, signals, clock, logger)),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use anyhow::Result;
     use tokio::net::TcpListener;
 
@@ -80,6 +86,7 @@ mod tests {
                 SqliteRuntimeStore::open_in_memory().await?,
                 ActorSignals::default(),
                 ManualClock::new(1),
+                Arc::new(crate::runtime::observability::NoopRuntimeLogger),
             )
             .await
             .is_err()

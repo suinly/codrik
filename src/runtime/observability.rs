@@ -18,6 +18,7 @@ pub enum RuntimeComponent {
     TelegramDelivery,
     TelegramStreaming,
     Reticulum,
+    Webhook,
     Recovery,
     Supervisor,
 }
@@ -92,6 +93,12 @@ pub struct RuntimeLogEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reticulum_destination: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_snapshotted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RuntimeRecoveryCounts>,
 }
 
@@ -117,6 +124,9 @@ impl RuntimeLogEvent {
             schema_version: None,
             telegram_bot_id: None,
             reticulum_destination: None,
+            webhook_endpoint: None,
+            duplicate: None,
+            route_snapshotted: None,
             recovery: None,
         }
     }
@@ -297,6 +307,36 @@ mod tests {
             "chat-address-4242",
         ] {
             assert!(!line.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn webhook_event_serializes_only_safe_coordinates() {
+        let bearer = "Bearer fake-secret-token";
+        let key = "fake-idempotency-key";
+        let payload = "fake-payload-marker";
+        let unknown_path = "/webhooks/private-unknown-path";
+        let mut event =
+            RuntimeLogEvent::transition(RuntimeComponent::Webhook, RuntimeTransition::Accepted);
+        event.actor_id = Some(ActorId::from_string("owner"));
+        event.work_item_id = Some(WorkItemId::from_string("work-id"));
+        event.webhook_endpoint = Some("events".into());
+        event.duplicate = Some(false);
+        event.route_snapshotted = Some(true);
+
+        let json = serde_json::to_string(&event).unwrap();
+
+        assert!(json.contains(r#""webhook_endpoint":"events""#));
+        assert!(json.contains(r#""route_snapshotted":true"#));
+        for forbidden in [
+            bearer,
+            key,
+            payload,
+            unknown_path,
+            "authorization",
+            "identity_hash",
+        ] {
+            assert!(!json.contains(forbidden));
         }
     }
 }

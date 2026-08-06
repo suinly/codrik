@@ -66,6 +66,14 @@ telegram:
 reticulum:
   rns_address: "127.0.0.1:4242"
   python: "/absolute/path/to/venv/bin/python3"
+
+webhooks:
+  listen: "127.0.0.1:8081"
+  endpoints:
+    grafana:
+      path: "/webhooks/grafana"
+      token: "..."
+      actor_id: "owner"
 ```
 
 | Field | Required | Default | Description |
@@ -87,6 +95,10 @@ reticulum:
 | `telegram.webhook_secret` | In webhook mode | None | Secret-token value used to authenticate Telegram webhook requests. |
 | `reticulum.rns_address` | When Reticulum is enabled | None | Existing Reticulum `TCPServerInterface` endpoint as `host:port`. |
 | `reticulum.python` | No | `python3` | Python executable containing the `RNS` and `LXMF` packages. |
+| `webhooks.listen` | When generic webhooks are enabled | None | Local HTTP listener, normally loopback behind a TLS reverse proxy. |
+| `webhooks.endpoints.<name>.path` | Yes | None | Exact POST path for this endpoint. Paths must be unique. |
+| `webhooks.endpoints.<name>.token` | Yes | None | Private bearer token used to authenticate requests. |
+| `webhooks.endpoints.<name>.actor_id` | Yes | None | Existing enabled actor receiving this endpoint's events. |
 
 ### Runtime paths
 
@@ -329,6 +341,67 @@ because doing so could duplicate a message.
 - `outcome_unknown`: a transport interruption occurred after a send may have
   reached Telegram. Inspect the chat before taking manual action to avoid a
   duplicate message.
+
+## Generic webhook gateway
+
+Generic webhooks are optional authenticated JSON ingress. Each endpoint maps an
+exact path to one existing enabled actor. Codrik validates all endpoint actors,
+binds `webhooks.listen`, then reports runtime readiness. Invalid actors or a
+listener bind conflict fail startup. Keep the listener on loopback and terminate
+public HTTPS at a reverse proxy; expose only configured exact paths.
+
+Requests must use `POST`, `Content-Type: application/json`, and
+`Authorization: Bearer <token>`. Codrik accepts arbitrary valid JSON up to 1
+MiB. A successful request returns a bodyless `202 Accepted` only after the event
+and work item commit to SQLite; model processing and delivery continue
+asynchronously.
+
+Supply an `Idempotency-Key` header when the sender has a stable event ID. The
+key may contain 1-256 visible ASCII characters. Explicit keys deduplicate
+per endpoint permanently, even when a replay's body differs. Without that
+header, Codrik hashes the body and suppresses identical bodies for 24 hours,
+including a replay exactly 24 hours after acceptance.
+
+Webhook runs receive a fixed frame identifying the endpoint and reception time,
+with the submitted JSON marked as untrusted data. They can use only the
+read-only `skills_list` and `skills_read` tools. The endpoint actor's ordinary
+runs retain their configured tools.
+
+If the actor has previously accepted Telegram text, Codrik snapshots that
+actor's latest Telegram chat route into the webhook event. The final result is
+delivered to that immutable chat route without Telegram reply-to. When no route
+exists, processing still completes and delivery is deferred. A later accepted
+Telegram message releases only the newest deferred result; older deferred
+results remain suppressed.
+
+### Grafana contact point
+
+Create a Grafana webhook contact point targeting, for example,
+`https://agent.example.com/webhooks/grafana`. Configure these headers:
+
+```text
+Authorization: Bearer <the configured endpoint token>
+Content-Type: application/json
+Idempotency-Key: {{ .GroupKey }}
+```
+
+Use Grafana's default webhook body or any custom JSON body. Grafana-specific
+schema parsing is unnecessary; Codrik treats the complete body as untrusted
+event data. Choose a stable notification identifier for `Idempotency-Key` if
+`.GroupKey` does not match the desired replay scope.
+
+### Webhook troubleshooting
+
+- `400 Bad Request`: malformed JSON or an empty, oversized, or non-visible
+  `Idempotency-Key`.
+- `401 Unauthorized`: missing or mismatched bearer token.
+- `404 Not Found`: path does not exactly match a configured endpoint.
+- `405 Method Not Allowed`: endpoint called with a method other than `POST`.
+- `413 Payload Too Large`: body exceeds 1 MiB.
+- `415 Unsupported Media Type`: `Content-Type` is not `application/json`.
+- `503 Service Unavailable`: SQLite could not commit, the endpoint actor became
+  unavailable, or the 64-request concurrency limit was saturated. Retry with
+  the same explicit idempotency key.
 
 ## Reticulum LXMF gateway
 

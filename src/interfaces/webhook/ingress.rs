@@ -7,6 +7,7 @@ use crate::{
     config::ValidatedWebhookEndpoint,
     runtime::{
         model::Clock,
+        observability::{RuntimeComponent, RuntimeLogEvent, RuntimeLogger, RuntimeTransition},
         signals::ActorSignals,
         store::{NewWebhookEvent, WebhookIdempotency, WebhookIngressOutcome, WebhookIngressStore},
     },
@@ -26,14 +27,21 @@ pub struct WebhookIngressService<S, C> {
     store: S,
     signals: ActorSignals,
     clock: C,
+    logger: std::sync::Arc<dyn RuntimeLogger>,
 }
 
 impl<S, C> WebhookIngressService<S, C> {
-    pub fn new(store: S, signals: ActorSignals, clock: C) -> Self {
+    pub fn new(
+        store: S,
+        signals: ActorSignals,
+        clock: C,
+        logger: std::sync::Arc<dyn RuntimeLogger>,
+    ) -> Self {
         Self {
             store,
             signals,
             clock,
+            logger,
         }
     }
 }
@@ -74,6 +82,28 @@ where
                 now,
             )
             .await?;
+        let mut log =
+            RuntimeLogEvent::transition(RuntimeComponent::Webhook, RuntimeTransition::Accepted);
+        log.actor_id = Some(endpoint.actor_id.clone());
+        log.webhook_endpoint = Some(endpoint.name.clone());
+        match &outcome {
+            WebhookIngressOutcome::Accepted {
+                event_id: _,
+                work_item_id,
+                route_snapshotted,
+                ..
+            } => {
+                log.work_item_id = Some(work_item_id.clone());
+                log.duplicate = Some(false);
+                log.route_snapshotted = Some(*route_snapshotted);
+                let _ = self.logger.log(&log);
+            }
+            WebhookIngressOutcome::Duplicate { .. } => {
+                log.duplicate = Some(true);
+                let _ = self.logger.log(&log);
+            }
+            WebhookIngressOutcome::ActorUnavailable => {}
+        }
         if let WebhookIngressOutcome::Accepted { sequence, .. } = &outcome {
             self.signals.notify(&endpoint.actor_id, *sequence).await;
         }
@@ -123,8 +153,12 @@ mod tests {
     async fn builds_trusted_envelope_and_persists_exact_key_hash() -> Result<()> {
         let store = RecordingStore::default();
         let actor = ActorId::from_string("owner");
-        let service =
-            WebhookIngressService::new(store.clone(), ActorSignals::default(), ManualClock::new(1));
+        let service = WebhookIngressService::new(
+            store.clone(),
+            ActorSignals::default(),
+            ManualClock::new(1),
+            Arc::new(crate::runtime::observability::NoopRuntimeLogger),
+        );
         let endpoint = ValidatedWebhookEndpoint {
             name: "grafana".into(),
             path: "/webhooks/grafana".into(),
