@@ -13,6 +13,7 @@ mod checkpoint;
 mod dispatch;
 mod failures;
 mod gateway;
+mod gateway_projection;
 mod identity_link;
 mod ingress;
 mod local_ingress;

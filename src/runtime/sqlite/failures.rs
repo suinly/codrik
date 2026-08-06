@@ -63,13 +63,14 @@ impl FailureStore for SqliteRuntimeStore {
                     }
 
                     let active_run = transaction.query_row(
-                        "SELECT runs.id, runs.actor_id, work_items.audience_kind, work_items.audience_address
+                        "SELECT runs.id, runs.actor_id, work_items.audience_kind, work_items.audience_address,
+                                runs.execution_policy, runs.ingress_source
                          FROM runs JOIN work_items ON work_items.id = runs.work_item_id
                          WHERE runs.work_item_id = ?1 AND runs.state = 'active'",
                         [fence.work_item_id.as_str()],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)),
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?)),
                     ).optional()?;
-                    if let Some((run_id, actor_id, audience_kind, audience_address)) = active_run {
+                    if let Some((run_id, actor_id, audience_kind, audience_address, execution_policy, ingress_source)) = active_run {
                         let audience = decode_audience(&audience_kind, audience_address)?;
                         let request_ids = {
                             let mut statement = transaction.prepare(
@@ -89,6 +90,12 @@ impl FailureStore for SqliteRuntimeStore {
                             run_id: RunId::from_string(run_id.clone()),
                             audience: audience.clone(),
                             delivery_route: None,
+                            execution_policy: match execution_policy.as_str() {
+                                "actor_tools" => crate::runtime::model::ExecutionPolicy::ActorTools,
+                                "skills_only" => crate::runtime::model::ExecutionPolicy::SkillsOnly,
+                                other => anyhow::bail!("invalid stored execution policy: {other}"),
+                            },
+                            ingress_source,
                         };
                         create_terminal_bundles(
                             &transaction,

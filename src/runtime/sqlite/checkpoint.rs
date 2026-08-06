@@ -7,15 +7,16 @@ use tokio_rusqlite::params;
 use crate::{
     agent::message::Message,
     runtime::{
-        gateway::{DeliveryRoute, split_unicode},
+        gateway::DeliveryRoute,
         model::{
             AttemptId, AttemptState, Audience, BundleId, DeliveryId, EventId, ExecutionPolicy,
-            GatewayDeliveryId, LocalRequestState, OutboxId, RequestId, Timestamp,
+            LocalRequestState, OutboxId, RequestId, Timestamp,
         },
         sqlite::{
             SqliteRuntimeStore,
             bundles::{manifest_for, payload_from_outbox},
             dispatch::ensure_current_lease,
+            gateway_projection::project_outbox_to_gateway,
             map_call_error,
             retry::call_connection_with_busy_retry,
         },
@@ -903,7 +904,38 @@ pub(super) fn create_terminal_bundles(
         .collect::<Result<Vec<_>>>()?;
     if let Some(route) = &context.delivery_route {
         for (intent, outbox_id) in intents.iter().zip(&outbox_ids) {
-            insert_gateway_deliveries(transaction, intent, outbox_id, route, now)?;
+            project_outbox_to_gateway(
+                transaction,
+                &intent.intent_key,
+                outbox_id,
+                &intent.payload,
+                route,
+                now,
+            )?;
+        }
+    } else if context.ingress_source.is_some()
+        && context.execution_policy == ExecutionPolicy::SkillsOnly
+    {
+        let event_sequence = transaction.query_row(
+            "SELECT MAX(events.mailbox_sequence)
+             FROM events JOIN run_events ON run_events.event_id = events.id
+             WHERE run_events.run_id = ?1 AND run_events.incorporated = 1",
+            [context.run_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        for outbox_id in &outbox_ids {
+            transaction.execute(
+                "INSERT INTO deferred_webhook_results(
+                    outbox_id, actor_id, event_sequence, state, released_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?4)
+                 ON CONFLICT(outbox_id) DO NOTHING",
+                params![
+                    outbox_id.as_str(),
+                    context.actor_id.as_str(),
+                    event_sequence,
+                    now.0
+                ],
+            )?;
         }
     }
     if request_ids.is_empty() {
@@ -971,6 +1003,8 @@ pub(super) struct TerminalBundleContext {
     pub(super) run_id: crate::runtime::model::RunId,
     pub(super) audience: Audience,
     pub(super) delivery_route: Option<DeliveryRoute>,
+    pub(super) execution_policy: ExecutionPolicy,
+    pub(super) ingress_source: Option<String>,
 }
 
 impl From<&AttachedRun> for TerminalBundleContext {
@@ -981,73 +1015,10 @@ impl From<&AttachedRun> for TerminalBundleContext {
             run_id: run.run_id.clone(),
             audience: run.audience.clone(),
             delivery_route: run.delivery_route.clone(),
+            execution_policy: run.execution_policy,
+            ingress_source: run.ingress_source.clone(),
         }
     }
-}
-
-fn insert_gateway_deliveries(
-    transaction: &tokio_rusqlite::rusqlite::Transaction<'_>,
-    intent: &NewOutboxIntent,
-    outbox_id: &OutboxId,
-    route: &DeliveryRoute,
-    now: Timestamp,
-) -> Result<()> {
-    let payloads = match &intent.payload {
-        crate::runtime::store::OutboxPayload::Text { text } => {
-            split_unicode(text, route.max_text_chars)
-                .into_iter()
-                .map(|text| crate::runtime::store::OutboxPayload::Text { text })
-                .collect()
-        }
-        crate::runtime::store::OutboxPayload::TerminalError { message, .. } => {
-            split_unicode(message, route.max_text_chars)
-                .into_iter()
-                .map(|text| crate::runtime::store::OutboxPayload::Text { text })
-                .collect()
-        }
-        crate::runtime::store::OutboxPayload::File { caption, .. }
-            if caption
-                .as_ref()
-                .is_some_and(|caption| caption.chars().count() > route.max_caption_chars) =>
-        {
-            let mut payloads =
-                split_unicode(caption.as_deref().unwrap_or_default(), route.max_text_chars)
-                    .into_iter()
-                    .map(|text| crate::runtime::store::OutboxPayload::Text { text })
-                    .collect::<Vec<_>>();
-            let mut file = intent.payload.clone();
-            if let crate::runtime::store::OutboxPayload::File { caption, .. } = &mut file {
-                *caption = None;
-            }
-            payloads.push(file);
-            payloads
-        }
-        crate::runtime::store::OutboxPayload::File { .. } => vec![intent.payload.clone()],
-    };
-    for (ordinal, payload) in payloads.into_iter().enumerate() {
-        transaction.execute(
-            "INSERT INTO gateway_deliveries(
-                id, intent_key, source_outbox_id, gateway, address,
-                reply_to_external_id, max_text_chars, max_caption_chars,
-                ordinal, payload_json, state, attempt_count, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', 0, ?11, ?11)
-             ON CONFLICT(intent_key) DO NOTHING",
-            params![
-                GatewayDeliveryId::new().as_str(),
-                format!("gateway:{}:{ordinal}", intent.intent_key),
-                outbox_id.as_str(),
-                route.gateway,
-                route.address,
-                route.reply_to_external_id,
-                route.max_text_chars as i64,
-                route.max_caption_chars as i64,
-                ordinal as i64,
-                serde_json::to_string(&payload)?,
-                now.0,
-            ],
-        )?;
-    }
-    Ok(())
 }
 
 fn terminal_state_name(state: LocalRequestState) -> &'static str {
@@ -1248,11 +1219,12 @@ mod tests {
             },
             sqlite::SqliteRuntimeStore,
             store::{
-                AttemptOutcome, AttemptRecovery, BundleStore, CheckpointRun, CheckpointStore,
-                ContextStore, ControlStore, DispatchStore, FinalPayload, FinalizeOutcome,
-                FinalizeRun, IngressStore, LocalCancel, LocalIngressStore, LocalSubmission,
-                NewInboundEvent, NewOutboxIntent, NewToolAttempt, OutboxPayload, StaleLease,
-                ToolAttemptStore,
+                ActorStore, AttemptOutcome, AttemptRecovery, BundleStore, CheckpointRun,
+                CheckpointStore, ContextStore, ControlStore, DispatchStore, FinalPayload,
+                FinalizeOutcome, FinalizeRun, IngressStore, LocalCancel, LocalIngressStore,
+                LocalSubmission, NewInboundEvent, NewOutboxIntent, NewToolAttempt, NewWebhookEvent,
+                OutboxPayload, StaleLease, ToolAttemptStore, WebhookIdempotency,
+                WebhookIngressStore,
             },
         },
         test_fixtures::{ActorSeed, ActorSeedSet, IdentitySeed},
@@ -1508,6 +1480,179 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(joined, text);
+    }
+
+    async fn webhook_store_with_run(
+        store: Option<SqliteRuntimeStore>,
+        identity: u8,
+    ) -> (SqliteRuntimeStore, crate::runtime::store::AttachedRun) {
+        let store = match store {
+            Some(store) => store,
+            None => {
+                let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+                store
+                    .ensure_initial_actor(&ActorId::from_string("owner"), &[], Timestamp(1))
+                    .await
+                    .unwrap();
+                store
+            }
+        };
+        store
+            .ingest_webhook(
+                NewWebhookEvent {
+                    endpoint: "grafana".into(),
+                    actor_id: ActorId::from_string("owner"),
+                    idempotency: WebhookIdempotency::Explicit([identity; 32]),
+                    payload_json: r#"{"type":"webhook","source":"grafana","received_at":"1970-01-01T00:00:00.001Z","data":{}}"#.into(),
+                },
+                Timestamp(100 * i64::from(identity)),
+            )
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_ready_actor(
+                "worker",
+                Timestamp(100 * i64::from(identity) + 10),
+                Timestamp(500),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(100 * i64::from(identity) + 11))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .checkpoint_run(
+                CheckpointRun {
+                    run: run.clone(),
+                    incorporated_event_ids: run.source_event_ids.clone(),
+                    checkpointed_attempt_ids: Vec::new(),
+                    messages: Vec::new(),
+                },
+                Timestamp(100 * i64::from(identity) + 12),
+            )
+            .await
+            .unwrap();
+        (store, run)
+    }
+
+    #[tokio::test]
+    async fn webhook_without_route_defers_then_new_telegram_input_releases_newest_only() {
+        let (store, first) = webhook_store_with_run(None, 1).await;
+        let mut first_final = finalize(&first, "webhook-1");
+        first_final.outbox[0].intent_class = "webhook_notification".into();
+        store
+            .finalize_run(first_final, Timestamp(120))
+            .await
+            .unwrap();
+        store.release_lease(&first.lease).await.unwrap();
+
+        let (store, second) = webhook_store_with_run(Some(store), 2).await;
+        let mut second_final = finalize(&second, "webhook-2");
+        second_final.outbox[0].intent_class = "webhook_notification".into();
+        second_final.outbox[0].payload = OutboxPayload::Text {
+            text: "🦀".repeat(5),
+        };
+        store
+            .finalize_run(second_final, Timestamp(220))
+            .await
+            .unwrap();
+        store.release_lease(&second.lease).await.unwrap();
+
+        let route = DeliveryRoute::new("telegram:900", "100", Some("99".into()), 4, 1024).unwrap();
+        let telegram = NewInboundEvent::text_with_route(
+            "telegram:900",
+            "telegram-1",
+            "telegram",
+            "100",
+            Audience::ActorPrivate,
+            route,
+            "next input",
+        )
+        .unwrap()
+        .with_latest_telegram_route_tracking();
+        store
+            .connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute(
+                    "INSERT INTO identities(provider, subject, actor_id) VALUES ('telegram', '100', 'owner')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .ingest(telegram.clone(), Timestamp(300))
+                .await
+                .unwrap(),
+            crate::runtime::store::IngressOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            store.ingest(telegram, Timestamp(301)).await.unwrap(),
+            crate::runtime::store::IngressOutcome::Duplicate { .. }
+        ));
+
+        let projection = store
+            .connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
+                let states = {
+                    let mut statement = connection.prepare(
+                        "SELECT outbox.intent_key, deferred_webhook_results.state
+                         FROM deferred_webhook_results JOIN outbox ON outbox.id = deferred_webhook_results.outbox_id
+                         ORDER BY event_sequence",
+                    )?;
+                    statement
+                        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                let deliveries = {
+                    let mut statement = connection.prepare(
+                        "SELECT gateway, address, reply_to_external_id, payload_json
+                         FROM gateway_deliveries ORDER BY ordinal",
+                    )?;
+                    statement
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                Ok((states, deliveries))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            projection.0,
+            vec![
+                ("webhook-1".into(), "superseded".into()),
+                ("webhook-2".into(), "released".into()),
+            ]
+        );
+        assert_eq!(projection.1.len(), 2);
+        assert!(
+            projection
+                .1
+                .iter()
+                .all(|row| { row.0 == "telegram:900" && row.1 == "100" && row.2.is_none() })
+        );
+        let text = projection
+            .1
+            .into_iter()
+            .map(|row| serde_json::from_str::<OutboxPayload>(&row.3).unwrap())
+            .map(|payload| match payload {
+                OutboxPayload::Text { text } => text,
+                other => panic!("unexpected payload: {other:?}"),
+            })
+            .collect::<String>();
+        assert_eq!(text, "🦀".repeat(5));
     }
 
     async fn local_store_with_run(

@@ -497,7 +497,12 @@ where
                             outbox: vec![NewOutboxIntent {
                                 id: OutboxId::new(),
                                 intent_key,
-                                intent_class: "interactive_reply".into(),
+                                intent_class: if run.ingress_source.is_some() {
+                                    "webhook_notification"
+                                } else {
+                                    "interactive_reply"
+                                }
+                                .into(),
                                 audience: run.audience.clone(),
                                 payload: OutboxPayload::Text { text: content },
                             }],

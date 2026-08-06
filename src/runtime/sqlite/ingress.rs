@@ -3,9 +3,10 @@ use async_trait::async_trait;
 use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 
 use crate::runtime::{
-    model::Timestamp,
-    sqlite::SqliteRuntimeStore,
-    store::{IngressOutcome, IngressStore, NewInboundEvent},
+    gateway::DeliveryRoute,
+    model::{OutboxId, Timestamp},
+    sqlite::{SqliteRuntimeStore, gateway_projection::project_outbox_to_gateway},
+    store::{IngressOutcome, IngressStore, NewInboundEvent, OutboxPayload},
 };
 
 #[async_trait]
@@ -31,7 +32,7 @@ impl IngressStore for SqliteRuntimeStore {
         let kind = encode_event_kind(event.kind);
         let execution_policy = encode_execution_policy(event.execution_policy);
         self.connection
-            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<IngressOutcome> {
+            .call(move |connection| -> Result<IngressOutcome> {
                 let transaction = connection
                     .transaction_with_behavior(tokio_rusqlite::rusqlite::TransactionBehavior::Immediate)?;
 
@@ -128,6 +129,17 @@ impl IngressStore for SqliteRuntimeStore {
                         now.0,
                     ],
                 )?;
+                if event.record_latest_telegram_route
+                    && let Some(route) = &event.delivery_route
+                {
+                    record_latest_route_and_release_deferred(
+                        &transaction,
+                        &actor_id,
+                        sequence,
+                        route,
+                        now,
+                    )?;
+                }
                 transaction.commit()?;
                 Ok(IngressOutcome::Accepted {
                     event_id,
@@ -138,6 +150,82 @@ impl IngressStore for SqliteRuntimeStore {
             .await
             .map_err(|error| anyhow!("failed to persist inbound event: {error}"))
     }
+}
+
+fn record_latest_route_and_release_deferred(
+    transaction: &tokio_rusqlite::rusqlite::Transaction<'_>,
+    actor_id: &str,
+    sequence: i64,
+    route: &DeliveryRoute,
+    now: Timestamp,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO actor_latest_telegram_routes(
+            actor_id, gateway, address, max_text_chars, max_caption_chars,
+            mailbox_sequence, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(actor_id) DO UPDATE SET
+            gateway = excluded.gateway,
+            address = excluded.address,
+            max_text_chars = excluded.max_text_chars,
+            max_caption_chars = excluded.max_caption_chars,
+            mailbox_sequence = excluded.mailbox_sequence,
+            updated_at = excluded.updated_at
+         WHERE excluded.mailbox_sequence > actor_latest_telegram_routes.mailbox_sequence",
+        params![
+            actor_id,
+            route.gateway,
+            route.address,
+            route.max_text_chars as i64,
+            route.max_caption_chars as i64,
+            sequence,
+            now.0,
+        ],
+    )?;
+    let newest = transaction
+        .query_row(
+            "SELECT deferred.outbox_id, outbox.intent_key, outbox.payload_json
+             FROM deferred_webhook_results AS deferred
+             JOIN outbox ON outbox.id = deferred.outbox_id
+             WHERE deferred.actor_id = ?1 AND deferred.state = 'pending'
+             ORDER BY deferred.event_sequence DESC, deferred.outbox_id DESC LIMIT 1",
+            [actor_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((outbox_id, intent_key, payload_json)) = newest else {
+        return Ok(());
+    };
+    transaction.execute(
+        "UPDATE deferred_webhook_results
+         SET state = 'superseded', updated_at = ?3
+         WHERE actor_id = ?1 AND state = 'pending' AND outbox_id != ?2",
+        params![actor_id, outbox_id, now.0],
+    )?;
+    let payload: OutboxPayload = serde_json::from_str(&payload_json)?;
+    let mut release_route = route.clone();
+    release_route.reply_to_external_id = None;
+    project_outbox_to_gateway(
+        transaction,
+        &intent_key,
+        &OutboxId::from_string(outbox_id.clone()),
+        &payload,
+        &release_route,
+        now,
+    )?;
+    transaction.execute(
+        "UPDATE deferred_webhook_results
+         SET state = 'released', released_at = ?2, updated_at = ?2
+         WHERE outbox_id = ?1 AND state = 'pending'",
+        params![outbox_id, now.0],
+    )?;
+    Ok(())
 }
 
 fn encode_audience(audience: &crate::runtime::model::Audience) -> Result<(String, Option<String>)> {
@@ -274,6 +362,107 @@ mod tests {
                 4096,
                 1024,
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_telegram_route_requires_explicit_tracking_and_new_accepted_sequence() {
+        use crate::runtime::gateway::DeliveryRoute;
+
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .seed_actors_for_test(owner_snapshot(), Timestamp(1))
+            .await
+            .unwrap();
+        let route = |address: &str| {
+            DeliveryRoute::new("telegram:900", address, Some("7".into()), 4096, 1024).unwrap()
+        };
+        let untracked = NewInboundEvent::text_with_route(
+            "telegram:900",
+            "untracked",
+            "telegram",
+            "123",
+            Audience::ActorPrivate,
+            route("100"),
+            "ordinary",
+        )
+        .unwrap();
+        store.ingest(untracked, Timestamp(2)).await.unwrap();
+        let tracked = NewInboundEvent::text_with_route(
+            "not-telegram-authority",
+            "tracked",
+            "telegram",
+            "123",
+            Audience::ActorPrivate,
+            route("200"),
+            "telegram text",
+        )
+        .unwrap()
+        .with_latest_telegram_route_tracking();
+        store.ingest(tracked.clone(), Timestamp(3)).await.unwrap();
+        assert!(matches!(
+            store.ingest(tracked, Timestamp(4)).await.unwrap(),
+            IngressOutcome::Duplicate { .. }
+        ));
+
+        let latest = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT gateway, address, mailbox_sequence FROM actor_latest_telegram_routes",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(latest, ("telegram:900".into(), "200".into(), 2));
+    }
+
+    #[tokio::test]
+    async fn latest_route_update_rolls_back_with_event_transaction() {
+        use crate::runtime::gateway::DeliveryRoute;
+
+        let store = SqliteRuntimeStore::open_in_memory().await.unwrap();
+        store
+            .seed_actors_for_test(owner_snapshot(), Timestamp(1))
+            .await
+            .unwrap();
+        store
+            .connection
+            .call(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_latest_route BEFORE INSERT ON actor_latest_telegram_routes
+                     BEGIN SELECT RAISE(ABORT, 'route rejected'); END;",
+                )
+            })
+            .await
+            .unwrap();
+        let event = NewInboundEvent::text_with_route(
+            "telegram:900",
+            "atomic",
+            "telegram",
+            "123",
+            Audience::ActorPrivate,
+            DeliveryRoute::new("telegram:900", "100", Some("7".into()), 4096, 1024).unwrap(),
+            "hello",
+        )
+        .unwrap()
+        .with_latest_telegram_route_tracking();
+
+        assert!(store.ingest(event, Timestamp(2)).await.is_err());
+        assert_eq!(
+            store
+                .next_mailbox_sequence("actor:telegram:123")
+                .await
+                .unwrap(),
+            0
         );
     }
 

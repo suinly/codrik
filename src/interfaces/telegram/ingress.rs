@@ -167,7 +167,8 @@ where
                             crate::runtime::model::Audience::ActorPrivate,
                             route,
                             text,
-                        )?,
+                        )?
+                        .with_latest_telegram_route_tracking(),
                         self.clock.now(),
                     )
                     .await?
@@ -203,7 +204,10 @@ mod tests {
             model::{ActorId, ManualClock, Timestamp},
             signals::ActorSignals,
             sqlite::SqliteRuntimeStore,
-            store::{ActorAdminStore, ActorStore, GatewayDeliveryStore, OutboxPayload},
+            store::{
+                ActorAdminStore, ActorStore, GatewayDeliveryStore, NewWebhookEvent, OutboxPayload,
+                WebhookIdempotency, WebhookIngressOutcome, WebhookIngressStore,
+            },
         },
     };
 
@@ -334,6 +338,61 @@ mod tests {
                     text: "This actor is disabled.".into(),
                 }
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_private_text_records_route_for_later_webhooks() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::from_string("owner");
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(10),
+            SystemLinkCodeGenerator,
+        ));
+        let code = manager.issue_code(&actor).await?.code;
+        let ingress = TelegramIngressService::new(
+            store.clone(),
+            manager,
+            ActorSignals::default(),
+            "900",
+            "codrik_bot",
+            ManualClock::new(20),
+        )?;
+        for (update_id, text) in [(1, format!("/link {code}")), (2, "hello".into())] {
+            ingress
+                .handle(serde_json::from_value(serde_json::json!({
+                    "update_id": update_id,
+                    "message": {
+                        "message_id": update_id,
+                        "from": {"id": 100, "is_bot": false},
+                        "chat": {"id": 100, "type": "private"},
+                        "text": text
+                    }
+                }))?)
+                .await?;
+        }
+
+        assert!(matches!(
+            store
+                .ingest_webhook(
+                    NewWebhookEvent {
+                        endpoint: "grafana".into(),
+                        actor_id: actor,
+                        idempotency: WebhookIdempotency::Explicit([7; 32]),
+                        payload_json: "{}".into(),
+                    },
+                    Timestamp(21),
+                )
+                .await?,
+            WebhookIngressOutcome::Accepted {
+                route_snapshotted: true,
+                ..
+            }
+        ));
         Ok(())
     }
 }
