@@ -19,6 +19,7 @@ mod local_ingress;
 mod outbox;
 pub mod recovery;
 mod retry;
+mod webhook;
 
 pub const RUNTIME_SCHEMA_VERSION: u32 = 7;
 
