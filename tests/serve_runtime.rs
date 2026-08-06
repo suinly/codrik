@@ -686,39 +686,43 @@ impl InjectedHarness {
             .await
         }));
         let probe_request = request_id();
-        let readiness = tokio::time::timeout(Duration::from_secs(10), async {
+        let socket = self.socket.clone();
+        let readiness = tokio::time::timeout(Duration::from_secs(10), async move {
             loop {
-                if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+                let socket = socket.clone();
+                let probe_request = probe_request.clone();
+                let ready = tokio::task::spawn_blocking(move || {
+                    let Ok(mut stream) = UnixStream::connect(socket) else {
+                        return false;
+                    };
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-                    if send_frame(
+                    send_frame(
                         &mut stream,
-                        json!({"type":"resume","request_id":probe_request.clone()}),
+                        json!({"type":"resume","request_id":probe_request}),
                     )
                     .is_ok()
                         && wait_for_type(&mut stream, "request_error").is_ok()
-                    {
-                        return;
-                    }
+                })
+                .await
+                .unwrap_or(false);
+                if ready {
+                    return;
                 }
                 tokio::task::yield_now().await;
             }
-        })
-        .await;
-        if readiness.is_err() {
-            if self
-                .task
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
-            {
-                let result = self.task.take().expect("finished task").await;
+        });
+        let task = self.task.as_mut().expect("injected runtime task");
+        tokio::select! {
+            readiness = readiness => readiness.context("injected runtime readiness")?,
+            result = task => {
+                self.task = None;
                 return match result {
                     Ok(Ok(())) => bail!("injected runtime exited before readiness"),
                     Ok(Err(error)) => Err(error).context("injected runtime startup failed"),
                     Err(error) => Err(error).context("injected runtime task failed"),
                 };
             }
-            readiness.context("injected runtime readiness")?;
         }
         Ok(())
     }

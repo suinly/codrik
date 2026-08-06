@@ -1538,7 +1538,7 @@ mod tests {
         let address = unused_tcp_address()?;
         let llm = RecordingLlm::default();
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let task = {
+        let mut task = {
             let llm = llm.clone();
             let shutdown = shutdown.clone();
             let home = home.clone();
@@ -1627,14 +1627,41 @@ mod tests {
                 ))
             })
             .await?;
-        let duplicate = client
+        let duplicate_request = client
             .post(format!("http://{address}/webhooks/events"))
             .header("authorization", "Bearer secret")
             .header("content-type", "application/json")
             .header("idempotency-key", "alert-7")
             .body(r#"{"status":"resolved"}"#)
-            .send()
-            .await?;
+            .send();
+        tokio::pin!(duplicate_request);
+        let duplicate = tokio::select! {
+            result = &mut task => {
+                return match result {
+                    Ok(Ok(())) => bail!("runtime exited before duplicate webhook request"),
+                    Ok(Err(error)) => Err(error).context("runtime failed before duplicate webhook request"),
+                    Err(error) => Err(error).context("runtime task failed before duplicate webhook request"),
+                };
+            }
+            response = &mut duplicate_request => match response {
+                Ok(response) => response,
+                Err(request_error) => {
+                    return match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        &mut task,
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(()))) => bail!("runtime exited before duplicate webhook request"),
+                        Ok(Ok(Err(error))) => Err(error)
+                            .context("runtime failed before duplicate webhook request"),
+                        Ok(Err(error)) => Err(error)
+                            .context("runtime task failed before duplicate webhook request"),
+                        Err(_) => Err(request_error.into()),
+                    };
+                }
+            },
+        };
         assert_eq!(duplicate.status(), reqwest::StatusCode::ACCEPTED);
         assert!(duplicate.bytes().await?.is_empty());
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

@@ -36,8 +36,8 @@ impl FailureStore for SqliteRuntimeStore {
             let error = error.clone();
             let clock = clock.clone();
             async move {
-                let now = clock.now();
                 store.connection.call(move |connection| -> Result<FailureDisposition> {
+                    let now = clock.now();
                     let transaction = connection.transaction_with_behavior(
                         tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                     )?;
@@ -188,8 +188,8 @@ impl FailureStore for SqliteRuntimeStore {
             let fence = fence.clone();
             let clock = clock.clone();
             async move {
-                let now = clock.now();
                 store.connection.call(move |connection| -> Result<()> {
+                    let now = clock.now();
                     let transaction = connection.transaction_with_behavior(
                         tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                     )?;
