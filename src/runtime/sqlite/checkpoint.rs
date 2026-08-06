@@ -296,6 +296,30 @@ impl ToolAttemptStore for SqliteRuntimeStore {
         transition_attempt(self, run, id, "prepared", "running", None, now).await
     }
 
+    async fn reject_prepared_attempt(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        outcome: AttemptOutcome,
+        now: Timestamp,
+    ) -> Result<()> {
+        let next_state = match &outcome {
+            AttemptOutcome::Succeeded { .. } => bail!("rejected attempt cannot succeed"),
+            AttemptOutcome::FailedKnown { .. } => "failed_known",
+            AttemptOutcome::CancelledKnown => "cancelled_known",
+        };
+        transition_attempt(
+            self,
+            run,
+            id,
+            "prepared",
+            next_state,
+            Some(serde_json::to_string(&outcome)?),
+            now,
+        )
+        .await
+    }
+
     async fn finish_attempt(
         &self,
         run: &AttachedRun,
@@ -1280,6 +1304,38 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, run)
+    }
+
+    #[tokio::test]
+    async fn reject_prepared_attempt_finishes_without_running_transition() -> anyhow::Result<()> {
+        let (store, run) = store_with_run().await;
+        let attempt = store
+            .prepare_attempt(
+                &run,
+                NewToolAttempt {
+                    id: crate::runtime::model::AttemptId::new(),
+                    tool_call_id: "policy-rejected".into(),
+                    tool_name: "skills_update".into(),
+                    arguments_json: "{}".into(),
+                    capabilities: crate::agent::tool::ToolCapabilities::read_only(),
+                },
+                Timestamp(110),
+            )
+            .await?;
+        store.fail_next_tool_start_for_test();
+        let outcome = AttemptOutcome::FailedKnown {
+            message: "tool is not allowed for this event: skills_update".into(),
+        };
+
+        store
+            .reject_prepared_attempt(&run, &attempt.id, outcome.clone(), Timestamp(111))
+            .await?;
+
+        assert_eq!(
+            store.recover_attempt(&attempt.id).await?,
+            AttemptRecovery::Terminal(outcome)
+        );
+        Ok(())
     }
 
     #[tokio::test]

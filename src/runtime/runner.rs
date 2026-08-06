@@ -233,16 +233,37 @@ where
         let context = RunContext::new();
         let mut tool_steps = 0;
         for attempt in self.store.unresolved_attempts(&run).await? {
+            let recovery = self.store.recover_attempt(&attempt.id).await?;
             if !run.execution_policy.allows(&attempt.tool_name) {
-                let outcome = AttemptOutcome::FailedKnown {
-                    message: format!("tool is not allowed for this event: {}", attempt.tool_name),
+                let outcome = match recovery {
+                    AttemptRecovery::MayInvoke => {
+                        let outcome = AttemptOutcome::FailedKnown {
+                            message: format!(
+                                "tool is not allowed for this event: {}",
+                                attempt.tool_name
+                            ),
+                        };
+                        self.store
+                            .reject_prepared_attempt(
+                                &run,
+                                &attempt.id,
+                                outcome.clone(),
+                                self.clock.now(),
+                            )
+                            .await?;
+                        outcome
+                    }
+                    AttemptRecovery::Terminal(outcome) => outcome,
+                    AttemptRecovery::OutcomeUnknown => {
+                        if attempt.state != crate::runtime::model::AttemptState::WaitingForDecision
+                        {
+                            self.store
+                                .block_unknown_attempt(&run, &attempt.id, self.clock.now())
+                                .await?;
+                        }
+                        return Ok(RunOnceOutcome::WaitingForDecision);
+                    }
                 };
-                self.store
-                    .mark_attempt_running(&run, &attempt.id, self.clock.now())
-                    .await?;
-                self.store
-                    .finish_attempt(&run, &attempt.id, outcome.clone(), self.clock.now())
-                    .await?;
                 let assistant = Message::assistant_tool_calls(
                     "",
                     vec![LlmToolCall {
@@ -279,7 +300,6 @@ where
                 messages.extend(recovered_messages);
                 continue;
             }
-            let recovery = self.store.recover_attempt(&attempt.id).await?;
             let outcome = match recovery {
                 AttemptRecovery::MayInvoke => {
                     if tool_steps >= self.limits.max_tool_steps {
@@ -970,6 +990,19 @@ mod tests {
         requests: Arc<Mutex<Vec<LlmRequest>>>,
     }
 
+    #[derive(Clone)]
+    struct RetryCapturingLlm {
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<LlmRequest>>>,
+    }
+
+    #[derive(Clone)]
+    struct PreemptingCapturingLlm {
+        store: SqliteRuntimeStore,
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<LlmRequest>>>,
+    }
+
     #[async_trait]
     impl LlmStreamClient for CapturingScriptedLlm {
         async fn stream(
@@ -980,6 +1013,56 @@ mod tests {
         ) -> Result<LlmResponse> {
             self.requests.lock().await.push(request);
             Ok(self.responses.lock().await.pop_front().unwrap())
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for RetryCapturingLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.requests.lock().await.push(request);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("retry me")
+            }
+            Ok(LlmResponse {
+                content: "done".into(),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmStreamClient for PreemptingCapturingLlm {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+            _sink: &mut dyn LlmStreamSink,
+            _context: &RunContext,
+        ) -> Result<LlmResponse> {
+            self.requests.lock().await.push(request);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.store
+                    .ingest(
+                        NewInboundEvent::text(
+                            "local",
+                            "preempt-skills-only",
+                            "local",
+                            "owner",
+                            Audience::ActorPrivate,
+                            "new context",
+                        )?,
+                        Timestamp(3),
+                    )
+                    .await?;
+            }
+            Ok(LlmResponse {
+                content: "done".into(),
+                tool_calls: vec![],
+            })
         }
     }
 
@@ -1240,7 +1323,11 @@ mod tests {
                         id: "actor:local:1".into(),
                         enabled: true,
                         tools: tools.iter().map(|tool| (*tool).into()).collect(),
-                        identities: Vec::new(),
+                        identities: vec![IdentitySeed {
+                            provider: "local".into(),
+                            subject: "owner".into(),
+                            username: None,
+                        }],
                     }],
                 },
                 Timestamp(1),
@@ -1265,16 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn skills_only_model_definitions_intersect_actor_grants() -> Result<()> {
         for (actor_tools, expected) in [
-            (
-                vec![
-                    "skills_list",
-                    "skills_read",
-                    "skills_create",
-                    "skills_update",
-                    "datetime",
-                ],
-                vec!["skills_list", "skills_read"],
-            ),
+            (vec!["*"], vec!["skills_list", "skills_read"]),
             (vec!["skills_read", "datetime"], vec!["skills_read"]),
             (vec!["datetime"], vec![]),
         ] {
@@ -1289,7 +1367,17 @@ mod tests {
                     requests: requests.clone(),
                 },
                 SkillsPolicyTools {
-                    names: actor_tools,
+                    names: if actor_tools == ["*"] {
+                        vec![
+                            "skills_list",
+                            "skills_read",
+                            "skills_create",
+                            "skills_update",
+                            "datetime",
+                        ]
+                    } else {
+                        actor_tools
+                    },
                     ..Default::default()
                 },
                 ActorSignals::default(),
@@ -1437,6 +1525,7 @@ mod tests {
             )
             .await?;
         store.release_lease(&lease).await?;
+        store.fail_next_tool_start_for_test();
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let runner = ActorRunner::new(
             FinalLlm,
@@ -1458,6 +1547,210 @@ mod tests {
                 message: "tool is not allowed for this event: skills_update".into()
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_only_checkpoint_failure_recovers_terminal_forbidden_attempt() -> Result<()> {
+        let store = store_with_skills_only(&["skills_update"]).await;
+        let lease = store
+            .acquire_ready_actor("seed", Timestamp(10), Timestamp(1_000))
+            .await?
+            .unwrap();
+        let run = store
+            .attach_next_run(&lease, 8, Timestamp(11))
+            .await?
+            .unwrap();
+        store
+            .checkpoint_run(
+                crate::runtime::store::CheckpointRun {
+                    run: run.clone(),
+                    incorporated_event_ids: run.source_event_ids.clone(),
+                    checkpointed_attempt_ids: vec![],
+                    messages: run.messages.clone(),
+                },
+                Timestamp(12),
+            )
+            .await?;
+        let attempt = store
+            .prepare_attempt(
+                &run,
+                NewToolAttempt {
+                    id: AttemptId::new(),
+                    tool_call_id: "terminal-forbidden".into(),
+                    tool_name: "skills_update".into(),
+                    arguments_json: "{}".into(),
+                    capabilities: ToolCapabilities::read_only(),
+                },
+                Timestamp(13),
+            )
+            .await?;
+        store
+            .mark_attempt_running(&run, &attempt.id, Timestamp(14))
+            .await?;
+        store
+            .finish_attempt(
+                &run,
+                &attempt.id,
+                AttemptOutcome::FailedKnown {
+                    message: "tool is not allowed for this event: skills_update".into(),
+                },
+                Timestamp(15),
+            )
+            .await?;
+        store.release_lease(&lease).await?;
+        store.fail_next_tool_start_for_test();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            CapturingScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                }]))),
+                requests: requests.clone(),
+            },
+            SkillsPolicyTools {
+                names: vec!["skills_update"],
+                calls: calls.clone(),
+            },
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_001)),
+        );
+
+        assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(requests.lock().await[0].messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message
+                    .text()
+                    .contains("tool is not allowed for this event: skills_update")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_only_retry_never_widens_model_definitions() -> Result<()> {
+        let store = store_with_skills_only(&["*"]).await;
+        let clock = ManualClock::new(1_000);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            RetryCapturingLlm {
+                calls: Arc::new(AtomicUsize::new(0)),
+                requests: requests.clone(),
+            },
+            SkillsPolicyTools {
+                names: vec![
+                    "skills_list",
+                    "skills_read",
+                    "skills_create",
+                    "skills_update",
+                    "datetime",
+                ],
+                ..Default::default()
+            },
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, clock.clone()),
+        );
+        let actor = ActorId::from_string("actor:local:1");
+
+        assert!(runner.run_quantum(&actor, "worker-1").await.is_err());
+        clock.advance(1_001);
+        assert_eq!(
+            runner
+                .run_quantum(&actor, "worker-2")
+                .await
+                .unwrap()
+                .outcome,
+            RunOnceOutcome::Completed
+        );
+        for request in requests.lock().await.iter() {
+            assert_eq!(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["skills_list", "skills_read"]
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_only_preemption_never_widens_model_definitions() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        store
+            .seed_actors_for_test(
+                ActorSeedSet {
+                    actors: vec![ActorSeed {
+                        id: "actor:local:1".into(),
+                        enabled: true,
+                        tools: vec!["*".into()],
+                        identities: vec![IdentitySeed {
+                            provider: "local".into(),
+                            subject: "owner".into(),
+                            username: None,
+                        }],
+                    }],
+                },
+                Timestamp(1),
+            )
+            .await?;
+        store
+            .ingest(
+                NewInboundEvent::text(
+                    "local",
+                    "initial-skills-only",
+                    "local",
+                    "owner",
+                    Audience::ActorPrivate,
+                    "initial",
+                )?
+                .with_execution_policy(ExecutionPolicy::SkillsOnly),
+                Timestamp(2),
+            )
+            .await?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runner = ActorRunner::new(
+            PreemptingCapturingLlm {
+                store: store.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                requests: requests.clone(),
+            },
+            SkillsPolicyTools {
+                names: vec![
+                    "skills_list",
+                    "skills_read",
+                    "skills_create",
+                    "skills_update",
+                    "datetime",
+                ],
+                ..Default::default()
+            },
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            RunnerLimits::default(),
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+
+        assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["skills_list", "skills_read"]
+            );
+        }
         Ok(())
     }
 

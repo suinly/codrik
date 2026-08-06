@@ -993,6 +993,13 @@ pub trait ToolAttemptStore: Send + Sync {
         id: &AttemptId,
         now: Timestamp,
     ) -> Result<()>;
+    async fn reject_prepared_attempt(
+        &self,
+        run: &AttachedRun,
+        id: &AttemptId,
+        outcome: AttemptOutcome,
+        now: Timestamp,
+    ) -> Result<()>;
     async fn finish_attempt(
         &self,
         run: &AttachedRun,
