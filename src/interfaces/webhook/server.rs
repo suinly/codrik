@@ -146,11 +146,16 @@ where
     let Some(endpoint) = state.endpoints.get(request.uri().path()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(candidate) = request
-        .headers()
-        .get("authorization")
-        .map(|value| value.as_bytes())
-        .and_then(|value| value.strip_prefix(b"Bearer "))
+    let mut authorization = request.headers().get_all("authorization").iter();
+    let Some(value) = authorization.next() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if authorization.next().is_some() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(candidate) = value
+        .as_bytes()
+        .strip_prefix(b"Bearer ")
         .filter(|value| !value.is_empty())
     else {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -375,6 +380,27 @@ mod tests {
             .await?;
         assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
         assert!(accepted.bytes().await?.is_empty());
+        shutdown.send_replace(true);
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_authorization_headers() -> Result<()> {
+        let (base, shutdown, task) = spawn().await?;
+        let client = reqwest::Client::new();
+        for second_value in ["Bearer wrong", "Bearer secret"] {
+            let response = client
+                .post(format!("{base}/webhooks/grafana"))
+                .header("authorization", "Bearer secret")
+                .header("authorization", second_value)
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+            assert!(response.bytes().await?.is_empty());
+        }
         shutdown.send_replace(true);
         task.await??;
         Ok(())
