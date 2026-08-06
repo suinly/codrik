@@ -574,6 +574,8 @@ impl DispatchStore for SqliteRuntimeStore {
                     request_ids,
                     audience: decode_audience(&audience_kind, audience_address)?,
                     delivery_route,
+                    execution_policy: crate::runtime::model::ExecutionPolicy::ActorTools,
+                    ingress_source: None,
                     messages,
                 }))
             },
@@ -1155,6 +1157,8 @@ mod tests {
                     kind: EventKind::CancelRequested,
                     audience: Audience::ActorPrivate,
                     delivery_route: None,
+                    execution_policy: crate::runtime::model::ExecutionPolicy::ActorTools,
+                    record_latest_telegram_route: false,
                     payload_json: r#"{"type":"cancel"}"#.into(),
                 },
                 Timestamp(200),

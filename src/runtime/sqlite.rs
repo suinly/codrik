@@ -20,7 +20,7 @@ mod outbox;
 pub mod recovery;
 mod retry;
 
-pub const RUNTIME_SCHEMA_VERSION: u32 = 6;
+pub const RUNTIME_SCHEMA_VERSION: u32 = 7;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_runtime.sql");
 const SERVE_MIGRATION: &str = include_str!("migrations/0002_serve.sql");
@@ -28,6 +28,7 @@ const IDENTITY_LINKING_MIGRATION: &str = include_str!("migrations/0003_identity_
 const GATEWAY_MIGRATION: &str = include_str!("migrations/0004_gateway.sql");
 const GATEWAY_FENCING_MIGRATION: &str = include_str!("migrations/0005_gateway_fencing.sql");
 const ACTOR_DELETION_MIGRATION: &str = include_str!("migrations/0006_actor_deletion.sql");
+const GENERIC_WEBHOOK_MIGRATION: &str = include_str!("migrations/0007_generic_webhook.sql");
 
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
@@ -87,6 +88,7 @@ impl SqliteRuntimeStore {
                         migrate_to_v4(connection)?;
                         migrate_to_v5(connection)?;
                         migrate_to_v6(connection)?;
+                        migrate_to_v7(connection)?;
                     }
                     1 => {
                         migrate_to_v2(connection)?;
@@ -94,24 +96,32 @@ impl SqliteRuntimeStore {
                         migrate_to_v4(connection)?;
                         migrate_to_v5(connection)?;
                         migrate_to_v6(connection)?;
+                        migrate_to_v7(connection)?;
                     }
                     2 => {
                         migrate_to_v3(connection)?;
                         migrate_to_v4(connection)?;
                         migrate_to_v5(connection)?;
                         migrate_to_v6(connection)?;
+                        migrate_to_v7(connection)?;
                     }
                     3 => {
                         migrate_to_v4(connection)?;
                         migrate_to_v5(connection)?;
                         migrate_to_v6(connection)?;
+                        migrate_to_v7(connection)?;
                     }
                     4 => {
                         migrate_to_v5(connection)?;
                         migrate_to_v6(connection)?;
+                        migrate_to_v7(connection)?;
                     }
-                    5 => migrate_to_v6(connection)?,
-                    6 => {}
+                    5 => {
+                        migrate_to_v6(connection)?;
+                        migrate_to_v7(connection)?;
+                    }
+                    6 => migrate_to_v7(connection)?,
+                    7 => {}
                     other => anyhow::bail!("unsupported runtime schema version: {other}"),
                 }
                 connection.execute_batch("PRAGMA busy_timeout = 0;")?;
@@ -309,6 +319,24 @@ fn migrate_to_v6(connection: &mut tokio_rusqlite::rusqlite::Connection) -> Resul
     Ok(())
 }
 
+fn migrate_to_v7(connection: &mut tokio_rusqlite::rusqlite::Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(GENERIC_WEBHOOK_MIGRATION)?;
+    let foreign_key_errors = {
+        let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
+        statement
+            .query([])?
+            .mapped(|row| row.get::<_, String>(0))
+            .count()
+    };
+    if foreign_key_errors != 0 {
+        anyhow::bail!("schema v7 migration left {foreign_key_errors} foreign key violations");
+    }
+    transaction.execute_batch("PRAGMA user_version = 7;")?;
+    transaction.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct V2Probe {
@@ -337,7 +365,7 @@ mod tests {
     use tokio_rusqlite::{Connection, rusqlite::OptionalExtension};
     use uuid::Uuid;
 
-    use super::{INITIAL_MIGRATION, SqliteRuntimeStore};
+    use super::{INITIAL_MIGRATION, RUNTIME_SCHEMA_VERSION, SqliteRuntimeStore};
 
     struct TempDb {
         path: PathBuf,
@@ -521,13 +549,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_database_includes_generic_webhook_schema() -> Result<()> {
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let (_, tables) = store.schema_probe().await?;
+        let (version, event_policy, run_policy, foreign_key_errors) = store
+            .connection
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<(i64, String, String, usize)> {
+                let scalar = |sql: &str| connection.query_row(sql, [], |row| row.get::<_, i64>(0));
+                let foreign_key_errors = connection.query_row(
+                    "SELECT count(*) FROM pragma_foreign_key_check",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
+                Ok((
+                    scalar("PRAGMA user_version")?,
+                    connection.query_row(
+                        "SELECT dflt_value FROM pragma_table_info('events') WHERE name = 'execution_policy'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT dflt_value FROM pragma_table_info('runs') WHERE name = 'execution_policy'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    foreign_key_errors,
+                ))
+            })
+            .await?;
+
+        assert_eq!(version, 7);
+        assert_eq!(event_policy, "'actor_tools'");
+        assert_eq!(run_policy, "'actor_tools'");
+        assert_eq!(foreign_key_errors, 0);
+        for table in [
+            "webhook_receipts",
+            "actor_latest_telegram_routes",
+            "deferred_webhook_results",
+        ] {
+            assert!(tables.contains(&table.to_string()), "missing {table}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fresh_database_applies_v1_then_v2_with_foreign_key_integrity() -> Result<()> {
         let store = SqliteRuntimeStore::open_in_memory().await?;
         let (foreign_keys, tables) = store.schema_probe().await?;
         let probe = store.v2_probe().await?;
 
         assert!(foreign_keys);
-        assert_eq!(probe.user_version, 6);
+        assert_eq!(probe.user_version, RUNTIME_SCHEMA_VERSION as i64);
         assert_eq!(probe.foreign_key_errors, 0);
         assert!(!tables.contains(&"runtime_metadata".to_string()));
         for table in [
@@ -582,7 +654,7 @@ mod tests {
             .await?;
 
         assert!(foreign_keys);
-        assert_eq!(version, 6);
+        assert_eq!(version, RUNTIME_SCHEMA_VERSION as i64);
         assert!(tables.contains(&"identity_link_codes".to_string()));
         assert!(tables.contains(&"identity_link_attempts".to_string()));
         Ok(())
@@ -630,7 +702,7 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(counts, (1_i64, 1_i64, 6_i64));
+        assert_eq!(counts, (1_i64, 1_i64, RUNTIME_SCHEMA_VERSION as i64));
         Ok(())
     }
 
@@ -696,7 +768,10 @@ mod tests {
             })
             .await?;
 
-        assert_eq!((probe.0, probe.1, probe.2), (6, 1, 1));
+        assert_eq!(
+            (probe.0, probe.1, probe.2),
+            (RUNTIME_SCHEMA_VERSION as i64, 1, 1)
+        );
         for table in ["gateway_commands", "gateway_deliveries", "gateway_streams"] {
             assert!(probe.3.contains(&table.to_string()), "missing {table}");
         }
@@ -726,7 +801,7 @@ mod tests {
         let store = SqliteRuntimeStore::open(db.path()).await?;
         let probe = store.v2_probe().await?;
 
-        assert_eq!(probe.user_version, 6);
+        assert_eq!(probe.user_version, RUNTIME_SCHEMA_VERSION as i64);
         assert_eq!(probe.archived_outbox, 7);
         assert_eq!(probe.archived_outbox_states, 7);
         assert_eq!(probe.archived_unmanaged_files, 1);

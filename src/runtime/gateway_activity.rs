@@ -88,6 +88,8 @@ mod tests {
             request_ids: vec![RequestId::new()],
             audience: Audience::ActorPrivate,
             delivery_route: route,
+            execution_policy: crate::runtime::model::ExecutionPolicy::ActorTools,
+            ingress_source: None,
             messages: Vec::new(),
         }
     }

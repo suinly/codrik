@@ -29,6 +29,7 @@ impl IngressStore for SqliteRuntimeStore {
             None => (None, None, None, None, None),
         };
         let kind = encode_event_kind(event.kind);
+        let execution_policy = encode_execution_policy(event.execution_policy);
         self.connection
             .call(move |connection| -> tokio_rusqlite::rusqlite::Result<IngressOutcome> {
                 let transaction = connection
@@ -102,10 +103,10 @@ impl IngressStore for SqliteRuntimeStore {
                         id, actor_id, work_item_id, mailbox_sequence, gateway, external_id,
                         kind, audience_kind, audience_address, delivery_gateway,
                         delivery_address, reply_to_external_id, delivery_max_text_chars,
-                        delivery_max_caption_chars, payload_json, state, created_at, updated_at
+                        delivery_max_caption_chars, execution_policy, payload_json, state, created_at, updated_at
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, 'pending', ?16, ?16
+                        ?13, ?14, ?15, ?16, 'pending', ?17, ?17
                      )",
                     params![
                         event_id.as_str(),
@@ -122,6 +123,7 @@ impl IngressStore for SqliteRuntimeStore {
                         reply_to_external_id,
                         delivery_max_text_chars,
                         delivery_max_caption_chars,
+                        execution_policy,
                         event.payload_json,
                         now.0,
                     ],
@@ -158,6 +160,13 @@ fn encode_event_kind(kind: crate::runtime::model::EventKind) -> &'static str {
         crate::runtime::model::EventKind::UserMessage => "user_message",
         crate::runtime::model::EventKind::CancelRequested => "cancel_requested",
         crate::runtime::model::EventKind::ExternalCompletion => "external_completion",
+    }
+}
+
+fn encode_execution_policy(policy: crate::runtime::model::ExecutionPolicy) -> &'static str {
+    match policy {
+        crate::runtime::model::ExecutionPolicy::ActorTools => "actor_tools",
+        crate::runtime::model::ExecutionPolicy::SkillsOnly => "skills_only",
     }
 }
 

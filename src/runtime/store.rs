@@ -395,6 +395,8 @@ pub struct NewInboundEvent {
     pub kind: EventKind,
     pub audience: Audience,
     pub delivery_route: Option<DeliveryRoute>,
+    pub execution_policy: ExecutionPolicy,
+    pub record_latest_telegram_route: bool,
     pub payload_json: String,
 }
 
@@ -459,9 +461,58 @@ impl NewInboundEvent {
             kind: EventKind::UserMessage,
             audience,
             delivery_route,
+            execution_policy: ExecutionPolicy::ActorTools,
+            record_latest_telegram_route: false,
             payload_json,
         })
     }
+
+    pub fn with_execution_policy(mut self, execution_policy: ExecutionPolicy) -> Self {
+        self.execution_policy = execution_policy;
+        self
+    }
+
+    pub fn with_latest_telegram_route_tracking(mut self) -> Self {
+        self.record_latest_telegram_route = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebhookIdempotency {
+    Explicit([u8; 32]),
+    Automatic([u8; 32]),
+}
+
+#[derive(Clone, Debug)]
+pub struct NewWebhookEvent {
+    pub endpoint: String,
+    pub actor_id: ActorId,
+    pub idempotency: WebhookIdempotency,
+    pub payload_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebhookIngressOutcome {
+    Accepted {
+        event_id: EventId,
+        work_item_id: WorkItemId,
+        sequence: i64,
+        route_snapshotted: bool,
+    },
+    Duplicate {
+        event_id: EventId,
+    },
+    ActorUnavailable,
+}
+
+#[async_trait]
+pub trait WebhookIngressStore: Send + Sync {
+    async fn ingest_webhook(
+        &self,
+        event: NewWebhookEvent,
+        now: Timestamp,
+    ) -> Result<WebhookIngressOutcome>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,6 +684,8 @@ pub struct AttachedRun {
     pub request_ids: Vec<RequestId>,
     pub audience: Audience,
     pub delivery_route: Option<DeliveryRoute>,
+    pub execution_policy: ExecutionPolicy,
+    pub ingress_source: Option<String>,
     pub messages: Vec<Message>,
 }
 

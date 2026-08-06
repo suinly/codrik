@@ -534,6 +534,8 @@ mod tests {
             request_ids: Vec::new(),
             audience: Audience::ActorPrivate,
             delivery_route: None,
+            execution_policy: crate::runtime::model::ExecutionPolicy::ActorTools,
+            ingress_source: None,
             messages: Vec::new(),
         };
         Ok((root, store, run))

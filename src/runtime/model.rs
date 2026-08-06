@@ -109,11 +109,57 @@ impl Timestamp {
     pub fn plus_millis(self, millis: i64) -> Self {
         Self(self.0.saturating_add(millis))
     }
+
+    pub fn to_rfc3339_utc(self) -> anyhow::Result<String> {
+        if self.0 < 0 {
+            anyhow::bail!("timestamp must not be before Unix epoch");
+        }
+        let days = self.0 / 86_400_000;
+        let day_millis = self.0 % 86_400_000;
+        let (year, month, day) = civil_date_from_unix_days(days);
+        if year > 9999 {
+            anyhow::bail!("timestamp year exceeds RFC3339 four-digit range");
+        }
+        let hour = day_millis / 3_600_000;
+        let minute = day_millis % 3_600_000 / 60_000;
+        let second = day_millis % 60_000 / 1_000;
+        let millis = day_millis % 1_000;
+        Ok(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+        ))
+    }
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 #[cfg(test)]
 mod timestamp_tests {
     use super::Timestamp;
+
+    #[test]
+    fn formats_rfc3339_utc() -> anyhow::Result<()> {
+        assert_eq!(Timestamp(0).to_rfc3339_utc()?, "1970-01-01T00:00:00.000Z");
+        assert_eq!(Timestamp(1).to_rfc3339_utc()?, "1970-01-01T00:00:00.001Z");
+        assert_eq!(
+            Timestamp(1_709_164_800_000).to_rfc3339_utc()?,
+            "2024-02-29T00:00:00.000Z"
+        );
+        assert!(Timestamp(-1).to_rfc3339_utc().is_err());
+        Ok(())
+    }
 
     #[test]
     fn plus_millis_saturates_synthetic_overflow() {
@@ -163,10 +209,22 @@ impl Clock for ManualClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActorId, ArtifactId, BundleId, BundleState, CancelId, DeliveryId, LocalRequestState,
-        MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES, MAX_FINAL_CHUNK_BYTES, MAX_FRAME_BYTES,
-        MAX_MANIFEST_BYTES, MAX_SUBMIT_BYTES, RequestId, WorkItemState,
+        ActorId, ArtifactId, BundleId, BundleState, CancelId, DeliveryId, ExecutionPolicy,
+        LocalRequestState, MAX_BUNDLE_BYTES, MAX_BUNDLE_DELIVERIES, MAX_FINAL_CHUNK_BYTES,
+        MAX_FRAME_BYTES, MAX_MANIFEST_BYTES, MAX_SUBMIT_BYTES, RequestId, WorkItemState,
     };
+
+    #[test]
+    fn skills_only_is_monotonic_and_read_only() {
+        assert_eq!(
+            ExecutionPolicy::ActorTools.intersect(ExecutionPolicy::SkillsOnly),
+            ExecutionPolicy::SkillsOnly
+        );
+        assert!(ExecutionPolicy::SkillsOnly.allows("skills_list"));
+        assert!(ExecutionPolicy::SkillsOnly.allows("skills_read"));
+        assert!(!ExecutionPolicy::SkillsOnly.allows("skills_create"));
+        assert!(!ExecutionPolicy::SkillsOnly.allows("datetime"));
+    }
 
     #[test]
     fn workspace_actor_ids_trim_valid_values() -> anyhow::Result<()> {
@@ -268,6 +326,28 @@ pub enum EventKind {
     UserMessage,
     CancelRequested,
     ExternalCompletion,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPolicy {
+    #[default]
+    ActorTools,
+    SkillsOnly,
+}
+
+impl ExecutionPolicy {
+    pub fn intersect(self, other: Self) -> Self {
+        if matches!(self, Self::SkillsOnly) || matches!(other, Self::SkillsOnly) {
+            Self::SkillsOnly
+        } else {
+            Self::ActorTools
+        }
+    }
+
+    pub fn allows(self, name: &str) -> bool {
+        matches!(self, Self::ActorTools) || matches!(name, "skills_list" | "skills_read")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

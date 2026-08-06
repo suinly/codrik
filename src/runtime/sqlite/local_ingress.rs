@@ -100,9 +100,10 @@ impl LocalIngressStore for SqliteRuntimeStore {
                 transaction.execute(
                     "INSERT INTO events(
                         id, actor_id, work_item_id, mailbox_sequence, gateway, external_id,
-                        kind, audience_kind, audience_address, payload_json, state, created_at, updated_at
+                        kind, audience_kind, audience_address, execution_policy,
+                        payload_json, state, created_at, updated_at
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'user_message',
-                               'actor_private', NULL, ?7, 'pending', ?8, ?8)",
+                               'actor_private', NULL, 'actor_tools', ?7, 'pending', ?8, ?8)",
                     params![
                         event_id.as_str(),
                         actor.as_str(),
