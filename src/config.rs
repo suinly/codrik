@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -21,6 +22,125 @@ pub struct AppConfig {
     pub telegram: Option<TelegramConfig>,
     #[serde(default)]
     pub reticulum: Option<ReticulumConfig>,
+    #[serde(default)]
+    pub webhooks: Option<WebhookConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    #[serde(deserialize_with = "deserialize_strict_string")]
+    pub listen: String,
+    pub endpoints: BTreeMap<String, WebhookEndpointConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookEndpointConfig {
+    #[serde(deserialize_with = "deserialize_strict_string")]
+    pub path: String,
+    #[serde(deserialize_with = "deserialize_strict_string")]
+    pub token: String,
+    #[serde(deserialize_with = "deserialize_strict_string")]
+    pub actor_id: String,
+}
+
+#[derive(Clone)]
+pub struct ValidatedWebhookConfig {
+    pub listen: SocketAddr,
+    pub endpoints: Vec<ValidatedWebhookEndpoint>,
+}
+
+#[derive(Clone)]
+pub struct ValidatedWebhookEndpoint {
+    pub name: String,
+    pub path: String,
+    pub token: String,
+    pub actor_id: crate::runtime::model::ActorId,
+}
+
+impl WebhookConfig {
+    pub fn validate(&self) -> Result<ValidatedWebhookConfig> {
+        let listen = self
+            .listen
+            .parse::<SocketAddr>()
+            .context("webhooks.listen must be a socket address")?;
+        if self.endpoints.is_empty() {
+            bail!("webhooks.endpoints must not be empty");
+        }
+        let mut paths = BTreeSet::new();
+        let mut endpoints = Vec::with_capacity(self.endpoints.len());
+        for (name, endpoint) in &self.endpoints {
+            if name.trim().is_empty() {
+                bail!("webhook endpoint name must not be blank");
+            }
+            if !endpoint.path.starts_with('/')
+                || endpoint.path.contains('?')
+                || endpoint.path.contains('#')
+            {
+                bail!("webhook endpoint path must be absolute without query or fragment");
+            }
+            if !paths.insert(endpoint.path.clone()) {
+                bail!("webhook endpoint paths must be unique");
+            }
+            if endpoint.token.is_empty()
+                || endpoint.token.len() > 256
+                || !endpoint.token.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                bail!("webhook endpoint token has invalid length or characters");
+            }
+            endpoints.push(ValidatedWebhookEndpoint {
+                name: name.clone(),
+                path: endpoint.path.clone(),
+                token: endpoint.token.clone(),
+                actor_id: crate::runtime::model::ActorId::parse_workspace_safe(&endpoint.actor_id)?,
+            });
+        }
+        Ok(ValidatedWebhookConfig { listen, endpoints })
+    }
+}
+
+impl std::fmt::Debug for WebhookConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebhookConfig")
+            .field("listen", &self.listen)
+            .field("endpoints", &self.endpoints)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for WebhookEndpointConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebhookEndpointConfig")
+            .field("path", &self.path)
+            .field("token", &"[REDACTED]")
+            .field("actor_id", &self.actor_id)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ValidatedWebhookConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedWebhookConfig")
+            .field("listen", &self.listen)
+            .field("endpoints", &self.endpoints)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ValidatedWebhookEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedWebhookEndpoint")
+            .field("name", &self.name)
+            .field("path", &self.path)
+            .field("token", &"[REDACTED]")
+            .field("actor_id", &self.actor_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -392,6 +512,75 @@ mod tests {
     use anyhow::Result;
 
     use super::{AppConfig, ImageDetailConfig, ValidatedTelegramIngressConfig};
+
+    #[test]
+    fn webhook_config_may_be_omitted() -> Result<()> {
+        let config: AppConfig =
+            yaml_serde::from_str("api_key: k\nbase_url: https://example.test/v1\nmodel: m\n")?;
+        assert!(config.webhooks.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_config_validates_named_endpoints_and_redacts_tokens() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nwebhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    audit:\n      path: /webhooks/audit\n      token: secret_B-2\n      actor_id: auditor\n    grafana:\n      path: /webhooks/grafana\n      token: secret_A-1\n      actor_id: owner\n",
+        )?;
+
+        let config_debug = format!("{config:?}");
+        assert!(!config_debug.contains("secret_A-1"));
+        assert!(!config_debug.contains("secret_B-2"));
+        let validated = config.webhooks.as_ref().unwrap().validate()?;
+        assert_eq!(validated.listen, "127.0.0.1:8081".parse()?);
+        assert_eq!(validated.endpoints.len(), 2);
+        assert_eq!(validated.endpoints[0].name, "audit");
+        assert_eq!(validated.endpoints[1].name, "grafana");
+        assert_eq!(validated.endpoints[1].actor_id.as_str(), "owner");
+        assert!(!format!("{validated:?}").contains("secret_A-1"));
+        assert!(!format!("{validated:?}").contains("secret_B-2"));
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_config_rejects_duplicate_paths() -> Result<()> {
+        let config: AppConfig = yaml_serde::from_str(
+            "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nwebhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: /hook, token: one, actor_id: owner }\n    b: { path: /hook, token: two, actor_id: owner }\n",
+        )?;
+
+        assert!(config.webhooks.unwrap().validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_config_rejects_invalid_values_and_unknown_fields() {
+        for section in [
+            "webhooks:\n  listen: invalid\n  endpoints:\n    a: { path: /hook, token: one, actor_id: owner }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints: {}",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    ' ': { path: /hook, token: one, actor_id: owner }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: hook, token: one, actor_id: owner }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: '/hook?x=1', token: one, actor_id: owner }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: '/hook#x', token: one, actor_id: owner }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: /hook, token: '', actor_id: owner }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: /hook, token: 'bad token', actor_id: owner }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: /hook, token: one, actor_id: '../owner' }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: /hook, token: one, actor_id: owner, extra: true }",
+            "webhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: { path: /hook, token: one, actor_id: owner }\n  extra: true",
+        ] {
+            let yaml =
+                format!("api_key: k\nbase_url: https://example.test/v1\nmodel: m\n{section}\n");
+            let invalid = yaml_serde::from_str::<AppConfig>(&yaml)
+                .map(|config| config.webhooks.unwrap().validate().is_err())
+                .unwrap_or(true);
+            assert!(invalid, "accepted invalid config:\n{yaml}");
+        }
+
+        let token = "x".repeat(257);
+        let yaml = format!(
+            "api_key: k\nbase_url: https://example.test/v1\nmodel: m\nwebhooks:\n  listen: 127.0.0.1:8081\n  endpoints:\n    a: {{ path: /hook, token: {token}, actor_id: owner }}\n"
+        );
+        let config: AppConfig = yaml_serde::from_str(&yaml).unwrap();
+        assert!(config.webhooks.unwrap().validate().is_err());
+    }
 
     #[test]
     fn reticulum_config_parses_endpoint_and_defaults_python() -> Result<()> {
