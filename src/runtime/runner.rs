@@ -446,21 +446,16 @@ where
                             if let Some(control) = self.store
                                 .newer_control_event(&current_lease, run.observed_sequence, self.clock.now())
                                 .await?
+                                .filter(|control| control.kind == EventKind::CancelRequested)
                             {
                                 context.cancel();
-                                return match control.kind {
-                                    EventKind::CancelRequested => {
-                                        self.store.cancel_run(&run, &control, self.clock.now()).await?;
-                                        advance_progress(progress, QuantumProgress::Finalized);
-                                        self.events.publish_activity(
-                                            &run,
-                                            AgentActivityEvent::Cancelled,
-                                        );
-                                        Ok(RunOnceOutcome::Cancelled)
-                                    }
-                                    EventKind::UserMessage => Ok(RunOnceOutcome::Yielded),
-                                    EventKind::ExternalCompletion => unreachable!(),
-                                };
+                                self.store.cancel_run(&run, &control, self.clock.now()).await?;
+                                advance_progress(progress, QuantumProgress::Finalized);
+                                self.events.publish_activity(
+                                    &run,
+                                    AgentActivityEvent::Cancelled,
+                                );
+                                return Ok(RunOnceOutcome::Cancelled);
                             }
                             anyhow::bail!("model generation exceeded wall-time limit")
                         },
@@ -3129,6 +3124,55 @@ mod tests {
             RunOnceOutcome::Cancelled
         );
         assert_eq!(store.sole_work_failure_count_for_test().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_user_message_at_model_wall_timeout_still_records_failure() -> Result<()> {
+        let store = store_with_text().await;
+        let started = Arc::new(Notify::new());
+        let limits = RunnerLimits {
+            max_wall_time: Duration::from_millis(10),
+            ..RunnerLimits::default()
+        };
+        let runner = ActorRunner::new(
+            BlockingLlm {
+                started: started.clone(),
+            },
+            NoTools,
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            limits,
+            test_artifacts(&store, ManualClock::new(1_000)),
+        );
+        let task = tokio::spawn(async move {
+            runner
+                .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+                .await
+        });
+        started.notified().await;
+        store
+            .ingest(
+                NewInboundEvent::text(
+                    "local",
+                    "queued-during-timeout",
+                    "local",
+                    "owner",
+                    Audience::ActorPrivate,
+                    "new context",
+                )?,
+                Timestamp(3),
+            )
+            .await?;
+        tokio::time::advance(Duration::from_millis(10)).await;
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(crate::runtime::store::QuantumFailure::RecoverableWork {
+                disposition: crate::runtime::store::FailureDisposition::RetryAt(_)
+            })
+        ));
+        assert_eq!(store.sole_work_failure_count_for_test().await?, 1);
         Ok(())
     }
 
