@@ -1552,7 +1552,7 @@ mod tests {
 
     #[tokio::test]
     async fn skills_only_checkpoint_failure_recovers_terminal_forbidden_attempt() -> Result<()> {
-        let store = store_with_skills_only(&["skills_update"]).await;
+        let store = store_with_skills_only(&["*"]).await;
         let lease = store
             .acquire_ready_actor("seed", Timestamp(10), Timestamp(1_000))
             .await?
@@ -1611,7 +1611,13 @@ mod tests {
                 requests: requests.clone(),
             },
             SkillsPolicyTools {
-                names: vec!["skills_update"],
+                names: vec![
+                    "skills_list",
+                    "skills_read",
+                    "skills_create",
+                    "skills_update",
+                    "datetime",
+                ],
                 calls: calls.clone(),
             },
             ActorSignals::default(),
@@ -1622,7 +1628,16 @@ mod tests {
 
         assert_eq!(runner.run_once("worker").await?, RunOnceOutcome::Completed);
         assert!(calls.lock().unwrap().is_empty());
-        assert!(requests.lock().await[0].messages.iter().any(|message| {
+        let requests = requests.lock().await;
+        assert_eq!(
+            requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["skills_list", "skills_read"]
+        );
+        assert!(requests[0].messages.iter().any(|message| {
             message.role == Role::Tool
                 && message
                     .text()
