@@ -867,7 +867,7 @@ mod tests {
         let instructions = agent_instructions_for_tool_config(&tool_config);
 
         assert!(instructions.contains(
-            "- skill-creator (built-in): Use when creating, writing, saving, or updating reusable skills."
+            "- skill-creator (built-in): Use when creating, writing, saving, updating, or deleting reusable skills."
         ));
         assert!(!instructions.contains("# Skill Creator"));
         Ok(())

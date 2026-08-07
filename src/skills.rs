@@ -431,6 +431,9 @@ mod tests {
         assert!(content.contains("# Skill Creator"));
         assert!(content.contains("skills_create"));
         assert!(content.contains("skills_update"));
+        assert!(content.contains("skills_delete"));
+        assert!(content.contains("confirm: true"));
+        assert!(content.contains("differently named replacement"));
         assert!(content.contains("skills_read"));
         Ok(())
     }

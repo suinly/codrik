@@ -18,6 +18,6 @@ const SKILL_CREATOR_FILES: &[BuiltinSkillFile] = &[BuiltinSkillFile {
 
 pub(super) const SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
     name: "skill-creator",
-    description: "Use when creating, writing, saving, or updating reusable skills.",
+    description: "Use when creating, writing, saving, updating, or deleting reusable skills.",
     files: SKILL_CREATOR_FILES,
 }];

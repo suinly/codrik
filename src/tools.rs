@@ -124,6 +124,67 @@ impl ToolExecutor for ToolRegistry {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn update_existing_skill_end_to_end() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "codrik-skill-update-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let skill_dir = root.join("existing-directory");
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: release\ndescription: Old release.\n---\n\n# Old\n",
+        )?;
+        let registry = ToolRegistry::with_allowed_tools_and_config(
+            vec![
+                "skills_list".into(),
+                "skills_update".into(),
+                "skills_read".into(),
+            ],
+            ToolRegistryConfig {
+                skill_roots: vec![crate::skills::SkillRoot::writable(&root, "user")],
+                ..ToolRegistryConfig::default()
+            },
+        );
+        let context = ToolCallContext::legacy(crate::llm::client::RunContext::new());
+
+        let listed = registry.execute("skills_list", "{}", &context).await?;
+        assert_eq!(
+            listed.observation,
+            r#"[{"name":"release","description":"Old release.","source":"user"}]"#
+        );
+
+        let updated = registry
+            .execute(
+                "skills_update",
+                r##"{"name":"release","description":"New release.","body":"---\nname: release\ndescription: New release.\n---\n\n# New\n"}"##,
+                &context,
+            )
+            .await?;
+        assert_eq!(
+            updated.observation,
+            r#"{"name":"release","description":"New release.","source":"user"}"#
+        );
+
+        let read = registry
+            .execute("skills_read", r#"{"name":"release"}"#, &context)
+            .await?;
+        let expected = "---\nname: release\ndescription: New release.\n---\n\n# New\n";
+        assert_eq!(read.observation, expected);
+        assert_eq!(
+            std::fs::read_to_string(skill_dir.join("SKILL.md"))?,
+            expected
+        );
+        assert_eq!(std::fs::read_dir(&root)?.count(), 1);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn definitions_include_datetime() {
         let tools = ToolRegistry::new().definitions();

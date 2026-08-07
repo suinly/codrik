@@ -356,6 +356,19 @@ because doing so could duplicate a message.
   reached Telegram. Inspect the chat before taking manual action to avoid a
   duplicate message.
 
+## Local skills
+
+Codrik discovers project skills from `.codrik/skills`, user skills from
+`~/.codrik/skills`, and compiled built-in skills in that precedence order. It
+exposes `skills_list` and `skills_read` for discovery and reading, plus three
+strict user-skill mutations.
+
+`skills_create` creates only new user skills, `skills_update` replaces only an
+existing writable user's `SKILL.md`, and `skills_delete` permanently removes
+the complete writable user-skill directory only when `confirm` is `true`.
+Project and built-in skills remain read-only. Mutation tools never fall back to
+a different operation.
+
 ## Generic webhook gateway
 
 Generic webhooks are optional authenticated JSON ingress. Each endpoint maps an
