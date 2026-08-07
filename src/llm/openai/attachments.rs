@@ -341,7 +341,8 @@ mod tests {
 
     use super::{
         FILES_API_UNAVAILABLE, OpenAiAttachmentContext, OpenAiClient, ProviderAttachmentKind,
-        classify, metadata_text, provider_has_no_files_api, selected_document_ids,
+        classify, metadata_text, provider_has_no_files_api, safe_attachment_path,
+        selected_document_ids,
     };
 
     fn temp_session_dir(name: &str) -> PathBuf {
