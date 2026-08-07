@@ -49,7 +49,8 @@ impl ToolRegistry {
                 Box::new(skills::SkillsListTool::new(skill_registry.clone())),
                 Box::new(skills::SkillsReadTool::new(skill_registry.clone())),
                 Box::new(skills::SkillsCreateTool::new(skill_registry.clone())),
-                Box::new(skills::SkillsUpdateTool::new(skill_registry)),
+                Box::new(skills::SkillsUpdateTool::new(skill_registry.clone())),
+                Box::new(skills::SkillsDeleteTool::new(skill_registry)),
                 Box::new(bashkit::BashkitTool::new(bashkit::BashkitToolConfig {
                     workspace: actor_workspace.clone(),
                 })),
@@ -139,6 +140,7 @@ mod tests {
         assert!(registry.capabilities("send_file").unwrap().retry_safe);
         assert!(!registry.capabilities("bash").unwrap().retry_safe);
         assert!(!registry.capabilities("skills_update").unwrap().retry_safe);
+        assert!(!registry.capabilities("skills_delete").unwrap().retry_safe);
     }
 
     #[test]
@@ -193,6 +195,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "skills_read"));
         assert!(tools.iter().any(|tool| tool.name == "skills_create"));
         assert!(tools.iter().any(|tool| tool.name == "skills_update"));
+        assert!(tools.iter().any(|tool| tool.name == "skills_delete"));
         let send_file = tools
             .iter()
             .find(|tool| tool.name == "send_file")

@@ -191,6 +191,55 @@ impl ToolHandler for SkillsUpdateTool {
     }
 }
 
+pub struct SkillsDeleteTool {
+    registry: SkillRegistry,
+}
+
+impl SkillsDeleteTool {
+    pub fn new(registry: SkillRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[derive(Deserialize)]
+struct SkillsDeleteArguments {
+    name: String,
+    confirm: bool,
+}
+
+#[async_trait]
+impl ToolHandler for SkillsDeleteTool {
+    fn name(&self) -> &'static str {
+        "skills_delete"
+    }
+
+    fn definition(&self) -> Tool {
+        Tool::new(
+            self.name(),
+            "Permanently delete an existing local user skill directory and all its files. Requires explicit confirmation.",
+            ToolParameters::new()
+                .required(
+                    "name",
+                    ToolParameter::string("Exact existing user skill name."),
+                )
+                .required(
+                    "confirm",
+                    ToolParameter::boolean("Must be true to confirm permanent deletion."),
+                ),
+        )
+    }
+
+    async fn execute(&self, arguments: &str) -> Result<String> {
+        let arguments: SkillsDeleteArguments =
+            serde_json::from_str(arguments).context("failed to parse skills_delete arguments")?;
+        if !arguments.confirm {
+            anyhow::bail!("skills_delete requires confirm: true");
+        }
+
+        serialize_skill(self.registry.delete(&arguments.name)?)
+    }
+}
+
 #[derive(Serialize)]
 struct SkillSummary {
     name: String,
@@ -232,7 +281,7 @@ mod tests {
     use anyhow::Result;
 
     use crate::{
-        agent::tool::ToolHandler,
+        agent::tool::{ToolHandler, ToolParameterKind},
         skills::{SkillRegistry, SkillRoot},
     };
 
@@ -328,6 +377,60 @@ mod tests {
             "---\nname: release\ndescription: Updated release.\n---\n\n# Updated\n"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_requires_true_confirmation_without_mutating() -> Result<()> {
+        let root = temp_root("delete-confirm")?;
+        write_skill(&root, "release", "# Release\n")?;
+        let tool = super::SkillsDeleteTool::new(SkillRegistry::new(vec![SkillRoot::writable(
+            &root, "user",
+        )]));
+
+        assert!(
+            tool.execute(r#"{"name":"release","confirm":false}"#)
+                .await
+                .is_err()
+        );
+        assert!(tool.execute(r#"{"name":"release"}"#).await.is_err());
+        assert!(root.join("release/SKILL.md").is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_returns_deleted_skill_summary() -> Result<()> {
+        let root = temp_root("delete-success")?;
+        write_skill(
+            &root,
+            "release",
+            "---\nname: release\ndescription: Release checklist.\n---\n# Release\n",
+        )?;
+        let tool = super::SkillsDeleteTool::new(SkillRegistry::new(vec![SkillRoot::writable(
+            &root, "user",
+        )]));
+
+        let result = tool.execute(r#"{"name":"release","confirm":true}"#).await?;
+
+        assert_eq!(
+            result,
+            r#"{"name":"release","description":"Release checklist.","source":"user"}"#
+        );
+        assert!(!root.join("release").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_definition_requires_name_and_boolean_confirmation() {
+        let tool = super::SkillsDeleteTool::new(SkillRegistry::new(Vec::new()));
+
+        let definition = tool.definition();
+
+        assert_eq!(definition.name, "skills_delete");
+        assert_eq!(definition.parameters.required, ["name", "confirm"]);
+        assert_eq!(
+            definition.parameters.properties["confirm"].kind,
+            ToolParameterKind::Boolean
+        );
     }
 
     fn write_skill(root: &Path, name: &str, content: &str) -> Result<()> {

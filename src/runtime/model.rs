@@ -223,6 +223,8 @@ mod tests {
         assert!(ExecutionPolicy::SkillsOnly.allows("skills_list"));
         assert!(ExecutionPolicy::SkillsOnly.allows("skills_read"));
         assert!(!ExecutionPolicy::SkillsOnly.allows("skills_create"));
+        assert!(!ExecutionPolicy::SkillsOnly.allows("skills_update"));
+        assert!(!ExecutionPolicy::SkillsOnly.allows("skills_delete"));
         assert!(!ExecutionPolicy::SkillsOnly.allows("datetime"));
     }
 
