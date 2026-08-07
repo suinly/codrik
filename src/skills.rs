@@ -110,6 +110,26 @@ impl SkillRegistry {
         })
     }
 
+    pub fn delete(&self, name: &str) -> Result<Skill> {
+        validate_skill_name(name)?;
+        let discovered = self
+            .discover()?
+            .into_iter()
+            .find(|entry| entry.skill.name == name)
+            .with_context(|| format!("unknown writable skill: {name}"))?;
+        if !discovered.writable {
+            bail!("skill is read-only: {name}");
+        }
+
+        let SkillLocation::Directory(dir) = &discovered.location else {
+            bail!("skill is read-only: {name}");
+        };
+        fs::remove_dir_all(dir)
+            .with_context(|| format!("failed to delete skill directory: {}", dir.display()))?;
+
+        Ok(discovered.skill)
+    }
+
     fn discover(&self) -> Result<Vec<DiscoveredSkill>> {
         let mut discovered = Vec::new();
         let mut seen_names = BTreeSet::new();
@@ -842,6 +862,84 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("unknown writable skill"));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_removes_complete_writable_skill_directory() -> Result<()> {
+        let root = temp_root("delete-writable")?;
+        write_skill(
+            &root,
+            "release",
+            "---\nname: release\ndescription: Release checklist.\n---\n# Release\n",
+        )?;
+        fs::create_dir_all(root.join("release/references/nested"))?;
+        fs::write(root.join("release/references/checklist.md"), "check\n")?;
+        fs::write(
+            root.join("release/references/nested/details.md"),
+            "details\n",
+        )?;
+        write_skill(&root, "deploy", "# Deploy\n")?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+
+        let deleted = registry.delete("release")?;
+
+        assert_eq!(
+            deleted,
+            Skill {
+                name: "release".into(),
+                description: "Release checklist.".into(),
+                source: "user".into(),
+            }
+        );
+        assert!(!root.join("release").exists());
+        assert!(root.join("deploy/SKILL.md").is_file());
+        assert!(registry.read("release", None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_rejects_unknown_and_unsafe_names() -> Result<()> {
+        let root = temp_root("delete-invalid")?;
+        write_skill(&root, "release", "# Release\n")?;
+        let registry = SkillRegistry::new(vec![SkillRoot::writable(&root, "user")]);
+
+        assert!(registry.delete("missing").is_err());
+        assert!(registry.delete("../release").is_err());
+
+        assert!(root.join("release/SKILL.md").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_rejects_read_only_and_builtin_skills() -> Result<()> {
+        let project = temp_root("delete-project")?;
+        write_skill(&project, "release", "# Release\n")?;
+        let project_registry = SkillRegistry::new(vec![SkillRoot::read_only(&project, "project")]);
+        let builtin_registry = SkillRegistry::new(vec![builtin_skill_root()]);
+
+        assert!(project_registry.delete("release").is_err());
+        assert!(builtin_registry.delete("skill-creator").is_err());
+
+        assert!(project.join("release/SKILL.md").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_does_not_reach_user_skill_shadowed_by_project() -> Result<()> {
+        let project = temp_root("delete-shadow-project")?;
+        let user = temp_root("delete-shadow-user")?;
+        write_skill(&project, "release", "# Project Release\n")?;
+        write_skill(&user, "release", "# User Release\n")?;
+        let registry = SkillRegistry::new(vec![
+            SkillRoot::read_only(&project, "project"),
+            SkillRoot::writable(&user, "user"),
+        ]);
+
+        assert!(registry.delete("release").is_err());
+
+        assert!(project.join("release/SKILL.md").is_file());
+        assert!(user.join("release/SKILL.md").is_file());
         Ok(())
     }
 
