@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Result;
 
@@ -22,7 +22,7 @@ use crate::{
         },
         signals::ActorSignals,
         store::{
-            AttachedRun, AttemptOutcome, AttemptRecovery, CheckpointRun, FailureFence,
+            ActorLease, AttachedRun, AttemptOutcome, AttemptRecovery, CheckpointRun, FailureFence,
             FinalizeOutcome, FinalizeRun, NewOutboxIntent, NewToolAttempt, OutboxPayload,
             QuantumFailure, QuantumProgress, QuantumReport, QuantumRunner, RuntimeStore,
         },
@@ -89,6 +89,38 @@ pub enum RunOnceOutcome {
     Yielded,
     Cancelled,
     WaitingForDecision,
+}
+
+enum ExecutionWait<T> {
+    Completed(T),
+    Cancelled,
+    Yielded,
+}
+
+struct ExecutionHeartbeat {
+    lease: tokio::sync::watch::Receiver<ActorLease>,
+    error: tokio::sync::watch::Receiver<Option<String>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    latest_lease: Arc<std::sync::RwLock<ActorLease>>,
+}
+
+#[derive(Debug)]
+struct ExecutionAuthorityError(String);
+
+impl std::fmt::Display for ExecutionAuthorityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ExecutionAuthorityError {}
+
+impl Drop for ExecutionHeartbeat {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
 }
 
 pub struct ActorRunner<L, T, S, C> {
@@ -159,7 +191,7 @@ where
         self.hooks.before_dispatch().await;
         let now = self.clock.now();
         let lease_until = now.plus_millis(duration_millis(self.limits.lease_duration)?);
-        let Some(lease) = self
+        let Some(mut lease) = self
             .store
             .acquire_ready_actor(owner, now, lease_until)
             .await?
@@ -169,9 +201,17 @@ where
         let mut fence = None;
         let mut activity_run = None;
         let mut progress = QuantumProgress::None;
+        let latest_lease = Arc::new(std::sync::RwLock::new(lease.clone()));
         let result = self
-            .run_leased(&lease, &mut fence, &mut activity_run, &mut progress)
+            .run_leased(
+                &mut lease,
+                &mut fence,
+                &mut activity_run,
+                &mut progress,
+                latest_lease.clone(),
+            )
             .await;
+        lease = latest_lease.read().expect("lease state poisoned").clone();
         if result.is_err()
             && let Some(run) = activity_run.as_ref()
         {
@@ -190,19 +230,277 @@ where
         self.clock.now()
     }
 
-    async fn run_leased(
+    fn start_execution_heartbeat(
         &self,
-        lease: &crate::runtime::store::ActorLease,
+        lease: &ActorLease,
+        latest_lease: Arc<std::sync::RwLock<ActorLease>>,
+    ) -> ExecutionHeartbeat {
+        let (lease_sender, lease_receiver) = tokio::sync::watch::channel(lease.clone());
+        let (error_sender, error_receiver) = tokio::sync::watch::channel(None);
+        let store = self.store.clone();
+        let clock = self.clock.clone();
+        let mut lease = lease.clone();
+        let lease_duration = self.limits.lease_duration;
+        let heartbeat_interval = self.limits.heartbeat_interval;
+        let task_latest_lease = latest_lease.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now = clock.now();
+                let lease_until = match duration_millis(lease_duration) {
+                    Ok(millis) => now.plus_millis(millis),
+                    Err(error) => {
+                        error_sender.send_replace(Some(error.to_string()));
+                        return;
+                    }
+                };
+                match store.renew_lease(&lease, now, lease_until).await {
+                    Ok(renewed) => {
+                        lease = renewed.clone();
+                        *task_latest_lease.write().expect("lease state poisoned") = renewed.clone();
+                        lease_sender.send_replace(renewed);
+                    }
+                    Err(error) => {
+                        error_sender.send_replace(Some(error.to_string()));
+                        return;
+                    }
+                }
+            }
+        });
+        ExecutionHeartbeat {
+            lease: lease_receiver,
+            error: error_receiver,
+            task: Some(task),
+            latest_lease,
+        }
+    }
+
+    async fn stop_execution_heartbeat(
+        &self,
+        heartbeat: &mut ExecutionHeartbeat,
+        lease: &mut ActorLease,
+        run: &mut AttachedRun,
+        failure_fence: &mut Option<FailureFence>,
+        activity_run: &mut Option<AttachedRun>,
+    ) -> Result<()> {
+        let Some(task) = heartbeat.task.take() else {
+            return Ok(());
+        };
+        task.abort();
+        let _ = task.await;
+        self.sync_execution_lease(heartbeat, lease, run, failure_fence, activity_run)?;
+        let now = self.clock.now();
+        let lease_duration = duration_millis(self.limits.lease_duration)
+            .map_err(|error| ExecutionAuthorityError(error.to_string()))?;
+        *lease = self
+            .store
+            .renew_lease(lease, now, now.plus_millis(lease_duration))
+            .await
+            .map_err(|error| ExecutionAuthorityError(error.to_string()))?;
+        *heartbeat
+            .latest_lease
+            .write()
+            .expect("lease state poisoned") = lease.clone();
+        run.lease = lease.clone();
+        *failure_fence = Some(FailureFence::from(&*run));
+        *activity_run = Some(run.clone());
+        Ok(())
+    }
+
+    fn sync_execution_lease(
+        &self,
+        heartbeat: &mut ExecutionHeartbeat,
+        lease: &mut ActorLease,
+        run: &mut AttachedRun,
+        failure_fence: &mut Option<FailureFence>,
+        activity_run: &mut Option<AttachedRun>,
+    ) -> Result<()> {
+        if let Some(error) = heartbeat.error.borrow().clone() {
+            return Err(ExecutionAuthorityError(error).into());
+        }
+        *lease = heartbeat.lease.borrow().clone();
+        run.lease = lease.clone();
+        *failure_fence = Some(FailureFence::from(&*run));
+        *activity_run = Some(run.clone());
+        Ok(())
+    }
+
+    async fn execution_timeout(
+        &self,
+        lease: &ActorLease,
+        run: &AttachedRun,
+        progress: &mut QuantumProgress,
+        context: &RunContext,
+    ) -> Result<bool> {
+        context.cancel();
+        if let Some(control) = self
+            .store
+            .newer_control_event(lease, run.observed_sequence, self.clock.now())
+            .await?
+            .filter(|control| control.kind == EventKind::CancelRequested)
+        {
+            self.store
+                .cancel_run(run, &control, self.clock.now())
+                .await?;
+            advance_progress(progress, QuantumProgress::Finalized);
+            self.events
+                .publish_activity(run, AgentActivityEvent::Cancelled);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn execution_boundary(
+        &self,
+        heartbeat: &mut ExecutionHeartbeat,
+        lease: &mut ActorLease,
+        run: &mut AttachedRun,
         failure_fence: &mut Option<FailureFence>,
         activity_run: &mut Option<AttachedRun>,
         progress: &mut QuantumProgress,
+        context: &RunContext,
+        wall_deadline: Pin<&mut tokio::time::Sleep>,
+    ) -> Result<Option<RunOnceOutcome>> {
+        if !wall_deadline.is_elapsed() {
+            self.sync_execution_lease(heartbeat, lease, run, failure_fence, activity_run)?;
+            return Ok(None);
+        }
+        self.stop_execution_heartbeat(heartbeat, lease, run, failure_fence, activity_run)
+            .await?;
+        if self
+            .execution_timeout(lease, run, progress, context)
+            .await?
+        {
+            return Ok(Some(RunOnceOutcome::Cancelled));
+        }
+        anyhow::bail!("model or tool execution exceeded wall-time limit")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn await_execution<F, O>(
+        &self,
+        execution: F,
+        run: &mut AttachedRun,
+        lease: &mut ActorLease,
+        failure_fence: &mut Option<FailureFence>,
+        activity_run: &mut Option<AttachedRun>,
+        progress: &mut QuantumProgress,
+        context: &RunContext,
+        heartbeat: &mut ExecutionHeartbeat,
+        mut wall_deadline: Pin<&mut tokio::time::Sleep>,
+        signal_receiver: &mut tokio::sync::watch::Receiver<i64>,
+    ) -> Result<ExecutionWait<O>>
+    where
+        F: Future<Output = O>,
+    {
+        self.sync_execution_lease(heartbeat, lease, run, failure_fence, activity_run)?;
+        if wall_deadline.as_ref().is_elapsed() {
+            self.stop_execution_heartbeat(heartbeat, lease, run, failure_fence, activity_run)
+                .await?;
+            if self
+                .execution_timeout(lease, run, progress, context)
+                .await?
+            {
+                return Ok(ExecutionWait::Cancelled);
+            }
+            anyhow::bail!("model or tool execution exceeded wall-time limit");
+        }
+        tokio::pin!(execution);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut wall_deadline => {
+                    self.stop_execution_heartbeat(
+                        heartbeat,
+                        lease,
+                        run,
+                        failure_fence,
+                        activity_run,
+                    ).await?;
+                    if self.execution_timeout(lease, run, progress, context).await? {
+                        return Ok(ExecutionWait::Cancelled);
+                    }
+                    anyhow::bail!("model or tool execution exceeded wall-time limit");
+                }
+                _ = heartbeat.error.changed() => {
+                    self.sync_execution_lease(
+                        heartbeat,
+                        lease,
+                        run,
+                        failure_fence,
+                        activity_run,
+                    )?;
+                }
+                execution = &mut execution => {
+                    self.sync_execution_lease(
+                        heartbeat,
+                        lease,
+                        run,
+                        failure_fence,
+                        activity_run,
+                    )?;
+                    return Ok(ExecutionWait::Completed(execution));
+                }
+                changed = signal_receiver.changed() => {
+                    self.sync_execution_lease(
+                        heartbeat,
+                        lease,
+                        run,
+                        failure_fence,
+                        activity_run,
+                    )?;
+                    if changed.is_err() {
+                        continue;
+                    }
+                    if let Some(control) = self.store
+                        .newer_control_event(lease, run.observed_sequence, self.clock.now())
+                        .await?
+                    {
+                        context.cancel();
+                        return match control.kind {
+                            EventKind::CancelRequested => {
+                                self.store.cancel_run(run, &control, self.clock.now()).await?;
+                                advance_progress(progress, QuantumProgress::Finalized);
+                                self.events.publish_activity(
+                                    run,
+                                    AgentActivityEvent::Cancelled,
+                                );
+                                Ok(ExecutionWait::Cancelled)
+                            }
+                            EventKind::UserMessage if wall_deadline.as_ref().is_elapsed() => {
+                                self.stop_execution_heartbeat(
+                                    heartbeat,
+                                    lease,
+                                    run,
+                                    failure_fence,
+                                    activity_run,
+                                ).await?;
+                                if self.execution_timeout(lease, run, progress, context).await? {
+                                    Ok(ExecutionWait::Cancelled)
+                                } else {
+                                    anyhow::bail!("model or tool execution exceeded wall-time limit")
+                                }
+                            }
+                            EventKind::UserMessage => Ok(ExecutionWait::Yielded),
+                            EventKind::ExternalCompletion => unreachable!(),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_leased(
+        &self,
+        lease: &mut ActorLease,
+        failure_fence: &mut Option<FailureFence>,
+        activity_run: &mut Option<AttachedRun>,
+        progress: &mut QuantumProgress,
+        latest_lease: Arc<std::sync::RwLock<ActorLease>>,
     ) -> Result<RunOnceOutcome> {
-        let mut current_lease = lease.clone();
-        let mut heartbeat = tokio::time::interval(self.limits.heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        heartbeat.tick().await;
-        let wall_deadline = tokio::time::sleep(self.limits.max_wall_time);
-        tokio::pin!(wall_deadline);
         let Some(mut run) = self
             .store
             .attach_next_run(lease, self.limits.max_events, self.clock.now())
@@ -231,29 +529,180 @@ where
         self.hooks.incorporation_committed(&run.request_ids).await;
 
         let context = RunContext::new();
-        let mut tool_steps = 0;
-        for attempt in self.store.unresolved_attempts(&run).await? {
-            let recovery = self.store.recover_attempt(&attempt.id).await?;
-            if !run.execution_policy.allows(&attempt.tool_name) {
+        let mut heartbeat = self.start_execution_heartbeat(lease, latest_lease);
+        let wall_deadline = tokio::time::sleep(self.limits.max_wall_time);
+        tokio::pin!(wall_deadline);
+        let mut signal_receiver = self.signals.subscribe(&lease.actor_id).await;
+        let result = async {
+            macro_rules! execution_boundary {
+                () => {
+                    if let Some(outcome) = self
+                        .execution_boundary(
+                            &mut heartbeat,
+                            lease,
+                            &mut run,
+                            failure_fence,
+                            activity_run,
+                            progress,
+                            &context,
+                            wall_deadline.as_mut(),
+                        )
+                        .await?
+                    {
+                        return Ok(outcome);
+                    }
+                };
+            }
+            let mut tool_steps = 0;
+            for attempt in self.store.unresolved_attempts(&run).await? {
+                execution_boundary!();
+                let recovery = self.store.recover_attempt(&attempt.id).await?;
+                if !run.execution_policy.allows(&attempt.tool_name) {
+                    let outcome = match recovery {
+                        AttemptRecovery::MayInvoke => {
+                            let outcome = AttemptOutcome::FailedKnown {
+                                message: format!(
+                                    "tool is not allowed for this event: {}",
+                                    attempt.tool_name
+                                ),
+                            };
+                            self.store
+                                .reject_prepared_attempt(
+                                    &run,
+                                    &attempt.id,
+                                    outcome.clone(),
+                                    self.clock.now(),
+                                )
+                                .await?;
+                            outcome
+                        }
+                        AttemptRecovery::Terminal(outcome) => outcome,
+                        AttemptRecovery::OutcomeUnknown => {
+                            if attempt.state
+                                != crate::runtime::model::AttemptState::WaitingForDecision
+                            {
+                                self.store
+                                    .block_unknown_attempt(&run, &attempt.id, self.clock.now())
+                                    .await?;
+                            }
+                            execution_boundary!();
+                            return Ok(RunOnceOutcome::WaitingForDecision);
+                        }
+                    };
+                    let assistant = Message::assistant_tool_calls(
+                        "",
+                        vec![LlmToolCall {
+                            id: attempt.tool_call_id.clone(),
+                            name: attempt.tool_name,
+                            arguments: attempt.arguments_json,
+                        }],
+                    );
+                    let mut recovered_messages = Vec::new();
+                    if !messages.iter().any(|message| {
+                        message
+                            .tool_calls
+                            .iter()
+                            .any(|call| call.id == attempt.tool_call_id)
+                    }) {
+                        recovered_messages.push(assistant);
+                    }
+                    recovered_messages.push(Message::tool_result(
+                        attempt.tool_call_id,
+                        observation_for_outcome(&outcome),
+                    ));
+                    self.store
+                        .checkpoint_run(
+                            CheckpointRun {
+                                run: run.clone(),
+                                incorporated_event_ids: Vec::new(),
+                                checkpointed_attempt_ids: vec![attempt.id],
+                                messages: recovered_messages.clone(),
+                            },
+                            self.clock.now(),
+                        )
+                        .await?;
+                    advance_progress(progress, QuantumProgress::KnownToolOutcome);
+                    messages.extend(recovered_messages);
+                    continue;
+                }
                 let outcome = match recovery {
                     AttemptRecovery::MayInvoke => {
-                        let outcome = AttemptOutcome::FailedKnown {
-                            message: format!(
-                                "tool is not allowed for this event: {}",
-                                attempt.tool_name
-                            ),
-                        };
+                        if tool_steps >= self.limits.max_tool_steps {
+                            execution_boundary!();
+                            return Ok(RunOnceOutcome::Yielded);
+                        }
+                        tool_steps += 1;
                         self.store
-                            .reject_prepared_attempt(
-                                &run,
-                                &attempt.id,
-                                outcome.clone(),
-                                self.clock.now(),
+                            .mark_attempt_running(&run, &attempt.id, self.clock.now())
+                            .await?;
+                        self.events.publish_activity(
+                            &run,
+                            AgentActivityEvent::ToolStarted {
+                                name: attempt.tool_name.clone(),
+                            },
+                        );
+                        let tool_context = ToolCallContext {
+                            attempt_id: attempt.id.to_string(),
+                            authorized_tools: vec![attempt.tool_name.clone()],
+                            cancellation: context.clone(),
+                        };
+                        let execution = self
+                            .await_execution(
+                                self.tools.execute(
+                                    &attempt.tool_name,
+                                    &attempt.arguments_json,
+                                    &tool_context,
+                                ),
+                                &mut run,
+                                lease,
+                                failure_fence,
+                                activity_run,
+                                progress,
+                                &context,
+                                &mut heartbeat,
+                                wall_deadline.as_mut(),
+                                &mut signal_receiver,
                             )
                             .await?;
+                        let execution = match execution {
+                            ExecutionWait::Completed(execution) => execution,
+                            ExecutionWait::Cancelled => return Ok(RunOnceOutcome::Cancelled),
+                            ExecutionWait::Yielded => return Ok(RunOnceOutcome::Yielded),
+                        };
+                        let outcome = match execution {
+                            Ok(execution) => match self
+                                .artifacts
+                                .stage_execution(&run, &attempt.id, execution)
+                                .await
+                            {
+                                Ok(execution) => AttemptOutcome::Succeeded { execution },
+                                Err(error) => AttemptOutcome::FailedKnown {
+                                    message: error.to_string(),
+                                },
+                            },
+                            Err(error) => AttemptOutcome::FailedKnown {
+                                message: error.to_string(),
+                            },
+                        };
+                        if !matches!(outcome, AttemptOutcome::Succeeded { .. }) {
+                            self.store
+                                .finish_attempt(
+                                    &run,
+                                    &attempt.id,
+                                    outcome.clone(),
+                                    self.clock.now(),
+                                )
+                                .await?;
+                        }
+                        self.events.publish_activity(
+                            &run,
+                            AgentActivityEvent::ToolFinished {
+                                name: attempt.tool_name.clone(),
+                                succeeded: matches!(outcome, AttemptOutcome::Succeeded { .. }),
+                            },
+                        );
                         outcome
                     }
-                    AttemptRecovery::Terminal(outcome) => outcome,
                     AttemptRecovery::OutcomeUnknown => {
                         if attempt.state != crate::runtime::model::AttemptState::WaitingForDecision
                         {
@@ -261,8 +710,10 @@ where
                                 .block_unknown_attempt(&run, &attempt.id, self.clock.now())
                                 .await?;
                         }
+                        execution_boundary!();
                         return Ok(RunOnceOutcome::WaitingForDecision);
                     }
+                    AttemptRecovery::Terminal(outcome) => outcome,
                 };
                 let assistant = Message::assistant_tool_calls(
                     "",
@@ -272,19 +723,18 @@ where
                         arguments: attempt.arguments_json,
                     }],
                 );
+                let tool_result =
+                    Message::tool_result(attempt.tool_call_id, observation_for_outcome(&outcome));
                 let mut recovered_messages = Vec::new();
                 if !messages.iter().any(|message| {
                     message
                         .tool_calls
                         .iter()
-                        .any(|call| call.id == attempt.tool_call_id)
+                        .any(|call| call.id == assistant.tool_calls[0].id)
                 }) {
                     recovered_messages.push(assistant);
                 }
-                recovered_messages.push(Message::tool_result(
-                    attempt.tool_call_id,
-                    observation_for_outcome(&outcome),
-                ));
+                recovered_messages.push(tool_result);
                 self.store
                     .checkpoint_run(
                         CheckpointRun {
@@ -298,12 +748,209 @@ where
                     .await?;
                 advance_progress(progress, QuantumProgress::KnownToolOutcome);
                 messages.extend(recovered_messages);
-                continue;
             }
-            let outcome = match recovery {
-                AttemptRecovery::MayInvoke => {
+            for _ in 0..self.limits.max_model_steps {
+                execution_boundary!();
+                if let Some(control) = self
+                    .store
+                    .newer_control_event(lease, run.observed_sequence, self.clock.now())
+                    .await?
+                {
+                    return match control.kind {
+                        EventKind::CancelRequested => {
+                            self.store
+                                .cancel_run(&run, &control, self.clock.now())
+                                .await?;
+                            advance_progress(progress, QuantumProgress::Finalized);
+                            self.events
+                                .publish_activity(&run, AgentActivityEvent::Cancelled);
+                            Ok(RunOnceOutcome::Cancelled)
+                        }
+                        EventKind::UserMessage => {
+                            execution_boundary!();
+                            Ok(RunOnceOutcome::Yielded)
+                        }
+                        EventKind::ExternalCompletion => unreachable!(),
+                    };
+                }
+                let mut request_messages = messages.clone();
+                if let Some(instructions) = &self.system_instructions {
+                    request_messages.insert(0, Message::system(instructions.clone()));
+                }
+                if is_reticulum_route(run.delivery_route.as_ref()) {
+                    request_messages.insert(0, Message::system(RETICULUM_RESPONSE_INSTRUCTIONS));
+                }
+                let request = LlmRequest {
+                    messages: request_messages,
+                    tools: definitions_for_policy(&self.tools, run.execution_policy),
+                };
+                self.events
+                    .publish_activity(&run, AgentActivityEvent::ModelStepStarted);
+                let response = {
+                    let event_run = run.clone();
+                    let execution_context = context.clone();
+                    let mut sink = RuntimeLlmSink {
+                        run: &event_run,
+                        publisher: self.events.as_ref(),
+                    };
+                    match self
+                        .await_execution(
+                            self.llm.stream(request, &mut sink, &context),
+                            &mut run,
+                            lease,
+                            failure_fence,
+                            activity_run,
+                            progress,
+                            &execution_context,
+                            &mut heartbeat,
+                            wall_deadline.as_mut(),
+                            &mut signal_receiver,
+                        )
+                        .await?
+                    {
+                        ExecutionWait::Completed(response) => response?,
+                        ExecutionWait::Cancelled => return Ok(RunOnceOutcome::Cancelled),
+                        ExecutionWait::Yielded => return Ok(RunOnceOutcome::Yielded),
+                    }
+                };
+                if response.tool_calls.is_empty() {
+                    let content =
+                        bounded_reticulum_response(run.delivery_route.as_ref(), response.content);
+                    let intent_key = format!("run:{}:final", run.run_id);
+                    match self
+                        .store
+                        .finalize_run(
+                            FinalizeRun {
+                                run: run.clone(),
+                                incorporated_event_ids: run.source_event_ids.clone(),
+                                final_messages: vec![Message::assistant(content.clone())],
+                                outbox: vec![NewOutboxIntent {
+                                    id: OutboxId::new(),
+                                    intent_key,
+                                    intent_class: if run.ingress_source.is_some() {
+                                        "webhook_notification"
+                                    } else {
+                                        "interactive_reply"
+                                    }
+                                    .into(),
+                                    audience: run.audience.clone(),
+                                    payload: OutboxPayload::Text { text: content },
+                                }],
+                            },
+                            self.clock.now(),
+                        )
+                        .await?
+                    {
+                        FinalizeOutcome::Completed => {
+                            advance_progress(progress, QuantumProgress::Finalized);
+                            self.events
+                                .publish_activity(&run, AgentActivityEvent::Completed);
+                            return Ok(RunOnceOutcome::Completed);
+                        }
+                        FinalizeOutcome::Preempted { .. } => {
+                            run = self
+                                .store
+                                .attach_next_run(lease, self.limits.max_events, self.clock.now())
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("preempted run was not resumable")
+                                })?;
+                            *failure_fence = Some(FailureFence::from(&run));
+                            *activity_run = Some(run.clone());
+                            messages = self
+                                .store
+                                .load_recent_context(
+                                    &lease.actor_id,
+                                    &run.audience,
+                                    self.limits.recent_messages,
+                                )
+                                .await?;
+                            messages.extend(run.messages.clone());
+                            self.store
+                                .checkpoint_run(
+                                    CheckpointRun {
+                                        run: run.clone(),
+                                        incorporated_event_ids: run.source_event_ids.clone(),
+                                        checkpointed_attempt_ids: Vec::new(),
+                                        messages: run.messages.clone(),
+                                    },
+                                    self.clock.now(),
+                                )
+                                .await?;
+                            continue;
+                        }
+                    }
+                }
+
+                if !response.content.is_empty() {
+                    self.events.publish_activity(
+                        &run,
+                        AgentActivityEvent::Description(response.content.clone()),
+                    );
+                }
+
+                let assistant =
+                    Message::assistant_tool_calls(response.content, response.tool_calls.clone());
+                let mut prepared = Vec::new();
+                for tool_call in response.tool_calls {
+                    if !run.execution_policy.allows(&tool_call.name) {
+                        prepared.push((tool_call, None));
+                        continue;
+                    }
+                    let capabilities = self
+                        .tools
+                        .capabilities(&tool_call.name)
+                        .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", tool_call.name))?;
+                    let attempt = self
+                        .store
+                        .prepare_attempt(
+                            &run,
+                            NewToolAttempt {
+                                id: AttemptId::new(),
+                                tool_call_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                                arguments_json: tool_call.arguments.clone(),
+                                capabilities,
+                            },
+                            self.clock.now(),
+                        )
+                        .await?;
+                    prepared.push((tool_call, Some(attempt)));
+                }
+                self.store
+                    .checkpoint_run(
+                        CheckpointRun {
+                            run: run.clone(),
+                            incorporated_event_ids: Vec::new(),
+                            checkpointed_attempt_ids: Vec::new(),
+                            messages: vec![assistant.clone()],
+                        },
+                        self.clock.now(),
+                    )
+                    .await?;
+                advance_progress(progress, QuantumProgress::ModelCheckpoint);
+                messages.push(assistant);
+
+                let mut checkpoint_messages = Vec::new();
+                let mut checkpointed_attempt_ids = Vec::new();
+                let mut budget_exhausted = false;
+                for (tool_call, attempt) in prepared {
+                    let Some(attempt) = attempt else {
+                        let outcome = AttemptOutcome::FailedKnown {
+                            message: format!(
+                                "tool is not allowed for this event: {}",
+                                tool_call.name
+                            ),
+                        };
+                        checkpoint_messages.push(Message::tool_result(
+                            tool_call.id,
+                            observation_for_outcome(&outcome),
+                        ));
+                        continue;
+                    };
                     if tool_steps >= self.limits.max_tool_steps {
-                        return Ok(RunOnceOutcome::Yielded);
+                        budget_exhausted = true;
+                        break;
                     }
                     tool_steps += 1;
                     self.store
@@ -312,360 +959,57 @@ where
                     self.events.publish_activity(
                         &run,
                         AgentActivityEvent::ToolStarted {
-                            name: attempt.tool_name.clone(),
+                            name: tool_call.name.clone(),
                         },
                     );
                     let tool_context = ToolCallContext {
                         attempt_id: attempt.id.to_string(),
-                        authorized_tools: vec![attempt.tool_name.clone()],
+                        authorized_tools: Vec::new(),
                         cancellation: context.clone(),
                     };
-                    let outcome = match self
-                        .tools
-                        .execute(&attempt.tool_name, &attempt.arguments_json, &tool_context)
-                        .await
-                    {
+                    let execution = self
+                        .await_execution(
+                            self.tools.execute(
+                                &tool_call.name,
+                                &tool_call.arguments,
+                                &tool_context,
+                            ),
+                            &mut run,
+                            lease,
+                            failure_fence,
+                            activity_run,
+                            progress,
+                            &context,
+                            &mut heartbeat,
+                            wall_deadline.as_mut(),
+                            &mut signal_receiver,
+                        )
+                        .await?;
+                    let execution = match execution {
+                        ExecutionWait::Completed(execution) => execution,
+                        ExecutionWait::Cancelled => return Ok(RunOnceOutcome::Cancelled),
+                        ExecutionWait::Yielded => return Ok(RunOnceOutcome::Yielded),
+                    };
+                    let (outcome, observation) = match execution {
                         Ok(execution) => match self
                             .artifacts
                             .stage_execution(&run, &attempt.id, execution)
                             .await
                         {
-                            Ok(execution) => AttemptOutcome::Succeeded { execution },
-                            Err(error) => AttemptOutcome::FailedKnown {
-                                message: error.to_string(),
-                            },
-                        },
-                        Err(error) => AttemptOutcome::FailedKnown {
-                            message: error.to_string(),
-                        },
-                    };
-                    if !matches!(outcome, AttemptOutcome::Succeeded { .. }) {
-                        self.store
-                            .finish_attempt(&run, &attempt.id, outcome.clone(), self.clock.now())
-                            .await?;
-                    }
-                    self.events.publish_activity(
-                        &run,
-                        AgentActivityEvent::ToolFinished {
-                            name: attempt.tool_name.clone(),
-                            succeeded: matches!(outcome, AttemptOutcome::Succeeded { .. }),
-                        },
-                    );
-                    outcome
-                }
-                AttemptRecovery::OutcomeUnknown => {
-                    if attempt.state != crate::runtime::model::AttemptState::WaitingForDecision {
-                        self.store
-                            .block_unknown_attempt(&run, &attempt.id, self.clock.now())
-                            .await?;
-                    }
-                    return Ok(RunOnceOutcome::WaitingForDecision);
-                }
-                AttemptRecovery::Terminal(outcome) => outcome,
-            };
-            let assistant = Message::assistant_tool_calls(
-                "",
-                vec![LlmToolCall {
-                    id: attempt.tool_call_id.clone(),
-                    name: attempt.tool_name,
-                    arguments: attempt.arguments_json,
-                }],
-            );
-            let tool_result =
-                Message::tool_result(attempt.tool_call_id, observation_for_outcome(&outcome));
-            let mut recovered_messages = Vec::new();
-            if !messages.iter().any(|message| {
-                message
-                    .tool_calls
-                    .iter()
-                    .any(|call| call.id == assistant.tool_calls[0].id)
-            }) {
-                recovered_messages.push(assistant);
-            }
-            recovered_messages.push(tool_result);
-            self.store
-                .checkpoint_run(
-                    CheckpointRun {
-                        run: run.clone(),
-                        incorporated_event_ids: Vec::new(),
-                        checkpointed_attempt_ids: vec![attempt.id],
-                        messages: recovered_messages.clone(),
-                    },
-                    self.clock.now(),
-                )
-                .await?;
-            advance_progress(progress, QuantumProgress::KnownToolOutcome);
-            messages.extend(recovered_messages);
-        }
-        let mut signal_receiver = self.signals.subscribe(&lease.actor_id).await;
-        for _ in 0..self.limits.max_model_steps {
-            if let Some(control) = self
-                .store
-                .newer_control_event(&current_lease, run.observed_sequence, self.clock.now())
-                .await?
-            {
-                return match control.kind {
-                    EventKind::CancelRequested => {
-                        self.store
-                            .cancel_run(&run, &control, self.clock.now())
-                            .await?;
-                        advance_progress(progress, QuantumProgress::Finalized);
-                        self.events
-                            .publish_activity(&run, AgentActivityEvent::Cancelled);
-                        Ok(RunOnceOutcome::Cancelled)
-                    }
-                    EventKind::UserMessage => Ok(RunOnceOutcome::Yielded),
-                    EventKind::ExternalCompletion => unreachable!(),
-                };
-            }
-            let mut request_messages = messages.clone();
-            if let Some(instructions) = &self.system_instructions {
-                request_messages.insert(0, Message::system(instructions.clone()));
-            }
-            if is_reticulum_route(run.delivery_route.as_ref()) {
-                request_messages.insert(0, Message::system(RETICULUM_RESPONSE_INSTRUCTIONS));
-            }
-            let request = LlmRequest {
-                messages: request_messages,
-                tools: definitions_for_policy(&self.tools, run.execution_policy),
-            };
-            self.events
-                .publish_activity(&run, AgentActivityEvent::ModelStepStarted);
-            let response = {
-                let event_run = run.clone();
-                let mut sink = RuntimeLlmSink {
-                    run: &event_run,
-                    publisher: self.events.as_ref(),
-                };
-                let generation = self.llm.stream(request, &mut sink, &context);
-                tokio::pin!(generation);
-                loop {
-                    tokio::select! {
-                        response = &mut generation => break response?,
-                        _ = &mut wall_deadline => {
-                            if let Some(control) = self.store
-                                .newer_control_event(&current_lease, run.observed_sequence, self.clock.now())
-                                .await?
-                                .filter(|control| control.kind == EventKind::CancelRequested)
-                            {
-                                context.cancel();
-                                self.store.cancel_run(&run, &control, self.clock.now()).await?;
-                                advance_progress(progress, QuantumProgress::Finalized);
-                                self.events.publish_activity(
-                                    &run,
-                                    AgentActivityEvent::Cancelled,
-                                );
-                                return Ok(RunOnceOutcome::Cancelled);
+                            Ok(execution) => {
+                                let observation = tool_observation::success(&execution.observation);
+                                (AttemptOutcome::Succeeded { execution }, observation)
                             }
-                            anyhow::bail!("model generation exceeded wall-time limit")
-                        },
-                        _ = heartbeat.tick() => {
-                            let now = self.clock.now();
-                            current_lease = self.store
-                                .renew_lease(
-                                    &current_lease,
-                                    now,
-                                    now.plus_millis(duration_millis(self.limits.lease_duration)?),
+                            Err(error) => {
+                                let observation = tool_observation::failure(&error);
+                                (
+                                    AttemptOutcome::FailedKnown {
+                                        message: error.to_string(),
+                                    },
+                                    observation,
                                 )
-                                .await?;
-                            run.lease = current_lease.clone();
-                            *failure_fence = Some(FailureFence::from(&run));
-                            *activity_run = Some(run.clone());
-                        }
-                        changed = signal_receiver.changed() => {
-                            if changed.is_err() {
-                                continue;
                             }
-                            if let Some(control) = self.store
-                                .newer_control_event(&current_lease, run.observed_sequence, self.clock.now())
-                                .await?
-                            {
-                                context.cancel();
-                                return match control.kind {
-                                    EventKind::CancelRequested => {
-                                        self.store.cancel_run(&run, &control, self.clock.now()).await?;
-                                        advance_progress(progress, QuantumProgress::Finalized);
-                                        self.events.publish_activity(
-                                            &run,
-                                            AgentActivityEvent::Cancelled,
-                                        );
-                                        Ok(RunOnceOutcome::Cancelled)
-                                    }
-                                    EventKind::UserMessage => Ok(RunOnceOutcome::Yielded),
-                                    EventKind::ExternalCompletion => unreachable!(),
-                                };
-                            }
-                        }
-                    }
-                }
-            };
-            if response.tool_calls.is_empty() {
-                let content =
-                    bounded_reticulum_response(run.delivery_route.as_ref(), response.content);
-                let intent_key = format!("run:{}:final", run.run_id);
-                match self
-                    .store
-                    .finalize_run(
-                        FinalizeRun {
-                            run: run.clone(),
-                            incorporated_event_ids: run.source_event_ids.clone(),
-                            final_messages: vec![Message::assistant(content.clone())],
-                            outbox: vec![NewOutboxIntent {
-                                id: OutboxId::new(),
-                                intent_key,
-                                intent_class: if run.ingress_source.is_some() {
-                                    "webhook_notification"
-                                } else {
-                                    "interactive_reply"
-                                }
-                                .into(),
-                                audience: run.audience.clone(),
-                                payload: OutboxPayload::Text { text: content },
-                            }],
                         },
-                        self.clock.now(),
-                    )
-                    .await?
-                {
-                    FinalizeOutcome::Completed => {
-                        advance_progress(progress, QuantumProgress::Finalized);
-                        self.events
-                            .publish_activity(&run, AgentActivityEvent::Completed);
-                        return Ok(RunOnceOutcome::Completed);
-                    }
-                    FinalizeOutcome::Preempted { .. } => {
-                        run = self
-                            .store
-                            .attach_next_run(
-                                &current_lease,
-                                self.limits.max_events,
-                                self.clock.now(),
-                            )
-                            .await?
-                            .ok_or_else(|| anyhow::anyhow!("preempted run was not resumable"))?;
-                        *failure_fence = Some(FailureFence::from(&run));
-                        *activity_run = Some(run.clone());
-                        messages = self
-                            .store
-                            .load_recent_context(
-                                &lease.actor_id,
-                                &run.audience,
-                                self.limits.recent_messages,
-                            )
-                            .await?;
-                        messages.extend(run.messages.clone());
-                        self.store
-                            .checkpoint_run(
-                                CheckpointRun {
-                                    run: run.clone(),
-                                    incorporated_event_ids: run.source_event_ids.clone(),
-                                    checkpointed_attempt_ids: Vec::new(),
-                                    messages: run.messages.clone(),
-                                },
-                                self.clock.now(),
-                            )
-                            .await?;
-                        continue;
-                    }
-                }
-            }
-
-            if !response.content.is_empty() {
-                self.events.publish_activity(
-                    &run,
-                    AgentActivityEvent::Description(response.content.clone()),
-                );
-            }
-
-            let assistant =
-                Message::assistant_tool_calls(response.content, response.tool_calls.clone());
-            let mut prepared = Vec::new();
-            for tool_call in response.tool_calls {
-                if !run.execution_policy.allows(&tool_call.name) {
-                    prepared.push((tool_call, None));
-                    continue;
-                }
-                let capabilities = self
-                    .tools
-                    .capabilities(&tool_call.name)
-                    .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", tool_call.name))?;
-                let attempt = self
-                    .store
-                    .prepare_attempt(
-                        &run,
-                        NewToolAttempt {
-                            id: AttemptId::new(),
-                            tool_call_id: tool_call.id.clone(),
-                            tool_name: tool_call.name.clone(),
-                            arguments_json: tool_call.arguments.clone(),
-                            capabilities,
-                        },
-                        self.clock.now(),
-                    )
-                    .await?;
-                prepared.push((tool_call, Some(attempt)));
-            }
-            self.store
-                .checkpoint_run(
-                    CheckpointRun {
-                        run: run.clone(),
-                        incorporated_event_ids: Vec::new(),
-                        checkpointed_attempt_ids: Vec::new(),
-                        messages: vec![assistant.clone()],
-                    },
-                    self.clock.now(),
-                )
-                .await?;
-            advance_progress(progress, QuantumProgress::ModelCheckpoint);
-            messages.push(assistant);
-
-            let mut checkpoint_messages = Vec::new();
-            let mut checkpointed_attempt_ids = Vec::new();
-            let mut budget_exhausted = false;
-            for (tool_call, attempt) in prepared {
-                let Some(attempt) = attempt else {
-                    let outcome = AttemptOutcome::FailedKnown {
-                        message: format!("tool is not allowed for this event: {}", tool_call.name),
-                    };
-                    checkpoint_messages.push(Message::tool_result(
-                        tool_call.id,
-                        observation_for_outcome(&outcome),
-                    ));
-                    continue;
-                };
-                if tool_steps >= self.limits.max_tool_steps {
-                    budget_exhausted = true;
-                    break;
-                }
-                tool_steps += 1;
-                self.store
-                    .mark_attempt_running(&run, &attempt.id, self.clock.now())
-                    .await?;
-                self.events.publish_activity(
-                    &run,
-                    AgentActivityEvent::ToolStarted {
-                        name: tool_call.name.clone(),
-                    },
-                );
-                let tool_context = ToolCallContext {
-                    attempt_id: attempt.id.to_string(),
-                    authorized_tools: Vec::new(),
-                    cancellation: context.clone(),
-                };
-                let (outcome, observation) = match self
-                    .tools
-                    .execute(&tool_call.name, &tool_call.arguments, &tool_context)
-                    .await
-                {
-                    Ok(execution) => match self
-                        .artifacts
-                        .stage_execution(&run, &attempt.id, execution)
-                        .await
-                    {
-                        Ok(execution) => {
-                            let observation = tool_observation::success(&execution.observation);
-                            (AttemptOutcome::Succeeded { execution }, observation)
-                        }
                         Err(error) => {
                             let observation = tool_observation::failure(&error);
                             (
@@ -675,53 +1019,55 @@ where
                                 observation,
                             )
                         }
-                    },
-                    Err(error) => {
-                        let observation = tool_observation::failure(&error);
-                        (
-                            AttemptOutcome::FailedKnown {
-                                message: error.to_string(),
-                            },
-                            observation,
-                        )
-                    }
-                };
-                let succeeded = matches!(outcome, AttemptOutcome::Succeeded { .. });
-                self.events.publish_activity(
-                    &run,
-                    AgentActivityEvent::ToolFinished {
-                        name: tool_call.name.clone(),
-                        succeeded,
-                    },
-                );
-                if !succeeded {
-                    self.store
-                        .finish_attempt(&run, &attempt.id, outcome, self.clock.now())
-                        .await?;
-                }
-                checkpointed_attempt_ids.push(attempt.id);
-                checkpoint_messages.push(Message::tool_result(tool_call.id, observation));
-            }
-            if !checkpoint_messages.is_empty() {
-                self.store
-                    .checkpoint_run(
-                        CheckpointRun {
-                            run: run.clone(),
-                            incorporated_event_ids: Vec::new(),
-                            checkpointed_attempt_ids,
-                            messages: checkpoint_messages.clone(),
+                    };
+                    let succeeded = matches!(outcome, AttemptOutcome::Succeeded { .. });
+                    self.events.publish_activity(
+                        &run,
+                        AgentActivityEvent::ToolFinished {
+                            name: tool_call.name.clone(),
+                            succeeded,
                         },
-                        self.clock.now(),
-                    )
-                    .await?;
-                advance_progress(progress, QuantumProgress::KnownToolOutcome);
-                messages.extend(checkpoint_messages);
+                    );
+                    if !succeeded {
+                        self.store
+                            .finish_attempt(&run, &attempt.id, outcome, self.clock.now())
+                            .await?;
+                    }
+                    checkpointed_attempt_ids.push(attempt.id);
+                    checkpoint_messages.push(Message::tool_result(tool_call.id, observation));
+                }
+                if !checkpoint_messages.is_empty() {
+                    self.store
+                        .checkpoint_run(
+                            CheckpointRun {
+                                run: run.clone(),
+                                incorporated_event_ids: Vec::new(),
+                                checkpointed_attempt_ids,
+                                messages: checkpoint_messages.clone(),
+                            },
+                            self.clock.now(),
+                        )
+                        .await?;
+                    advance_progress(progress, QuantumProgress::KnownToolOutcome);
+                    messages.extend(checkpoint_messages);
+                }
+                if budget_exhausted {
+                    execution_boundary!();
+                    return Ok(RunOnceOutcome::Yielded);
+                }
             }
-            if budget_exhausted {
-                return Ok(RunOnceOutcome::Yielded);
-            }
+            execution_boundary!();
+            Ok(RunOnceOutcome::Yielded)
         }
-        Ok(RunOnceOutcome::Yielded)
+        .await;
+        let cleanup = self
+            .stop_execution_heartbeat(&mut heartbeat, lease, &mut run, failure_fence, activity_run)
+            .await;
+        match (result, cleanup) {
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(outcome), Ok(())) => Ok(outcome),
+        }
     }
 }
 
@@ -756,7 +1102,7 @@ where
             .acquire_ready_actor_for(actor, owner, now, lease_until)
             .await
             .map_err(QuantumFailure::AuthorityUnavailable)?;
-        let Some(lease) = lease else {
+        let Some(mut lease) = lease else {
             return Ok(QuantumReport {
                 work_item_id: None,
                 outcome: RunOnceOutcome::Idle,
@@ -766,9 +1112,21 @@ where
         let mut fence = None;
         let mut activity_run = None;
         let mut progress = QuantumProgress::None;
+        let latest_lease = Arc::new(std::sync::RwLock::new(lease.clone()));
         let result = self
-            .run_leased(&lease, &mut fence, &mut activity_run, &mut progress)
+            .run_leased(
+                &mut lease,
+                &mut fence,
+                &mut activity_run,
+                &mut progress,
+                latest_lease.clone(),
+            )
             .await;
+        lease = latest_lease.read().expect("lease state poisoned").clone();
+        if let Some(run) = activity_run.as_mut() {
+            run.lease = lease.clone();
+            fence = Some(FailureFence::from(&*run));
+        }
         if result.is_err()
             && let Some(run) = activity_run.as_ref()
         {
@@ -835,7 +1193,8 @@ where
 }
 
 fn authority_error(error: &anyhow::Error) -> bool {
-    crate::runtime::sqlite::is_authority_failure(error)
+    error.downcast_ref::<ExecutionAuthorityError>().is_some()
+        || crate::runtime::sqlite::is_authority_failure(error)
 }
 
 fn advance_progress(current: &mut QuantumProgress, committed: QuantumProgress) {
@@ -920,7 +1279,7 @@ mod tests {
             ipc::protocol::{ActivityEvent, ServerEventBody},
             model::{
                 ActorId, AttemptId, Audience, EventKind, ExecutionPolicy, ManualClock, RequestId,
-                Timestamp,
+                SystemClock, Timestamp,
             },
             observability::{RuntimeLogEvent, RuntimeLogger},
             runner::{ActorRunner, RunOnceOutcome, RunnerLimits, bounded_reticulum_response},
@@ -946,6 +1305,16 @@ mod tests {
             std::env::temp_dir().join(format!("codrik-runner-test-{}", uuid::Uuid::new_v4())),
             store.clone(),
             clock,
+        )
+    }
+
+    fn system_artifacts(
+        store: &SqliteRuntimeStore,
+    ) -> ArtifactManager<SqliteRuntimeStore, SystemClock> {
+        ArtifactManager::new(
+            std::env::temp_dir().join(format!("codrik-runner-test-{}", uuid::Uuid::new_v4())),
+            store.clone(),
+            SystemClock,
         )
     }
 
@@ -1114,6 +1483,11 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingTools {
         attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct BlockingTools {
+        started: Arc<Notify>,
     }
 
     #[derive(Clone)]
@@ -1299,6 +1673,27 @@ mod tests {
             assert_eq!(name, "datetime");
             self.attempts.lock().await.push(context.attempt_id.clone());
             Ok(ToolExecution::text("2026-07-14"))
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for BlockingTools {
+        fn definitions(&self) -> Vec<Tool> {
+            vec![Tool::new("datetime", "time", Default::default())]
+        }
+
+        fn capabilities(&self, name: &str) -> Option<ToolCapabilities> {
+            (name == "datetime").then(ToolCapabilities::read_only)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _arguments: &str,
+            _context: &ToolCallContext,
+        ) -> Result<ToolExecution> {
+            self.started.notify_one();
+            std::future::pending().await
         }
     }
 
@@ -3039,12 +3434,14 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn model_wall_timeout_records_recoverable_failure_and_releases_lease() -> Result<()> {
         let store = store_with_text().await;
         let started = Arc::new(Notify::new());
         let limits = RunnerLimits {
-            max_wall_time: Duration::from_millis(10),
+            max_wall_time: Duration::from_millis(100),
+            lease_duration: Duration::from_millis(50),
+            heartbeat_interval: Duration::from_millis(10),
             ..RunnerLimits::default()
         };
         let runner = ActorRunner::new(
@@ -3055,7 +3452,7 @@ mod tests {
             ActorSignals::default(),
             Arc::new(NoopRuntimeEventPublisher),
             limits,
-            test_artifacts(&store, ManualClock::new(1_000)),
+            system_artifacts(&store),
         );
         let task = tokio::spawn(async move {
             runner
@@ -3063,10 +3460,9 @@ mod tests {
                 .await
         });
         started.notified().await;
-        tokio::time::advance(Duration::from_millis(10)).await;
-
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task).await?;
         assert!(matches!(
-            task.await.unwrap(),
+            outcome.unwrap(),
             Err(crate::runtime::store::QuantumFailure::RecoverableWork {
                 disposition: crate::runtime::store::FailureDisposition::RetryAt(_)
             })
@@ -3076,12 +3472,65 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn execution_timeout_renews_lease_before_recording_failure() -> Result<()> {
+        let store = store_with_text().await;
+        let started = Arc::new(Notify::new());
+        let limits = RunnerLimits {
+            max_wall_time: Duration::from_millis(200),
+            lease_duration: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_millis(25),
+            ..RunnerLimits::default()
+        };
+        let runner = ActorRunner::new(
+            ScriptedLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([LlmResponse {
+                    content: "checking".into(),
+                    tool_calls: vec![LlmToolCall {
+                        id: "blocked-tool".into(),
+                        name: "datetime".into(),
+                        arguments: "{}".into(),
+                    }],
+                }]))),
+            },
+            BlockingTools {
+                started: started.clone(),
+            },
+            ActorSignals::default(),
+            Arc::new(NoopRuntimeEventPublisher),
+            limits,
+            ArtifactManager::new(
+                std::env::temp_dir().join(format!("codrik-runner-test-{}", uuid::Uuid::new_v4())),
+                store.clone(),
+                SystemClock,
+            ),
+        );
+        let task = tokio::spawn(async move {
+            runner
+                .run_quantum(&ActorId::from_string("actor:local:1"), "worker")
+                .await
+        });
+        started.notified().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task).await?;
+        assert!(matches!(
+            outcome.unwrap(),
+            Err(crate::runtime::store::QuantumFailure::RecoverableWork {
+                disposition: crate::runtime::store::FailureDisposition::RetryAt(_)
+            })
+        ));
+        assert_eq!(store.sole_work_failure_count_for_test().await?, 1);
+        assert!(store.current_lease().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn durable_cancel_at_model_wall_timeout_does_not_record_failure() -> Result<()> {
         let store = store_with_text().await;
         let started = Arc::new(Notify::new());
         let limits = RunnerLimits {
-            max_wall_time: Duration::from_millis(10),
+            max_wall_time: Duration::from_millis(100),
+            lease_duration: Duration::from_millis(50),
+            heartbeat_interval: Duration::from_millis(10),
             ..RunnerLimits::default()
         };
         let runner = ActorRunner::new(
@@ -3092,7 +3541,7 @@ mod tests {
             ActorSignals::default(),
             Arc::new(NoopRuntimeEventPublisher),
             limits,
-            test_artifacts(&store, ManualClock::new(1_000)),
+            system_artifacts(&store),
         );
         let task = tokio::spawn(async move {
             runner
@@ -3117,22 +3566,20 @@ mod tests {
                 Timestamp(3),
             )
             .await?;
-        tokio::time::advance(Duration::from_millis(10)).await;
-
-        assert_eq!(
-            task.await.unwrap().unwrap().outcome,
-            RunOnceOutcome::Cancelled
-        );
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task).await?;
+        assert_eq!(outcome.unwrap().unwrap().outcome, RunOnceOutcome::Cancelled);
         assert_eq!(store.sole_work_failure_count_for_test().await?, 0);
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn queued_user_message_at_model_wall_timeout_still_records_failure() -> Result<()> {
         let store = store_with_text().await;
         let started = Arc::new(Notify::new());
         let limits = RunnerLimits {
-            max_wall_time: Duration::from_millis(10),
+            max_wall_time: Duration::from_millis(100),
+            lease_duration: Duration::from_millis(50),
+            heartbeat_interval: Duration::from_millis(10),
             ..RunnerLimits::default()
         };
         let runner = ActorRunner::new(
@@ -3143,7 +3590,7 @@ mod tests {
             ActorSignals::default(),
             Arc::new(NoopRuntimeEventPublisher),
             limits,
-            test_artifacts(&store, ManualClock::new(1_000)),
+            system_artifacts(&store),
         );
         let task = tokio::spawn(async move {
             runner
@@ -3164,15 +3611,35 @@ mod tests {
                 Timestamp(3),
             )
             .await?;
-        tokio::time::advance(Duration::from_millis(10)).await;
-
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task).await?;
         assert!(matches!(
-            task.await.unwrap(),
+            outcome.unwrap(),
             Err(crate::runtime::store::QuantumFailure::RecoverableWork {
                 disposition: crate::runtime::store::FailureDisposition::RetryAt(_)
             })
         ));
         assert_eq!(store.sole_work_failure_count_for_test().await?, 1);
+        let now = Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64
+                + 1_001,
+        );
+        let lease = store
+            .acquire_ready_actor_for(
+                &ActorId::from_string("actor:local:1"),
+                "next-worker",
+                now,
+                now.plus_millis(1_000),
+            )
+            .await?
+            .expect("queued input keeps actor ready");
+        let next = store
+            .attach_next_run(&lease, 8, now)
+            .await?
+            .expect("queued input remains attachable");
+        assert_eq!(next.messages.len(), 1);
+        assert_eq!(next.messages[0].role, Role::User);
         Ok(())
     }
 
