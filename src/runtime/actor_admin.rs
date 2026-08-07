@@ -1,11 +1,12 @@
 use std::{collections::BTreeSet, path::PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
     artifacts::remove_deleted_artifacts,
+    attachments::RuntimeAttachmentStore,
     model::{ActorId, Clock},
     signals::ActorDirectorySignals,
     store::{
@@ -59,6 +60,7 @@ pub struct ActorAdministration<S, C> {
     signals: ActorDirectorySignals,
     clock: C,
     artifact_root: PathBuf,
+    attachments: RuntimeAttachmentStore,
 }
 
 impl<S, C> ActorAdministration<S, C> {
@@ -69,6 +71,7 @@ impl<S, C> ActorAdministration<S, C> {
         signals: ActorDirectorySignals,
         clock: C,
         artifact_root: impl Into<PathBuf>,
+        attachments: RuntimeAttachmentStore,
     ) -> Self {
         known_tools.insert("*".into());
         Self {
@@ -78,6 +81,7 @@ impl<S, C> ActorAdministration<S, C> {
             signals,
             clock,
             artifact_root: artifact_root.into(),
+            attachments,
         }
     }
 }
@@ -158,6 +162,14 @@ where
             ActorDeleteOutcome::Deleted { artifact_paths } => {
                 remove_deleted_artifacts(&self.artifact_root, &artifact_paths).await;
                 self.signals.notify();
+                if force {
+                    self.attachments
+                        .remove_actor(&actor)
+                        .await
+                        .with_context(|| {
+                            format!("actor {actor} was deleted, but attachment cleanup failed")
+                        })?;
+                }
                 Ok(ActorAdminResult::Deleted { actor_id: actor })
             }
             ActorDeleteOutcome::NotFound => bail!("actor {actor} does not exist"),
@@ -226,11 +238,54 @@ mod tests {
 
     use crate::runtime::{
         actor_admin::{ActorAdminCommand, ActorAdministration, ActorAdministrator},
+        attachments::RuntimeAttachmentStore,
         model::{ActorId, ManualClock, Timestamp},
         signals::ActorDirectorySignals,
         sqlite::SqliteRuntimeStore,
-        store::{ActorStore, RuntimeActor},
+        store::{ActorAdminStore, ActorStore, RuntimeActor},
     };
+
+    #[tokio::test]
+    async fn force_delete_removes_only_deleted_actor_attachments() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "codrik-actor-admin-attachments-{}",
+            std::process::id()
+        ));
+        tokio::fs::remove_dir_all(&root).await.ok();
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let owner = ActorId::parse_workspace_safe("owner")?;
+        let alice = ActorId::parse_workspace_safe("alice")?;
+        store
+            .ensure_initial_actor(&owner, &[], Timestamp(1))
+            .await?;
+        store.create_actor(&alice, Timestamp(2)).await?;
+        store.set_actor_enabled(&alice, false).await?;
+        tokio::fs::create_dir_all(root.join("alice")).await?;
+        tokio::fs::create_dir_all(root.join("bob")).await?;
+        tokio::fs::write(root.join("alice/a.bin"), b"a").await?;
+        tokio::fs::write(root.join("bob/b.bin"), b"b").await?;
+        let admin = ActorAdministration::new(
+            store,
+            owner,
+            BTreeSet::new(),
+            ActorDirectorySignals::default(),
+            ManualClock::new(3),
+            std::env::temp_dir().join("codrik-actor-admin-artifacts"),
+            RuntimeAttachmentStore::new(&root),
+        );
+
+        admin
+            .execute(ActorAdminCommand::Delete {
+                actor_id: alice,
+                force: true,
+            })
+            .await?;
+
+        assert!(!tokio::fs::try_exists(root.join("alice")).await?);
+        assert!(tokio::fs::try_exists(root.join("bob/b.bin")).await?);
+        tokio::fs::remove_dir_all(root).await.ok();
+        Ok(())
+    }
 
     async fn administration(
         signals: ActorDirectorySignals,
@@ -247,6 +302,9 @@ mod tests {
             signals,
             ManualClock::new(2),
             std::env::temp_dir().join("codrik-actor-admin-artifacts"),
+            RuntimeAttachmentStore::new(
+                std::env::temp_dir().join("codrik-actor-admin-attachments"),
+            ),
         ))
     }
 
@@ -341,6 +399,9 @@ mod tests {
             ActorDirectorySignals::default(),
             ManualClock::new(2),
             std::env::temp_dir().join("codrik-actor-admin-artifacts"),
+            RuntimeAttachmentStore::new(
+                std::env::temp_dir().join("codrik-actor-admin-attachments"),
+            ),
         );
 
         admin

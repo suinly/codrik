@@ -385,6 +385,7 @@ pub struct RuntimePaths {
     pub socket: PathBuf,
     pub lock: PathBuf,
     pub artifacts: PathBuf,
+    pub attachments: PathBuf,
     pub client_requests: PathBuf,
     pub reticulum: PathBuf,
 }
@@ -439,6 +440,7 @@ impl RuntimeConfig {
                 codrik_home,
                 "artifacts",
             ),
+            attachments: codrik_home.join("attachments"),
             client_requests: codrik_home.join("client").join("requests"),
             reticulum: codrik_home.join("reticulum"),
         })
@@ -785,6 +787,10 @@ telegram:
         assert_eq!(paths.socket, PathBuf::from("/tmp/codrik-home/codrik.sock"));
         assert_eq!(paths.lock, PathBuf::from("/tmp/codrik-home/runtime.lock"));
         assert_eq!(paths.artifacts, PathBuf::from("/tmp/codrik-home/artifacts"));
+        assert_eq!(
+            paths.attachments,
+            PathBuf::from("/tmp/codrik-home/attachments")
+        );
         assert_eq!(paths.reticulum, PathBuf::from("/tmp/codrik-home/reticulum"));
         assert_eq!(
             paths.client_requests,

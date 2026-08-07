@@ -1,10 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use crate::{
-    agent::{message::Message, tool::ToolCapabilities},
+    agent::{
+        message::{Attachment, Message},
+        tool::ToolCapabilities,
+    },
     runtime::{gateway::*, model::*},
 };
 
@@ -440,6 +443,38 @@ impl NewInboundEvent {
         )
     }
 
+    pub fn attachment_with_route(
+        gateway: impl Into<String>,
+        external_id: impl Into<String>,
+        identity_provider: impl Into<String>,
+        identity_subject: impl Into<String>,
+        audience: Audience,
+        delivery_route: DeliveryRoute,
+        caption: Option<String>,
+        attachment: Attachment,
+    ) -> Result<Self> {
+        validate_runtime_attachment(&attachment)?;
+        let caption = caption
+            .map(|caption| caption.trim().to_owned())
+            .filter(|caption| !caption.is_empty());
+        Ok(Self {
+            gateway: gateway.into(),
+            external_id: external_id.into(),
+            identity_provider: identity_provider.into(),
+            identity_subject: identity_subject.into(),
+            kind: EventKind::UserMessage,
+            audience,
+            delivery_route: Some(delivery_route),
+            execution_policy: ExecutionPolicy::ActorTools,
+            record_latest_telegram_route: false,
+            payload_json: serde_json::to_string(&serde_json::json!({
+                "type": "attachment",
+                "caption": caption,
+                "attachment": attachment,
+            }))?,
+        })
+    }
+
     fn text_with_optional_route(
         gateway: impl Into<String>,
         external_id: impl Into<String>,
@@ -476,6 +511,27 @@ impl NewInboundEvent {
         self.record_latest_telegram_route = true;
         self
     }
+}
+
+pub(crate) fn validate_runtime_attachment(attachment: &Attachment) -> Result<()> {
+    if attachment.id != attachment.sha256
+        || attachment.sha256.len() != 64
+        || !attachment
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || attachment.display_name.trim().is_empty()
+        || attachment.media_type.trim().is_empty()
+        || attachment.relative_path.as_os_str().is_empty()
+        || attachment.relative_path.is_absolute()
+        || attachment
+            .relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("inbound attachment metadata is invalid")
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

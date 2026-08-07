@@ -57,6 +57,7 @@ impl OpenAiClient {
     async fn to_openai_request(
         &self,
         llm_request: LlmRequest,
+        context: &RunContext,
     ) -> Result<(
         CreateResponse,
         Vec<crate::memory::provider_files::ProviderFileKey>,
@@ -78,8 +79,9 @@ impl OpenAiClient {
         let mut items = Vec::new();
         let mut reused_keys = Vec::new();
         for message in llm_request.messages {
-            let (message_items, message_reused_keys) =
-                self.to_response_items(message, &selected_documents).await?;
+            let (message_items, message_reused_keys) = self
+                .to_response_items(message, &selected_documents, context)
+                .await?;
             items.extend(message_items);
             reused_keys.extend(message_reused_keys);
         }
@@ -108,6 +110,7 @@ impl OpenAiClient {
         &self,
         message: Message,
         selected_documents: &std::collections::HashSet<String>,
+        context: &RunContext,
     ) -> Result<(
         Vec<InputItem>,
         Vec<crate::memory::provider_files::ProviderFileKey>,
@@ -127,8 +130,9 @@ impl OpenAiClient {
                         }
                         MessagePart::Text(_) => {}
                         MessagePart::Attachment(file) => {
-                            let resolved =
-                                self.resolve_attachment(&file, selected_documents).await?;
+                            let resolved = self
+                                .resolve_attachment(&file, selected_documents, context)
+                                .await?;
                             if resolved.reused_cache
                                 && let Some(key) = resolved.cache_key
                             {
@@ -292,7 +296,7 @@ impl OpenAiClient {
 impl LlmClient for OpenAiClient {
     async fn generate(&self, llm_request: LlmRequest, context: &RunContext) -> Result<LlmResponse> {
         let original_request = llm_request.clone();
-        let (request, reused_keys) = self.to_openai_request(llm_request).await?;
+        let (request, reused_keys) = self.to_openai_request(llm_request, context).await?;
         let responses = self.client.responses();
         let response = tokio::select! {
             response = responses.create(request) => response,
@@ -304,8 +308,8 @@ impl LlmClient for OpenAiClient {
             Err(error)
                 if !reused_keys.is_empty() && is_stale_provider_file_error(&error.to_string()) =>
             {
-                self.evict_provider_files(&reused_keys).await?;
-                let (request, _) = self.to_openai_request(original_request).await?;
+                self.evict_provider_files(&reused_keys, context).await?;
+                let (request, _) = self.to_openai_request(original_request, context).await?;
                 tokio::select! {
                     response = responses.create(request) => response?,
                     _ = context.cancelled() => bail!(RUN_CANCELLED),
@@ -327,15 +331,15 @@ impl LlmStreamClient for OpenAiClient {
         context: &RunContext,
     ) -> Result<LlmResponse> {
         let original_request = llm_request.clone();
-        let (request, reused_keys) = self.to_openai_request(llm_request).await?;
+        let (request, reused_keys) = self.to_openai_request(llm_request, context).await?;
 
         match self.collect_stream_response(request, sink, context).await {
             Ok(response) => Ok(response),
             Err(error)
                 if !reused_keys.is_empty() && is_stale_provider_file_error(&error.to_string()) =>
             {
-                self.evict_provider_files(&reused_keys).await?;
-                let (request, _) = self.to_openai_request(original_request).await?;
+                self.evict_provider_files(&reused_keys, context).await?;
+                let (request, _) = self.to_openai_request(original_request, context).await?;
                 self.collect_stream_response(request, sink, context).await
             }
             Err(error) => Err(error),
@@ -505,7 +509,11 @@ mod tests {
     async fn tool_result_maps_to_function_call_output_by_call_id() -> Result<()> {
         let client = OpenAiClient::new("test", "key", "http://localhost");
         let (items, _) = client
-            .to_response_items(Message::tool_result("call_1", "sunny"), &Default::default())
+            .to_response_items(
+                Message::tool_result("call_1", "sunny"),
+                &Default::default(),
+                &RunContext::new(),
+            )
             .await?;
 
         assert_eq!(items.len(), 1);
@@ -548,10 +556,13 @@ mod tests {
     async fn request_keeps_system_text_in_instructions_not_input() -> Result<()> {
         let client = OpenAiClient::new("test", "key", "http://localhost");
         let (request, _) = client
-            .to_openai_request(LlmRequest {
-                messages: vec![Message::system("be concise"), Message::user("hello")],
-                tools: Vec::new(),
-            })
+            .to_openai_request(
+                LlmRequest {
+                    messages: vec![Message::system("be concise"), Message::user("hello")],
+                    tools: Vec::new(),
+                },
+                &RunContext::new(),
+            )
             .await?;
 
         assert_eq!(request.instructions.as_deref(), Some("be concise"));
@@ -569,21 +580,24 @@ mod tests {
     async fn assistant_history_uses_previous_response_text_shorthand() -> Result<()> {
         let client = OpenAiClient::new("test", "key", "http://localhost");
         let (request, _) = client
-            .to_openai_request(LlmRequest {
-                messages: vec![
-                    Message::user("hello"),
-                    Message::assistant_tool_calls(
-                        "previous answer",
-                        vec![LlmToolCall {
-                            id: "call_1".into(),
-                            name: "datetime".into(),
-                            arguments: "{}".into(),
-                        }],
-                    ),
-                    Message::user("follow-up"),
-                ],
-                tools: Vec::new(),
-            })
+            .to_openai_request(
+                LlmRequest {
+                    messages: vec![
+                        Message::user("hello"),
+                        Message::assistant_tool_calls(
+                            "previous answer",
+                            vec![LlmToolCall {
+                                id: "call_1".into(),
+                                name: "datetime".into(),
+                                arguments: "{}".into(),
+                            }],
+                        ),
+                        Message::user("follow-up"),
+                    ],
+                    tools: Vec::new(),
+                },
+                &RunContext::new(),
+            )
             .await?;
 
         let InputParam::Items(items) = request.input else {

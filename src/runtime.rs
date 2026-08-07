@@ -1,5 +1,6 @@
 pub mod actor_admin;
 pub mod artifacts;
+pub mod attachments;
 pub mod dispatcher;
 pub mod gateway;
 pub mod gateway_activity;

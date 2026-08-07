@@ -135,6 +135,7 @@ pub struct ActorRunner<L, T, S, C> {
     system_instructions: Option<String>,
     logger: Arc<dyn RuntimeLogger>,
     hooks: Arc<dyn RuntimeBoundaryHooks>,
+    attachment_root: Option<std::path::PathBuf>,
 }
 
 impl<L, T, S, C> ActorRunner<L, T, S, C>
@@ -166,6 +167,7 @@ where
             system_instructions: None,
             logger: Arc::new(NoopRuntimeLogger),
             hooks: Arc::new(NoopRuntimeBoundaryHooks),
+            attachment_root: None,
         }
     }
 
@@ -184,6 +186,11 @@ where
 
     pub fn with_boundary_hooks(mut self, hooks: Arc<dyn RuntimeBoundaryHooks>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    pub fn with_attachment_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.attachment_root = Some(root.into());
         self
     }
 
@@ -528,7 +535,10 @@ where
             .await?;
         self.hooks.incorporation_committed(&run.request_ids).await;
 
-        let context = RunContext::new();
+        let context = match &self.attachment_root {
+            Some(root) => RunContext::new().with_attachment_root(root),
+            None => RunContext::new(),
+        };
         let mut heartbeat = self.start_execution_heartbeat(lease, latest_lease);
         let wall_deadline = tokio::time::sleep(self.limits.max_wall_time);
         tokio::pin!(wall_deadline);

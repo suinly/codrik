@@ -114,6 +114,7 @@ impl OpenAiClient {
         &self,
         file: &Attachment,
         selected_documents: &HashSet<String>,
+        run_context: &crate::llm::client::RunContext,
     ) -> Result<ResolvedAttachment> {
         let kind = classify(&file.media_type);
         if kind == ProviderAttachmentKind::MetadataOnly
@@ -132,8 +133,18 @@ impl OpenAiClient {
             .attachment_context
             .as_ref()
             .context("file attachment requires a session attachment context")?;
+        let actor_root = run_context
+            .attachment_root()
+            .unwrap_or(&context.session_dir);
+        let provider_files = if run_context.attachment_root().is_some() {
+            ProviderFileStore::new(actor_root)
+        } else {
+            context.provider_files.clone()
+        };
         if self.files_api_capability.load(Ordering::Relaxed) == FILES_API_UNAVAILABLE {
-            return self.resolve_without_files_api(file, kind, context).await;
+            return self
+                .resolve_without_files_api(file, kind, context, actor_root)
+                .await;
         }
         let purpose = match kind {
             ProviderAttachmentKind::Image => ProviderUploadPurpose::Vision,
@@ -145,11 +156,11 @@ impl OpenAiClient {
             provider: "openai".to_string(),
             purpose: purpose.clone(),
         };
-        let cached = context.provider_files.get(&key).await?;
+        let cached = provider_files.get(&key).await?;
         let (file_id, reused_cache) = if let Some(record) = cached {
             (record.file_id, true)
         } else {
-            let path = safe_attachment_path(&context.session_dir, &file.relative_path).await?;
+            let path = safe_attachment_path(actor_root, &file.relative_path).await?;
             let uploaded = match self
                 .client
                 .files()
@@ -173,12 +184,13 @@ impl OpenAiClient {
                 Err(error) if provider_has_no_files_api(&error.to_string()) => {
                     self.files_api_capability
                         .store(FILES_API_UNAVAILABLE, Ordering::Relaxed);
-                    return self.resolve_without_files_api(file, kind, context).await;
+                    return self
+                        .resolve_without_files_api(file, kind, context, actor_root)
+                        .await;
                 }
                 Err(error) => return Err(error.into()),
             };
-            context
-                .provider_files
+            provider_files
                 .put(ProviderFileRecord {
                     key: key.clone(),
                     file_id: uploaded.id.clone(),
@@ -213,10 +225,11 @@ impl OpenAiClient {
         file: &Attachment,
         kind: ProviderAttachmentKind,
         context: &OpenAiAttachmentContext,
+        actor_root: &std::path::Path,
     ) -> Result<ResolvedAttachment> {
         let content = match kind {
             ProviderAttachmentKind::Image => {
-                let path = safe_attachment_path(&context.session_dir, &file.relative_path).await?;
+                let path = safe_attachment_path(actor_root, &file.relative_path).await?;
                 let bytes = fs::read(&path).await.with_context(|| {
                     format!("failed to read image attachment: {}", path.display())
                 })?;
@@ -244,12 +257,20 @@ impl OpenAiClient {
         })
     }
 
-    pub(super) async fn evict_provider_files(&self, keys: &[ProviderFileKey]) -> Result<()> {
+    pub(super) async fn evict_provider_files(
+        &self,
+        keys: &[ProviderFileKey],
+        run_context: &crate::llm::client::RunContext,
+    ) -> Result<()> {
         let Some(context) = &self.attachment_context else {
             return Ok(());
         };
+        let provider_files = run_context
+            .attachment_root()
+            .map(ProviderFileStore::new)
+            .unwrap_or_else(|| context.provider_files.clone());
         for key in keys {
-            context.provider_files.remove(key).await?;
+            provider_files.remove(key).await?;
         }
         Ok(())
     }
@@ -272,8 +293,11 @@ async fn safe_attachment_path(
     session_dir: &std::path::Path,
     relative_path: &std::path::Path,
 ) -> Result<PathBuf> {
-    if relative_path.is_absolute() {
-        bail!("attachment path must be relative");
+    if relative_path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("attachment path must contain only normal relative components");
     }
     let canonical_session = fs::canonicalize(session_dir).await.with_context(|| {
         format!(
@@ -310,13 +334,72 @@ mod tests {
         agent::message::{Attachment, Message, MessagePart, UserInput},
         config::ImageDetailConfig,
         llm::client::{LlmClient, LlmRequest, RunContext},
-        memory::provider_files::ProviderFileStore,
+        memory::provider_files::{
+            ProviderFileKey, ProviderFileRecord, ProviderFileStore, ProviderUploadPurpose,
+        },
     };
 
     use super::{
         FILES_API_UNAVAILABLE, OpenAiAttachmentContext, OpenAiClient, ProviderAttachmentKind,
         classify, metadata_text, provider_has_no_files_api, selected_document_ids,
     };
+
+    fn temp_session_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "codrik-openai-attachment-test-{}-{name}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn evicts_provider_file_from_run_actor_cache() -> Result<()> {
+        let legacy = temp_session_dir("evict-legacy");
+        let actor = temp_session_dir("evict-actor");
+        fs::remove_dir_all(&legacy).await.ok();
+        fs::remove_dir_all(&actor).await.ok();
+        let key = ProviderFileKey {
+            sha256: "abc".into(),
+            provider: "openai".into(),
+            purpose: ProviderUploadPurpose::Vision,
+        };
+        let record = ProviderFileRecord {
+            key: key.clone(),
+            file_id: "file-1".into(),
+        };
+        ProviderFileStore::new(&actor).put(record).await?;
+        let client = OpenAiClient::new("test", "key", "http://127.0.0.1:1")
+            .with_attachment_context(OpenAiAttachmentContext {
+                provider_files: ProviderFileStore::new(&legacy),
+                session_dir: legacy.clone(),
+                image_detail: ImageDetailConfig::Auto,
+            });
+        let context = crate::llm::client::RunContext::new().with_attachment_root(&actor);
+
+        client
+            .evict_provider_files(&[key.clone()], &context)
+            .await?;
+
+        assert!(ProviderFileStore::new(&actor).get(&key).await?.is_none());
+        fs::remove_dir_all(legacy).await.ok();
+        fs::remove_dir_all(actor).await.ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_parent_components_even_when_path_resolves_inside_root() -> Result<()> {
+        let root = temp_session_dir("parent-path");
+        fs::remove_dir_all(&root).await.ok();
+        fs::create_dir_all(root.join("nested")).await?;
+        fs::write(root.join("file.pdf"), b"pdf").await?;
+
+        assert!(
+            safe_attachment_path(&root, std::path::Path::new("nested/../file.pdf"))
+                .await
+                .is_err()
+        );
+        fs::remove_dir_all(root).await.ok();
+        Ok(())
+    }
 
     fn attachment(id: &str, media_type: &str, size_bytes: u64) -> Attachment {
         Attachment::new(
@@ -402,7 +485,13 @@ mod tests {
             .files_api_capability
             .store(FILES_API_UNAVAILABLE, Ordering::Relaxed);
 
-        let resolved = client.resolve_attachment(&file, &HashSet::new()).await?;
+        let resolved = client
+            .resolve_attachment(
+                &file,
+                &HashSet::new(),
+                &crate::llm::client::RunContext::new(),
+            )
+            .await?;
 
         assert_eq!(
             serde_json::to_value(resolved.content)?,

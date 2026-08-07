@@ -416,6 +416,7 @@ struct InjectedLlm {
     block_call: Option<usize>,
     release: Arc<Notify>,
     tool_sets: Arc<Mutex<Vec<Vec<String>>>>,
+    requests: Arc<Mutex<Vec<codrik::llm::client::LlmRequest>>>,
 }
 
 impl InjectedLlm {
@@ -427,6 +428,7 @@ impl InjectedLlm {
             block_call: None,
             release: Arc::new(Notify::new()),
             tool_sets: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -455,6 +457,10 @@ impl InjectedLlm {
             called.await;
         }
     }
+
+    fn requests(&self) -> Vec<codrik::llm::client::LlmRequest> {
+        self.requests.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -465,6 +471,7 @@ impl codrik::llm::client::LlmStreamClient for InjectedLlm {
         sink: &mut dyn codrik::llm::client::LlmStreamSink,
         _context: &codrik::llm::client::RunContext,
     ) -> Result<codrik::llm::client::LlmResponse> {
+        self.requests.lock().unwrap().push(request.clone());
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let mut tools = request
             .tools
@@ -1669,6 +1676,8 @@ mod telegram_acceptance {
 
     use anyhow::Result;
     use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::stream;
 
     use super::{ACTOR, InjectedLlm, InjectedReply};
     use codrik::{
@@ -1676,9 +1685,10 @@ mod telegram_acceptance {
         interfaces::telegram::{
             activity::TelegramActivityWorker,
             api::{
-                DeleteWebhook, EditMessageText, GetUpdates, SendChatAction, SendFile, SendMessage,
-                SendRichMessage, SetWebhook, TelegramApi, TelegramApiError, TelegramIngressApi,
-                TelegramMessageRef, WebhookInfo,
+                DeleteWebhook, EditMessageText, GetFile, GetUpdates, SendChatAction, SendFile,
+                SendMessage, SendRichMessage, SetWebhook, TelegramApi, TelegramApiError,
+                TelegramDownloadStream, TelegramFile, TelegramIngressApi, TelegramMessageRef,
+                WebhookInfo,
             },
             delivery::TelegramDeliveryWorker,
             prepare_with_api,
@@ -1704,6 +1714,7 @@ mod telegram_acceptance {
         edited: Arc<Mutex<Vec<String>>>,
         actions: Arc<Mutex<Vec<String>>>,
         reply_message_ids: Arc<Mutex<Vec<i64>>>,
+        downloaded: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1749,6 +1760,28 @@ mod telegram_acceptance {
             TelegramApiError,
         > {
             unreachable!("webhook acceptance must not poll updates")
+        }
+
+        async fn get_file(
+            &self,
+            command: GetFile,
+        ) -> std::result::Result<TelegramFile, TelegramApiError> {
+            Ok(TelegramFile {
+                file_id: command.file_id,
+                file_unique_id: "telegram-unique".into(),
+                file_size: Some(16),
+                file_path: Some("documents/sample.png".into()),
+            })
+        }
+
+        async fn download_file(
+            &self,
+            file_path: &str,
+        ) -> std::result::Result<TelegramDownloadStream, TelegramApiError> {
+            self.downloaded.lock().unwrap().push(file_path.into());
+            Ok(Box::pin(stream::iter([Ok(Bytes::from_static(
+                b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR",
+            ))])))
         }
     }
 
@@ -1825,6 +1858,25 @@ mod telegram_acceptance {
                     "type": "private"
                 },
                 "text": text
+            }
+        })
+    }
+
+    fn document_update(update_id: i64, message_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "from": {"id": 4242, "is_bot": false, "username": "owner"},
+                "chat": {"id": 4242, "type": "private"},
+                "caption": "inspect",
+                "document": {
+                    "file_id": "telegram-file",
+                    "file_unique_id": "telegram-unique",
+                    "file_name": "sample.png",
+                    "mime_type": "application/octet-stream",
+                    "file_size": 16
+                }
             }
         })
     }
@@ -1910,6 +1962,7 @@ mod telegram_acceptance {
                 signals.clone(),
                 activity.clone(),
                 clock.clone(),
+                root.join("attachments"),
                 artifacts.clone(),
                 api.clone(),
             )
@@ -1958,6 +2011,18 @@ mod telegram_acceptance {
         assert_eq!(text_response.status(), reqwest::StatusCode::OK);
         assert_eq!(counts(&database).await?, (1, 1, 1, 1, 1));
 
+        let file_update = document_update(12, 102);
+        let file_response = client
+            .post(format!("http://{webhook_address}/webhooks/telegram"))
+            .header("content-type", "application/json")
+            .header("x-telegram-bot-api-secret-token", "acceptance_secret")
+            .json(&file_update)
+            .send()
+            .await?;
+        assert_eq!(file_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(counts(&database).await?, (1, 1, 2, 1, 1));
+        assert_eq!(*api.downloaded.lock().unwrap(), ["documents/sample.png"]);
+
         let streaming = Arc::new(TelegramActivityWorker::new(api.clone(), "telegram:900"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let streaming_task = {
@@ -1969,24 +2034,38 @@ mod telegram_acceptance {
             Arc::new(NoopRuntimeEventPublisher),
             activity,
         ));
+        let llm = InjectedLlm::new(vec![InjectedReply::PartialThenFinal {
+            delta: "Пр".into(),
+            final_text: RICH_FINAL.into(),
+        }]);
+        drop(store);
+        let restarted_store = SqliteRuntimeStore::open(&database).await?;
         let runner = ActorRunner::new(
-            InjectedLlm::new(vec![InjectedReply::PartialThenFinal {
-                delta: "Пр".into(),
-                final_text: RICH_FINAL.into(),
-            }]),
+            llm.clone(),
             ToolRegistry::new(),
             signals,
             events,
             RunnerLimits::default(),
-            ArtifactManager::new(artifacts, store.clone(), clock.clone()),
-        );
+            ArtifactManager::new(artifacts, restarted_store.clone(), clock.clone()),
+        )
+        .with_attachment_root(root.join("attachments").join(ACTOR));
         assert_eq!(
             runner.run_once("telegram-acceptance").await?,
             RunOnceOutcome::Completed
         );
-        let restarted_store = SqliteRuntimeStore::open(&database).await?;
+        let requests = llm.requests();
+        let content = &requests[0].messages.last().unwrap().content;
+        assert!(matches!(
+            content.as_slice(),
+            [
+                codrik::agent::message::MessagePart::Text(text),
+                codrik::agent::message::MessagePart::Attachment(file)
+            ] if text == "inspect"
+                && file.media_type == "image/png"
+                && !file.relative_path.is_absolute()
+        ));
         let restarted_delivery = TelegramDeliveryWorker::new(
-            restarted_store,
+            restarted_store.clone(),
             api.clone(),
             clock.clone(),
             "telegram:900",
@@ -2013,7 +2092,7 @@ mod telegram_acceptance {
         assert!(api.reply_message_ids.lock().unwrap().is_empty());
         assert!(!api.actions.lock().unwrap().is_empty());
 
-        for replay in [&link_update, &text_update] {
+        for replay in [&link_update, &text_update, &file_update] {
             let response = client
                 .post(format!("http://{webhook_address}/webhooks/telegram"))
                 .header("content-type", "application/json")
@@ -2024,13 +2103,14 @@ mod telegram_acceptance {
             assert_eq!(response.status(), reqwest::StatusCode::OK);
         }
         assert_eq!(delivery.run_once().await?, 0);
-        assert_eq!(counts(&database).await?, (1, 1, 1, 1, 2));
+        assert_eq!(counts(&database).await?, (1, 1, 2, 1, 2));
+        assert_eq!(llm.requests().len(), 1);
 
         shutdown_tx.send_replace(true);
         streaming_task.await??;
         webhook_shutdown_tx.send_replace(true);
         webhook_task.await??;
-        drop(store);
+        drop(restarted_store);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

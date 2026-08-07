@@ -1,7 +1,13 @@
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{
+    fmt,
+    path::{Component, Path, PathBuf},
+    pin::Pin,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::interfaces::telegram::types::{TelegramBot, TelegramUpdate};
@@ -77,6 +83,22 @@ pub struct GetUpdates {
     pub limit: u8,
     pub allowed_updates: Vec<String>,
 }
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GetFile {
+    pub file_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TelegramFile {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_size: Option<u64>,
+    pub file_path: Option<String>,
+}
+
+pub type TelegramDownloadStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, TelegramApiError>> + Send>>;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct WebhookInfo {
@@ -173,6 +195,23 @@ pub trait TelegramIngressApi: Send + Sync {
         &self,
         command: GetUpdates,
     ) -> Result<Vec<TelegramUpdate>, TelegramApiError>;
+    async fn get_file(&self, _command: GetFile) -> Result<TelegramFile, TelegramApiError> {
+        Err(api_error(
+            TelegramApiErrorClass::Terminal,
+            "getFile",
+            "file download is unsupported",
+        ))
+    }
+    async fn download_file(
+        &self,
+        _file_path: &str,
+    ) -> Result<TelegramDownloadStream, TelegramApiError> {
+        Err(api_error(
+            TelegramApiErrorClass::Terminal,
+            "downloadFile",
+            "file download is unsupported",
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -334,6 +373,71 @@ impl TelegramIngressApi for ReqwestTelegramApi {
     ) -> Result<Vec<TelegramUpdate>, TelegramApiError> {
         self.post_json("getUpdates", &command, true).await
     }
+
+    async fn get_file(&self, command: GetFile) -> Result<TelegramFile, TelegramApiError> {
+        self.post_json("getFile", &command, true).await
+    }
+
+    async fn download_file(
+        &self,
+        file_path: &str,
+    ) -> Result<TelegramDownloadStream, TelegramApiError> {
+        validate_file_path(file_path)?;
+        let response = self
+            .client
+            .get(format!(
+                "{}/file/bot{}/{}",
+                self.base_url, self.token, file_path
+            ))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| {
+                api_error(
+                    TelegramApiErrorClass::Retryable { retry_after: None },
+                    "downloadFile",
+                    "HTTP transport failed",
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(api_error(
+                if response.status().is_server_error() {
+                    TelegramApiErrorClass::Retryable { retry_after: None }
+                } else {
+                    TelegramApiErrorClass::Terminal
+                },
+                "downloadFile",
+                "Bot API rejected download",
+            ));
+        }
+        Ok(Box::pin(response.bytes_stream().map(|chunk| {
+            chunk.map_err(|_| {
+                api_error(
+                    TelegramApiErrorClass::Retryable { retry_after: None },
+                    "downloadFile",
+                    "response body failed",
+                )
+            })
+        })))
+    }
+}
+
+fn validate_file_path(file_path: &str) -> Result<(), TelegramApiError> {
+    let path = Path::new(file_path);
+    if file_path.is_empty()
+        || file_path.contains(['\\', '?', '#'])
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(api_error(
+            TelegramApiErrorClass::Terminal,
+            "downloadFile",
+            "file path is invalid",
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -468,16 +572,83 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::Result;
+    use futures_util::TryStreamExt;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
     use super::{
-        DeleteWebhook, GetUpdates, InputRichMessage, ReqwestTelegramApi, SendChatAction,
+        DeleteWebhook, GetFile, GetUpdates, InputRichMessage, ReqwestTelegramApi, SendChatAction,
         SendMessage, SendRichMessage, TelegramApi, TelegramApiErrorClass, TelegramChatAction,
         TelegramIngressApi,
     };
+
+    #[tokio::test]
+    async fn get_file_posts_file_id_and_decodes_path() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /botsecret-token/getFile "));
+            assert!(request.contains(r#""file_id":"f""#));
+            let body = r#"{"ok":true,"result":{"file_id":"f","file_unique_id":"u","file_size":4,"file_path":"documents/a.bin"}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+            anyhow::Ok(())
+        });
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &base)?;
+
+        let file = api
+            .get_file(GetFile {
+                file_id: "f".into(),
+            })
+            .await?;
+
+        assert_eq!(file.file_path.as_deref(), Some("documents/a.bin"));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_file_streams_bytes_and_rejects_unsafe_paths() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /file/botsecret-token/documents/a.bin "));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\ndata")
+                .await?;
+            anyhow::Ok(())
+        });
+        let api = ReqwestTelegramApi::with_base_url("secret-token", &base)?;
+
+        let chunks = api
+            .download_file("documents/a.bin")
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(chunks.concat(), b"data");
+        for path in [
+            "",
+            "/absolute",
+            "../secret",
+            "a/../secret",
+            r"a\secret",
+            "a?x",
+            "a#x",
+        ] {
+            assert!(api.download_file(path).await.is_err(), "accepted {path}");
+        }
+        server.await??;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn get_me_decodes_successful_envelope() -> Result<()> {

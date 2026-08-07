@@ -3,14 +3,17 @@ use async_trait::async_trait;
 use tokio_rusqlite::{params, rusqlite::OptionalExtension};
 
 use crate::{
-    agent::message::Message,
+    agent::message::{Attachment, Message, UserInput},
     runtime::{
         gateway::DeliveryRoute,
         model::{
             ActorId, Audience, EventId, ExecutionPolicy, RequestId, RunId, Timestamp, WorkItemId,
         },
         sqlite::{SqliteRuntimeStore, map_call_error, retry::call_connection_with_busy_retry},
-        store::{ActorLease, AttachedRun, ControlEvent, ControlStore, DispatchStore, StaleLease},
+        store::{
+            ActorLease, AttachedRun, ControlEvent, ControlStore, DispatchStore, StaleLease,
+            validate_runtime_attachment,
+        },
     },
 };
 
@@ -787,6 +790,28 @@ fn event_message(payload_json: &str) -> Result<Message> {
     let payload: serde_json::Value = serde_json::from_str(payload_json)?;
     match payload.get("type").and_then(serde_json::Value::as_str) {
         Some("text") => Ok(Message::user(required_string(&payload, "text")?)),
+        Some("attachment") => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct AttachmentEvent {
+                #[serde(rename = "type")]
+                kind: String,
+                caption: Option<String>,
+                attachment: Attachment,
+            }
+            let event: AttachmentEvent = serde_json::from_str(payload_json)?;
+            if event.kind != "attachment" {
+                bail!("invalid attachment event type");
+            }
+            validate_runtime_attachment(&event.attachment)?;
+            let input = match event.caption {
+                Some(caption) if !caption.trim().is_empty() => {
+                    UserInput::new().push_text(caption.trim())
+                }
+                _ => UserInput::new(),
+            };
+            Ok(Message::user(input.push_attachment(event.attachment)))
+        }
         Some("webhook") => Ok(Message::user(render_webhook(&payload)?)),
         _ => bail!("unsupported inbound event payload type"),
     }
@@ -984,6 +1009,7 @@ impl SqliteRuntimeStore {
 #[cfg(test)]
 mod tests {
     use crate::{
+        agent::message::{Attachment, MessagePart},
         runtime::{
             gateway::DeliveryRoute,
             model::{
@@ -999,6 +1025,71 @@ mod tests {
         },
         test_fixtures::{ActorSeed, ActorSeedSet, IdentitySeed},
     };
+
+    #[test]
+    fn attachment_event_decodes_caption_before_attachment() {
+        let digest = "a".repeat(64);
+        let payload = serde_json::json!({
+            "type": "attachment",
+            "caption": "inspect",
+            "attachment": {
+                "id": digest,
+                "relative_path": format!("{digest}.png"),
+                "display_name": "screen.png",
+                "media_type": "image/png",
+                "size_bytes": 4,
+                "sha256": digest,
+            }
+        });
+
+        let message = super::event_message(&payload.to_string()).unwrap();
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [MessagePart::Text(text), MessagePart::Attachment(Attachment { display_name, .. })]
+                if text == "inspect" && display_name == "screen.png"
+        ));
+    }
+
+    #[test]
+    fn attachment_event_rejects_unsafe_relative_path() {
+        let digest = "a".repeat(64);
+        let payload = serde_json::json!({
+            "type": "attachment",
+            "caption": null,
+            "attachment": {
+                "id": digest,
+                "relative_path": "../secret",
+                "display_name": "secret",
+                "media_type": "application/octet-stream",
+                "size_bytes": 4,
+                "sha256": digest,
+            }
+        });
+
+        assert!(super::event_message(&payload.to_string()).is_err());
+    }
+
+    #[test]
+    fn attachment_event_rejects_unknown_fields() {
+        let digest = "a".repeat(64);
+        let payload = serde_json::json!({
+            "type": "attachment",
+            "caption": null,
+            "unknown": true,
+            "attachment": {
+                "id": digest,
+                "relative_path": format!("{digest}.bin"),
+                "display_name": "file.bin",
+                "media_type": "application/octet-stream",
+                "size_bytes": 4,
+                "sha256": digest,
+                "unknown": true,
+            }
+        });
+
+        assert!(super::event_message(&payload.to_string()).is_err());
+    }
 
     async fn store_with_event() -> SqliteRuntimeStore {
         let store = SqliteRuntimeStore::open_in_memory().await.unwrap();

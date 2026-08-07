@@ -1,7 +1,11 @@
 use crate::{
     config::{AppConfig, RuntimePaths, codrik_dir},
     interfaces::{reticulum, telegram, webhook},
-    llm::{client::LlmStreamClient, openai::OpenAiClient},
+    llm::{
+        client::LlmStreamClient,
+        openai::{OpenAiAttachmentContext, OpenAiClient},
+    },
+    memory::provider_files::ProviderFileStore,
     runtime::{
         actor_admin::ActorAdministration,
         artifacts::ArtifactManager,
@@ -53,7 +57,12 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         config.model.clone(),
         config.api_key.clone(),
         config.base_url.clone(),
-    );
+    )
+    .with_attachment_context(OpenAiAttachmentContext {
+        session_dir: home.join("attachments"),
+        provider_files: ProviderFileStore::new(home.join("attachments")),
+        image_detail: config.attachments.image_detail,
+    });
     serve_at_until(
         config,
         Arc::new(StderrRuntimeLogger::default()),
@@ -276,6 +285,7 @@ where
         directory.clone(),
         clock.clone(),
         paths.artifacts.clone(),
+        crate::runtime::attachments::RuntimeAttachmentStore::new(paths.attachments.clone()),
     ));
     let server = LocalIpcServer::bind_with_hooks(
         &paths.socket,
@@ -326,6 +336,7 @@ where
                 signals.clone(),
                 gateway_activity.clone(),
                 clock.clone(),
+                paths.attachments.clone(),
                 paths.artifacts.clone(),
             )
             .await?,
@@ -455,6 +466,7 @@ where
     service.component("dispatcher", {
         let dispatcher_task_owner = dispatcher_owner.clone();
         let home = home.clone();
+        let attachment_root = paths.attachments.clone();
         let signals = signals.clone();
         let artifacts = artifacts.clone();
         let logger = logger.clone();
@@ -464,6 +476,7 @@ where
             dispatchers
                 .run_with(shutdown_rx, move |actor, actor_shutdown| {
                     let home = home.clone();
+                    let attachment_root = attachment_root.clone();
                     let signals = signals.clone();
                     let events = events.clone();
                     let artifacts = artifacts.clone();
@@ -489,6 +502,7 @@ where
                             RunnerLimits::default(),
                             artifacts,
                         )
+                        .with_attachment_root(attachment_root.join(actor.id.as_str()))
                         .with_system_instructions(instructions)
                         .with_logger(logger)
                         .with_boundary_hooks(hooks);
@@ -604,6 +618,7 @@ fn prepare_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {
         validate_secure_directory(parent)?;
     }
     create_secure_directory(&paths.artifacts)?;
+    create_secure_directory(&paths.attachments)?;
     create_secure_directory(&paths.reticulum)?;
     Ok(())
 }
@@ -614,6 +629,7 @@ fn validate_runtime_paths(home: &Path, paths: &RuntimePaths) -> Result<()> {
         validate_secure_directory(parent)?;
     }
     validate_secure_directory(&paths.artifacts)?;
+    validate_secure_directory(&paths.attachments)?;
     validate_secure_directory(&paths.reticulum)
 }
 
@@ -623,6 +639,7 @@ fn required_parents(paths: &RuntimePaths) -> Result<Vec<&Path>> {
         &paths.lock,
         &paths.socket,
         &paths.artifacts,
+        &paths.attachments,
         &paths.reticulum,
     ]
     .into_iter()

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::tool::FileArtifact;
@@ -77,13 +78,24 @@ pub struct LlmRequest {
 #[derive(Clone, Default)]
 pub struct RunContext {
     cancellation: CancellationToken,
+    attachment_root: Option<PathBuf>,
 }
 
 impl RunContext {
     pub fn new() -> Self {
         Self {
             cancellation: CancellationToken::new(),
+            attachment_root: None,
         }
+    }
+
+    pub fn with_attachment_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.attachment_root = Some(root.into());
+        self
+    }
+
+    pub fn attachment_root(&self) -> Option<&Path> {
+        self.attachment_root.as_deref()
     }
 
     pub fn cancel(&self) {
@@ -109,6 +121,22 @@ impl RunContext {
 
 pub fn is_run_cancelled_error(error: &anyhow::Error) -> bool {
     error.to_string() == RUN_CANCELLED
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::RunContext;
+
+    #[test]
+    fn run_context_retains_attachment_root() {
+        let context = RunContext::new().with_attachment_root("/tmp/attachments/alice");
+        assert_eq!(
+            context.attachment_root(),
+            Some(Path::new("/tmp/attachments/alice"))
+        );
+    }
 }
 
 #[derive(Debug, Clone)]

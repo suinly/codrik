@@ -125,6 +125,7 @@ pub async fn prepare<C>(
     signals: ActorSignals,
     activity: GatewayActivityHub,
     clock: C,
+    attachment_root: PathBuf,
     artifact_root: PathBuf,
 ) -> Result<
     PreparedTelegramGateway<crate::runtime::sqlite::SqliteRuntimeStore, ReqwestTelegramApi, C>,
@@ -140,6 +141,7 @@ where
         signals,
         activity,
         clock,
+        attachment_root,
         artifact_root,
         api,
     )
@@ -154,6 +156,7 @@ pub async fn prepare_with_api<S, A, C>(
     signals: ActorSignals,
     activity: GatewayActivityHub,
     clock: C,
+    attachment_root: PathBuf,
     artifact_root: PathBuf,
     api: A,
 ) -> Result<PreparedTelegramGateway<S, A, C>>
@@ -217,14 +220,20 @@ where
         }
     }
     let gateway = format!("telegram:{bot_id}");
-    let ingress = Arc::new(TelegramIngressService::new(
-        store.clone(),
-        linking,
-        signals,
-        bot_id.clone(),
-        bot_username,
-        clock.clone(),
-    )?);
+    let ingress = Arc::new(
+        TelegramIngressService::new(
+            store.clone(),
+            linking,
+            signals,
+            bot_id.clone(),
+            bot_username,
+            clock.clone(),
+        )?
+        .with_attachment_ingress(
+            Arc::new(api.clone()),
+            crate::runtime::attachments::RuntimeAttachmentStore::new(attachment_root),
+        ),
+    );
     Ok(PreparedTelegramGateway {
         transport,
         ingress,
@@ -416,6 +425,7 @@ mod tests {
             GatewayActivityHub::default(),
             clock,
             std::env::temp_dir(),
+            std::env::temp_dir(),
             api.clone(),
         )
         .await?;
@@ -475,6 +485,7 @@ mod tests {
             GatewayActivityHub::default(),
             clock,
             std::env::temp_dir(),
+            std::env::temp_dir(),
             api,
         )
         .await
@@ -515,6 +526,7 @@ mod tests {
             ActorSignals::default(),
             GatewayActivityHub::default(),
             clock,
+            std::env::temp_dir(),
             std::env::temp_dir(),
             api.clone(),
         )

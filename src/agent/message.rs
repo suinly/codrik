@@ -84,6 +84,7 @@ fn text_from_parts(parts: &[MessagePart]) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Attachment {
     pub id: String,
     pub relative_path: PathBuf,

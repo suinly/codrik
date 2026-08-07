@@ -81,7 +81,7 @@ webhooks:
 | `api_key` | Yes | None | Provider API key. Keep the configuration file private. |
 | `base_url` | Yes | None | OpenAI-compatible API base URL. |
 | `model` | Yes | None | Model name sent to the configured provider. |
-| `attachments.max_file_size_mb` | No | `20` | Maximum accepted attachment size in MiB. |
+| `attachments.max_file_size_mb` | No | `20` | Maximum legacy/session attachment size in MiB. Hosted Telegram downloads always use Telegram's fixed 20,000,000-byte limit. |
 | `attachments.image_detail` | No | `auto` | Image detail: `auto`, `low`, or `high`. |
 | `runtime.actor_id` | For `serve` | None | Actor selected by the runtime; automatically created only when the actors table is empty. |
 | `runtime.database_path` | No | `<CODRIK_HOME>/runtime.sqlite` | Durable SQLite database. |
@@ -216,6 +216,20 @@ token. `public_url`, `listen`, and `webhook_secret` are ignored in this mode.
 Polling retries transient failures with delays of 1, 2, 4, 8, 16, then 30
 seconds; Telegram's `retry_after` value takes precedence. Update replay after a
 restart is safe because ingress is durable and deduplicated by update ID.
+
+### Incoming files
+
+Private Telegram chats accept photos, documents, videos, animations, audio,
+voice messages, video notes, and stickers. Every Telegram update is a separate
+agent turn; album members are not grouped. A caption is passed before its file,
+while a file without a caption is also valid input.
+
+Codrik uses Telegram's hosted Bot API and accepts at most 20,000,000 downloaded
+bytes per file. It verifies the actual downloaded size and derives MIME type
+from the content rather than trusting Telegram metadata. Files are retained
+under `<CODRIK_HOME>/attachments/<actor-id>/` until that actor is force-deleted.
+Provider-supported images and documents are sent to the model. Other formats
+remain available to the model as verified metadata and a safe local path.
 
 ### Webhook mode
 

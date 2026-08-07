@@ -4,8 +4,12 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use crate::{
-    interfaces::telegram::types::{TelegramInbound, TelegramUpdate},
+    interfaces::telegram::{
+        api::{GetFile, TelegramIngressApi},
+        types::{TelegramInbound, TelegramUpdate},
+    },
     runtime::{
+        attachments::{RuntimeAttachmentStore, TELEGRAM_MAX_DOWNLOAD_BYTES},
         gateway::{GatewayCommandKey, NewGatewayDelivery},
         identity_link::{IdentityLinkManager, LinkRedemption},
         model::{ActorId, Clock},
@@ -37,6 +41,8 @@ pub struct TelegramIngressService<S, C> {
     bot_id: String,
     bot_username: String,
     clock: C,
+    attachment_api: Option<Arc<dyn TelegramIngressApi>>,
+    attachments: Option<RuntimeAttachmentStore>,
 }
 
 impl<S, C> TelegramIngressService<S, C>
@@ -64,7 +70,19 @@ where
             bot_id,
             bot_username,
             clock,
+            attachment_api: None,
+            attachments: None,
         })
+    }
+
+    pub fn with_attachment_ingress(
+        mut self,
+        api: Arc<dyn TelegramIngressApi>,
+        attachments: RuntimeAttachmentStore,
+    ) -> Self {
+        self.attachment_api = Some(api);
+        self.attachments = Some(attachments);
+        self
     }
 
     async fn enqueue_response(
@@ -99,6 +117,107 @@ where
         let update_id = update.update_id;
         match update.classify(&self.bot_id, &self.bot_username)? {
             TelegramInbound::Unsupported => Ok(TelegramIngressOutcome::Unsupported),
+            TelegramInbound::Attachment {
+                caption,
+                attachment,
+                identity,
+                route,
+            } => {
+                let Some(actor) = self
+                    .store
+                    .resolve_identity(&identity.provider, &identity.subject)
+                    .await?
+                else {
+                    self.enqueue_response(
+                        update_id,
+                        route,
+                        "This channel is not linked. Run `codrik link`, then send `/link CODE` here.",
+                    )
+                    .await?;
+                    return Ok(TelegramIngressOutcome::CommandHandled);
+                };
+                if !actor.enabled {
+                    self.enqueue_response(update_id, route, "This actor is disabled.")
+                        .await?;
+                    return Ok(TelegramIngressOutcome::CommandHandled);
+                }
+                let Some(api) = &self.attachment_api else {
+                    return Ok(TelegramIngressOutcome::Unsupported);
+                };
+                let Some(attachments) = &self.attachments else {
+                    return Ok(TelegramIngressOutcome::Unsupported);
+                };
+                let stored = async {
+                    if attachment
+                        .file_size
+                        .is_some_and(|size| size > TELEGRAM_MAX_DOWNLOAD_BYTES)
+                    {
+                        bail!("Telegram file exceeds hosted download limit")
+                    }
+                    let remote = api
+                        .get_file(GetFile {
+                            file_id: attachment.file_id,
+                        })
+                        .await?;
+                    if remote
+                        .file_size
+                        .is_some_and(|size| size > TELEGRAM_MAX_DOWNLOAD_BYTES)
+                    {
+                        bail!("Telegram file exceeds hosted download limit")
+                    }
+                    let file_path = remote
+                        .file_path
+                        .filter(|path| !path.trim().is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("Telegram getFile omitted file_path"))?;
+                    let stream = api.download_file(&file_path).await?;
+                    attachments
+                        .store_stream(&actor.id, &attachment.display_name, stream)
+                        .await
+                }
+                .await;
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(_) => {
+                        self.enqueue_response(
+                            update_id,
+                            route,
+                            "Could not receive this file. Telegram files must be 20 MB or smaller.",
+                        )
+                        .await?;
+                        return Ok(TelegramIngressOutcome::CommandHandled);
+                    }
+                };
+                match self
+                    .store
+                    .ingest(
+                        NewInboundEvent::attachment_with_route(
+                            format!("telegram:{}", self.bot_id),
+                            update_id.to_string(),
+                            identity.provider,
+                            identity.subject,
+                            crate::runtime::model::Audience::ActorPrivate,
+                            route,
+                            caption,
+                            stored,
+                        )?
+                        .with_latest_telegram_route_tracking(),
+                        self.clock.now(),
+                    )
+                    .await?
+                {
+                    IngressOutcome::Accepted { sequence, .. } => {
+                        self.signals.notify(&actor.id, sequence).await;
+                        Ok(TelegramIngressOutcome::Accepted {
+                            actor_id: actor.id,
+                            sequence,
+                        })
+                    }
+                    IngressOutcome::Duplicate { .. } => Ok(TelegramIngressOutcome::Duplicate),
+                    IngressOutcome::Unauthorized => {
+                        bail!("Telegram identity became unauthorized during ingress")
+                    }
+                }
+            }
             TelegramInbound::Link {
                 code,
                 identity,
@@ -192,14 +311,30 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        convert::Infallible,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use anyhow::Result;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::stream;
 
     use super::{TelegramIngress, TelegramIngressOutcome, TelegramIngressService};
     use crate::{
-        interfaces::telegram::types::TelegramUpdate,
+        interfaces::telegram::{
+            api::{
+                GetFile, TelegramApiError, TelegramDownloadStream, TelegramFile, TelegramIngressApi,
+            },
+            types::{TelegramBot, TelegramUpdate},
+        },
         runtime::{
+            attachments::{RuntimeAttachmentStore, TELEGRAM_MAX_DOWNLOAD_BYTES},
             identity_link::{IdentityLinkManager, IdentityLinkService, SystemLinkCodeGenerator},
             model::{ActorId, ManualClock, Timestamp},
             signals::ActorSignals,
@@ -211,6 +346,324 @@ mod tests {
             },
         },
     };
+
+    #[derive(Clone, Default)]
+    struct AttachmentApi {
+        get_file_calls: Arc<AtomicUsize>,
+        download_calls: Arc<AtomicUsize>,
+        returned_size: Arc<Mutex<Option<u64>>>,
+        bytes: Arc<Mutex<Bytes>>,
+    }
+
+    #[async_trait]
+    impl TelegramIngressApi for AttachmentApi {
+        async fn get_me(&self) -> std::result::Result<TelegramBot, TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn set_webhook(
+            &self,
+            _command: crate::interfaces::telegram::api::SetWebhook,
+        ) -> std::result::Result<(), TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn delete_webhook(
+            &self,
+            _command: crate::interfaces::telegram::api::DeleteWebhook,
+        ) -> std::result::Result<(), TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn get_webhook_info(
+            &self,
+        ) -> std::result::Result<crate::interfaces::telegram::api::WebhookInfo, TelegramApiError>
+        {
+            unreachable!()
+        }
+
+        async fn get_updates(
+            &self,
+            _command: crate::interfaces::telegram::api::GetUpdates,
+        ) -> std::result::Result<Vec<TelegramUpdate>, TelegramApiError> {
+            unreachable!()
+        }
+
+        async fn get_file(
+            &self,
+            command: GetFile,
+        ) -> std::result::Result<TelegramFile, TelegramApiError> {
+            self.get_file_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TelegramFile {
+                file_id: command.file_id,
+                file_unique_id: "unique".into(),
+                file_size: *self.returned_size.lock().unwrap(),
+                file_path: Some("documents/sample.png".into()),
+            })
+        }
+
+        async fn download_file(
+            &self,
+            _file_path: &str,
+        ) -> std::result::Result<TelegramDownloadStream, TelegramApiError> {
+            self.download_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter([Ok::<_, TelegramApiError>(
+                self.bytes.lock().unwrap().clone(),
+            )])))
+        }
+    }
+
+    fn temp_attachment_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "codrik-telegram-ingress-{}-{name}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn linked_attachment_is_stored_and_accepted() -> Result<()> {
+        let root = temp_attachment_root("accepted");
+        tokio::fs::remove_dir_all(&root).await.ok();
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(10),
+            SystemLinkCodeGenerator,
+        ));
+        let code = manager.issue_code(&actor).await?.code;
+        let api = AttachmentApi {
+            returned_size: Arc::new(Mutex::new(Some(16))),
+            bytes: Arc::new(Mutex::new(Bytes::from_static(
+                b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR",
+            ))),
+            ..AttachmentApi::default()
+        };
+        let ingress = TelegramIngressService::new(
+            store.clone(),
+            manager,
+            ActorSignals::default(),
+            "900",
+            "codrik_bot",
+            ManualClock::new(20),
+        )?
+        .with_attachment_ingress(Arc::new(api), RuntimeAttachmentStore::new(&root));
+        ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {"message_id":1,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"text":format!("/link {code}")}
+        }))?).await?;
+
+        let outcome = ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 2,
+            "message": {"message_id":2,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"caption":"inspect","document":{"file_id":"file","file_unique_id":"unique","file_name":"sample.png","file_size":16}}
+        }))?).await?;
+
+        assert!(matches!(
+            outcome,
+            TelegramIngressOutcome::Accepted { sequence: 1, .. }
+        ));
+        assert!(tokio::fs::try_exists(root.join("alice")).await?);
+        tokio::fs::remove_dir_all(root).await.ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unlinked_attachment_does_not_call_telegram_file_api() -> Result<()> {
+        let root = temp_attachment_root("unlinked");
+        tokio::fs::remove_dir_all(&root).await.ok();
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(10),
+            SystemLinkCodeGenerator,
+        ));
+        let api = AttachmentApi::default();
+        let ingress = TelegramIngressService::new(
+            store,
+            manager,
+            ActorSignals::default(),
+            "900",
+            "codrik_bot",
+            ManualClock::new(20),
+        )?
+        .with_attachment_ingress(Arc::new(api.clone()), RuntimeAttachmentStore::new(&root));
+
+        let outcome = ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 2,
+            "message": {"message_id":2,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"document":{"file_id":"file","file_unique_id":"unique","file_name":"sample.png","file_size":16}}
+        }))?).await?;
+
+        assert_eq!(outcome, TelegramIngressOutcome::CommandHandled);
+        assert_eq!(api.get_file_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.download_calls.load(Ordering::SeqCst), 0);
+        assert!(!tokio::fs::try_exists(&root).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_attachment_skips_telegram_file_api() -> Result<()> {
+        let root = temp_attachment_root("declared-oversize");
+        tokio::fs::remove_dir_all(&root).await.ok();
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(10),
+            SystemLinkCodeGenerator,
+        ));
+        let code = manager.issue_code(&actor).await?.code;
+        let api = AttachmentApi::default();
+        let ingress = TelegramIngressService::new(
+            store,
+            manager,
+            ActorSignals::default(),
+            "900",
+            "codrik_bot",
+            ManualClock::new(20),
+        )?
+        .with_attachment_ingress(Arc::new(api.clone()), RuntimeAttachmentStore::new(&root));
+        ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {"message_id":1,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"text":format!("/link {code}")}
+        }))?).await?;
+
+        let outcome = ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 2,
+            "message": {"message_id":2,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"document":{"file_id":"file","file_unique_id":"unique","file_name":"large.bin","file_size":20000001}}
+        }))?).await?;
+
+        assert_eq!(outcome, TelegramIngressOutcome::CommandHandled);
+        assert_eq!(api.get_file_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.download_calls.load(Ordering::SeqCst), 0);
+        assert!(!tokio::fs::try_exists(&root).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_attachment_does_not_call_telegram_file_api() -> Result<()> {
+        let root = temp_attachment_root("disabled");
+        tokio::fs::remove_dir_all(&root).await.ok();
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(10),
+            SystemLinkCodeGenerator,
+        ));
+        let code = manager.issue_code(&actor).await?.code;
+        let api = AttachmentApi::default();
+        let ingress = TelegramIngressService::new(
+            store.clone(),
+            manager,
+            ActorSignals::default(),
+            "900",
+            "codrik_bot",
+            ManualClock::new(20),
+        )?
+        .with_attachment_ingress(Arc::new(api.clone()), RuntimeAttachmentStore::new(&root));
+        ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {"message_id":1,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"text":format!("/link {code}")}
+        }))?).await?;
+        store.set_actor_enabled(&actor, false).await?;
+
+        let outcome = ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 2,
+            "message": {"message_id":2,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"document":{"file_id":"file","file_unique_id":"unique","file_name":"sample.bin","file_size":16}}
+        }))?).await?;
+
+        assert_eq!(outcome, TelegramIngressOutcome::CommandHandled);
+        assert_eq!(api.get_file_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.download_calls.load(Ordering::SeqCst), 0);
+        assert!(!tokio::fs::try_exists(&root).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enforces_returned_and_streamed_file_size_limits() -> Result<()> {
+        let root = temp_attachment_root("size-limits");
+        tokio::fs::remove_dir_all(&root).await.ok();
+        let store = SqliteRuntimeStore::open_in_memory().await?;
+        let actor = ActorId::parse_workspace_safe("alice")?;
+        store
+            .ensure_initial_actor(&actor, &[], Timestamp(1))
+            .await?;
+        let manager: Arc<dyn IdentityLinkManager> = Arc::new(IdentityLinkService::new(
+            store.clone(),
+            ManualClock::new(10),
+            SystemLinkCodeGenerator,
+        ));
+        let code = manager.issue_code(&actor).await?.code;
+        let api = AttachmentApi {
+            returned_size: Arc::new(Mutex::new(Some(TELEGRAM_MAX_DOWNLOAD_BYTES + 1))),
+            ..AttachmentApi::default()
+        };
+        let ingress = TelegramIngressService::new(
+            store,
+            manager,
+            ActorSignals::default(),
+            "900",
+            "codrik_bot",
+            ManualClock::new(20),
+        )?
+        .with_attachment_ingress(Arc::new(api.clone()), RuntimeAttachmentStore::new(&root));
+        ingress.handle(serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "message": {"message_id":1,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"text":format!("/link {code}")}
+        }))?).await?;
+
+        let attachment = |update_id, file_size| {
+            serde_json::json!({
+                "update_id": update_id,
+                "message": {"message_id":update_id,"from":{"id":100,"is_bot":false},"chat":{"id":100,"type":"private"},"document":{"file_id":"file","file_unique_id":format!("unique-{update_id}"),"file_name":"sample.bin","file_size":file_size}}
+            })
+        };
+        assert_eq!(
+            ingress
+                .handle(serde_json::from_value(attachment(2, 16))?)
+                .await?,
+            TelegramIngressOutcome::CommandHandled
+        );
+        assert_eq!(api.download_calls.load(Ordering::SeqCst), 0);
+
+        *api.returned_size.lock().unwrap() = Some(TELEGRAM_MAX_DOWNLOAD_BYTES);
+        *api.bytes.lock().unwrap() = Bytes::from(vec![b'x'; TELEGRAM_MAX_DOWNLOAD_BYTES as usize]);
+        assert!(matches!(
+            ingress
+                .handle(serde_json::from_value(attachment(
+                    3,
+                    TELEGRAM_MAX_DOWNLOAD_BYTES
+                ))?)
+                .await?,
+            TelegramIngressOutcome::Accepted { sequence: 1, .. }
+        ));
+
+        *api.returned_size.lock().unwrap() = None;
+        *api.bytes.lock().unwrap() =
+            Bytes::from(vec![b'x'; TELEGRAM_MAX_DOWNLOAD_BYTES as usize + 1]);
+        assert_eq!(
+            ingress
+                .handle(serde_json::from_value(attachment(4, 16))?)
+                .await?,
+            TelegramIngressOutcome::CommandHandled
+        );
+        assert_eq!(api.get_file_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(api.download_calls.load(Ordering::SeqCst), 2);
+        let mut files = tokio::fs::read_dir(root.join("alice")).await?;
+        assert!(files.next_entry().await?.is_some());
+        assert!(files.next_entry().await?.is_none());
+        tokio::fs::remove_dir_all(root).await.ok();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn link_command_uses_idempotent_core_and_enqueues_response_without_agent_work()
